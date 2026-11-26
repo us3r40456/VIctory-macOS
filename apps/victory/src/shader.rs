@@ -6,13 +6,57 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_game::{sgd5, shaderpack};
 use victory_shader::gfx10::{self, Instruction};
 use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
 
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
+
+/// Files available to offline shader tools, with their size when known.
+/// A flat game directory may contain links to files in the original package.
+/// Inspect a linked file without enabling traversal into linked directories.
+pub(crate) fn shader_files(root: &Path) -> impl Iterator<Item = (walkdir::DirEntry, Option<u64>)> {
+    let entries = walkdir::WalkDir::new(root).into_iter();
+    #[cfg(windows)]
+    let entries = entries.filter_entry(|entry| {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        // Wine can report a Unix directory link as a directory with a reparse
+        // attribute in the listing, even when FileType::is_symlink() is false.
+        if entry.depth() == 0
+            || !entry.file_type().is_dir()
+            || !entry
+                .metadata()
+                .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        {
+            return true;
+        }
+        let path = entry.path();
+        let Ok(parent) = path.parent().expect("non-root entry").canonicalize() else {
+            return false;
+        };
+        path.canonicalize()
+            .is_ok_and(|target| target == parent.join(entry.file_name()))
+    });
+    entries.filter_map(|result| {
+        let entry = result.ok()?;
+        let kind = entry.file_type();
+        let size = if kind.is_symlink() {
+            let target = std::fs::metadata(entry.path()).ok()?;
+            if !target.is_file() {
+                return None;
+            }
+            Some(target.len())
+        } else if kind.is_file() {
+            entry.metadata().ok().map(|m| m.len())
+        } else {
+            return None;
+        };
+        Some((entry, size))
+    })
+}
 
 /// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
@@ -83,15 +127,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
     let mut t = Totals::default();
     let mut packs = Vec::new();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        for (entry, size) in shader_files(root) {
             let path = entry.path();
-            if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE {
+            if size.is_some_and(|len| len > MAX_FILE) {
                 eprintln!("skipping large file {}", path.display());
                 continue;
             }
@@ -105,6 +143,16 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
             if data.starts_with(shaderpack::MAGIC) {
                 packs.push((path.to_owned(), data));
                 continue;
+            }
+            // A shader archive can hold both the compressed pack and the
+            // shader database that identifies the pack's programs.
+            if (sgd5::is_sgd5(&data)
+                || path
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("shaders.rpf")))
+                && let Some(pack) = shaderpack::find(&data)
+            {
+                packs.push((path.to_owned(), pack.into_owned()));
             }
             let mut found_here = 0;
             let engine: HashMap<usize, u64> = sgd5::databases(&data)
@@ -262,6 +310,54 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
     Ok(())
 }
 
+/// Sizes and full content hashes for comparison with serialized console PSOs.
+fn pack_blobs(packet: &[u8], metadata: &[u8]) -> String {
+    format!(
+        "packet_bytes={} packet_blake3={} metadata_bytes={} metadata_blake3={}",
+        packet.len(),
+        blake3::hash(packet),
+        metadata.len(),
+        blake3::hash(metadata)
+    )
+}
+
+/// Index packet/metadata pairs without scanning shader containers or running the translator.
+pub fn pack_index(path: &Path) -> Result<()> {
+    use std::io::{BufWriter, Write};
+
+    let info = std::fs::metadata(path).with_context(|| format!("opening {}", path.display()))?;
+    anyhow::ensure!(info.is_file(), "{} is not a regular file", path.display());
+    anyhow::ensure!(
+        info.len() <= MAX_FILE,
+        "{} exceeds the 2 GiB limit",
+        path.display()
+    );
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let data = shaderpack::find(&bytes)
+        .with_context(|| format!("no shader pack in {}", path.display()))?;
+    let pack = shaderpack::Pack::parse(&data).map_err(anyhow::Error::msg)?;
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    for (i, g) in pack.graphics().enumerate() {
+        writeln!(
+            out,
+            "graphics record={i} key={:016x} shader={:016x} {}",
+            g.key,
+            g.shader_hash,
+            pack_blobs(g.packet, g.metadata)
+        )?;
+    }
+    for (i, c) in pack.compute().enumerate() {
+        writeln!(
+            out,
+            "compute record={i} shader={:016x} {}",
+            c.shader_hash,
+            pack_blobs(c.packet, c.metadata)
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// A shader pack's pipelines; with `verbose` one line each, naming every
 /// stage's container (BLAKE3 prefix and name) found in the other files.
 fn list_pack(path: &Path, data: &[u8], t: &Totals, verbose: bool) {
@@ -313,7 +409,7 @@ fn list_pack(path: &Path, data: &[u8], t: &Totals, verbose: bool) {
             line += &format!(" {stage}={n}");
         }
         if verbose {
-            println!("{line}");
+            println!("{line} {}", pack_blobs(g.packet, g.metadata));
         }
     }
     let mut compute_keyed = 0;
@@ -324,7 +420,11 @@ fn list_pack(path: &Path, data: &[u8], t: &Totals, verbose: bool) {
         named += usize::from(n != "?");
         stages += 1;
         if verbose {
-            println!("compute shader={} CS={n}", hex(c.shader_hash));
+            println!(
+                "compute shader={} CS={n} {}",
+                hex(c.shader_hash),
+                pack_blobs(c.packet, c.metadata)
+            );
         }
     }
     println!(
@@ -400,4 +500,33 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(all(test, unix))]
+mod file_tests {
+    use super::shader_files;
+    use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn linked_shader_archives_keep_their_size_without_walking_linked_directories() {
+        let root =
+            std::env::temp_dir().join(format!("victory-shader-links-{}", std::process::id()));
+        let flat = root.join("flat");
+        let package = root.join("package");
+        fs::create_dir_all(&flat).unwrap();
+        fs::create_dir_all(&package).unwrap();
+        let archive = package.join("shaders.rpf");
+        fs::write(&archive, [0; 17]).unwrap();
+        let linked = flat.join("shaders.rpf");
+        symlink(&archive, &linked).unwrap();
+        symlink(&package, flat.join("tree")).unwrap();
+        symlink(&flat, flat.join("loop")).unwrap();
+        symlink(root.join("missing"), flat.join("broken")).unwrap();
+
+        let files: Vec<_> = shader_files(&flat)
+            .map(|(entry, size)| (entry.into_path(), size))
+            .collect();
+        assert_eq!(files, [(linked, Some(17))]);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

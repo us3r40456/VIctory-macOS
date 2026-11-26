@@ -16,6 +16,9 @@ use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
 };
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod blob_probe;
+
 /// What D3D returns when none of the requested feature levels is supported.
 const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
 
@@ -266,6 +269,8 @@ extern "system" fn deserialize_pipeline_x_probe<const SLOT: usize>(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    blob_probe::observe(SLOT, desc);
     #[cfg(feature = "diagnostics")]
     if pipeline_probe_enabled() {
         static REJECT_GRAPHICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

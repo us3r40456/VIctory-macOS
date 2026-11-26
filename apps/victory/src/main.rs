@@ -65,6 +65,9 @@ enum Command {
     /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
+        /// Print only pipeline record indexes, shader IDs and blob hashes from one pack or archive.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["paths", "verbose", "disasm", "effects"])]
+        pack_index: Option<PathBuf>,
         /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
@@ -165,10 +168,14 @@ fn main() -> Result<()> {
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,
+            pack_index,
             verbose,
             disasm,
             effects,
-        } => shader::run(paths, verbose || disasm, disasm, effects),
+        } => match pack_index {
+            Some(path) => shader::pack_index(&path),
+            None => shader::run(paths, verbose || disasm, disasm, effects),
+        },
         Command::Translate {
             paths,
             jobs,
