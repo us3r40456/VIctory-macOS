@@ -1,7 +1,8 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. Set `VICTORY_CAPTURE_FULL=1` to keep every pixel in saved PNGs.
+//! Only in builds with diagnostics.
 
 use std::path::PathBuf;
 
@@ -65,24 +66,11 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
-    let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
-    for y in 0..h as usize {
-        raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
-        for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
-            if bgra {
-                raw.extend([p[2], p[1], p[0]]);
-            } else {
-                raw.extend_from_slice(p);
-            }
-        }
-    }
+    let step = if crate::switch::on("VICTORY_CAPTURE_FULL") { 1 } else { 2 };
+    let (w, h, raw) = rgb_scanlines(width, height, pitch, bgra, rows, step);
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -100,6 +88,28 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
+}
+
+fn rgb_scanlines(
+    width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8], step: u32,
+) -> (u32, u32, Vec<u8>) {
+    let (w, h) = ((width / step).max(1), (height / step).max(1));
+    let step = step as usize;
+    // Filter byte 0 per row, then RGB samples without pitch padding.
+    let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
+    for y in 0..h as usize {
+        raw.push(0);
+        let row = &rows[y * step * pitch..];
+        for x in 0..w as usize {
+            let p = &row[x * step * 4..][..3];
+            if bgra {
+                raw.extend([p[2], p[1], p[0]]);
+            } else {
+                raw.extend_from_slice(p);
+            }
+        }
+    }
+    (w, h, raw)
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -217,7 +227,8 @@ pub(crate) fn save_read_back(
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        // GetCopyableFootprints may omit the last row's trailing padding.
+        let len = buffer.GetDesc().Width as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -551,12 +562,16 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), buffer.GetDesc().Width as usize);
         // Tiny targets (exposure, averages): their values as they are.
-        if f.Width * f.Height <= 16 {
-            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
-            let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
+        if u64::from(f.Width) * u64::from(f.Height) <= 16
+            && let Some((bytes, block)) = crate::resource::element(f.Format.0 as u32)
+        {
+            let row_bytes = (u64::from(f.Width).div_ceil(block) * bytes) as usize;
+            let words: Vec<String> = rows.chunks(pitch)
+                .take(u64::from(f.Height).div_ceil(block) as usize)
+                .filter_map(|row| row.get(..row_bytes))
+                .flat_map(|row| row.chunks(4))
                 .map(|c| {
                     let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
                     format!("{w:#x}={}", f32::from_bits(w))
@@ -897,6 +912,24 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_capture_keeps_sparse_pixels_and_ignores_row_padding() {
+        // Three BGRA rows, with no trailing padding after the final row.
+        let mut rows = [0u8; 44];
+        rows[12..16].fill(255);
+        rows[28..32].fill(255);
+        rows[20..24].copy_from_slice(&[0, 0, 255, 255]);
+        rows[40..44].copy_from_slice(&[255, 0, 0, 255]);
+        let half = super::rgb_scanlines(3, 3, 16, true, &rows, 2);
+        assert_eq!(half, (1, 1, vec![0; 4]));
+        let (w, h, full) = super::rgb_scanlines(3, 3, 16, true, &rows, 1);
+        assert_eq!((w, h), (3, 3));
+        let mut expected = vec![0; 30];
+        expected[14] = 255; // red at (1, 1)
+        expected[29] = 255; // blue at (2, 2)
+        assert_eq!(full, expected);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
