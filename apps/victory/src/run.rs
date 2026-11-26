@@ -247,7 +247,10 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
+    {
+        victory_loader::configure_init_frame(&hash, &image);
+        diagnostics(&image, &cfg);
+    }
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
