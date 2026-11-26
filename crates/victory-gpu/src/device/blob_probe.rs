@@ -1,5 +1,5 @@
 //! Compare two immediate reads of the serialized PSO description and its first
-//! two contiguous blocks. The third compute address has no known length.
+//! two blocks. The third compute address has no known length.
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -31,6 +31,7 @@ fn read(address: usize, buffer: &mut [u8]) -> bool {
 struct Sample {
     blocks: Vec<u8>,
     split: usize,
+    contiguous: bool,
 }
 
 fn sample(
@@ -52,18 +53,31 @@ fn sample(
     if first_len == 0 || second_len == 0 || first_len > MAX_BLOCK || second_len > MAX_BLOCK {
         return Err("block size out of range");
     }
-    if first == 0
-        || first.checked_add(first_len) != Some(second)
-        || second.checked_add(second_len).is_none()
-    {
-        return Err("invalid block range");
+    if first == 0 || second == 0 {
+        return Err("null block address");
+    }
+    let first_end = first.checked_add(first_len).ok_or("block range overflow")?;
+    let second_end = second
+        .checked_add(second_len)
+        .ok_or("block range overflow")?;
+    if first < second_end && second < first_end {
+        return Err("overlapping blocks");
     }
 
-    // One read covers both blocks. Re-read the same addresses, then the
-    // description itself. Equality is a repeated observation, not a lock.
+    // Each address has its own length. A title can store the metadata in a
+    // different allocation. Never include the gap in a read or a hash.
+    let contiguous = first_end == second;
+    let mut read_blocks = |bytes: &mut [u8]| {
+        if contiguous {
+            read(first, bytes)
+        } else {
+            let (packet, metadata) = bytes.split_at_mut(first_len);
+            read(first, packet) && read(second, metadata)
+        }
+    };
     let mut blocks = vec![0; first_len + second_len];
     let mut again = vec![0; blocks.len()];
-    if !read(first, &mut blocks) || !read(first, &mut again) {
+    if !read_blocks(&mut blocks) || !read_blocks(&mut again) {
         return Err("unreadable blocks");
     }
     let mut end = [0; 64];
@@ -76,6 +90,7 @@ fn sample(
     Ok(Sample {
         blocks,
         split: first_len,
+        contiguous,
     })
 }
 
@@ -115,7 +130,7 @@ pub(super) fn observe(slot: usize, desc: *const c_void) {
                         %slot, index, outcome = if packet_zero && metadata_zero { "all_zero" } else { "stable" },
                         packet_bytes = packet.len(), packet_blake3 = %blake3::hash(packet),
                         metadata_bytes = metadata.len(), metadata_blake3 = %blake3::hash(metadata),
-                        packet_zero, metadata_zero, "console PSO block sample"
+                        packet_zero, metadata_zero, contiguous = s.contiguous, "console PSO block sample"
                     );
                 }
                 Err(reason) => {
@@ -169,11 +184,35 @@ mod tests {
             assert!(sample(desc.as_ptr() as usize, read).is_err());
         }
         let mut desc = header(1, 28, 20);
-        desc[3] += 1;
+        desc[3] -= 1;
         assert!(matches!(
             sample(desc.as_ptr() as usize, read),
-            Err("invalid block range")
+            Err("overlapping blocks")
         ));
+    }
+
+    #[test]
+    fn reads_separate_blocks_in_either_order_without_reading_the_gap() {
+        let data: Vec<u8> = (1..=100).collect();
+        for (first, second) in [(0, 80), (60, 0)] {
+            let base = data.as_ptr() as usize;
+            let mut desc = header(base + first, 28, 20);
+            desc[3] = (base + second) as u64;
+            let mut spans = Vec::new();
+            let s = sample(desc.as_ptr() as usize, |address, buf| {
+                if address != desc.as_ptr() as usize {
+                    spans.push((address, buf.len()));
+                }
+                read(address, buf)
+            })
+            .unwrap();
+            assert!(!s.contiguous);
+            assert_eq!(spans, [(base + first, 28), (base + second, 20)].repeat(2));
+            assert_eq!(
+                s.blocks.split_at(s.split),
+                (&data[first..first + 28], &data[second..second + 20])
+            );
+        }
     }
 
     #[test]
