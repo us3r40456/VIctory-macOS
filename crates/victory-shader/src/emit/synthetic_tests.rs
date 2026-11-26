@@ -65,6 +65,11 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_wave(words, false)
+}
+
+fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
+    let wave = if wave64 { 64 } else { 32 };
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -77,7 +82,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -94,7 +99,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [wave, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -138,6 +143,8 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
         view_marks: false,
     })
 }
@@ -389,6 +396,166 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], want, "{label}");
     }
+}
+
+/// Builds, DXIL-validates, and runs a single-wave `ds_bpermute_b32` compute
+/// shader (`wave` = 32 or 64) where `body` leaves each lane's result in `v3`.
+fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
+    let wave = if wave64 { 64 } else { 32 };
+    assert_eq!(want.len(), wave as usize);
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    ];
+    words.extend_from_slice(body);
+    words.extend_from_slice(&[
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    let shader = build_wave(&words, wave64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(wave),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // A wave64 program needs 64 lanes in a wave: a 32-lane host (D3DMetal
+        // takes WaveSize(64) and runs 32) runs it in halves (`lower::halves`).
+        if wave64 && !warp && host.wave32().unwrap_or(false) {
+            eprintln!("{label}: waves of 32 lanes at most; skipped");
+            continue;
+        }
+        // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
+        // 32-lane hardware adapters.
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            assert!(warp || wave64, "{label}: no pipeline for a wave of 32");
+            eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], want, "{label}");
+    }
+}
+
+#[test]
+fn permutes_mask_high_address_bits_and_divergent_branches() {
+    // High byte-address bits (0x100) and sub-dword bits (+3) are ignored, so
+    // only bits 6:2 select the source lane. Lanes 16..31 skip the permute via
+    // `s_cbranch_execz`, so reads from them yield 0 while they keep `v3`.
+    let body = [
+        0x4A04_00FF,
+        0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
+        0x4A06_00FF,
+        0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+    ];
+    let want: Vec<u32> = (0..32)
+        .map(|l| {
+            if l < 8 {
+                0x3000 + l + 8
+            } else if l < 16 {
+                0
+            } else {
+                0xBEEF_0000 + l
+            }
+        })
+        .collect();
+    run_permute_cs(false, &body, &want);
+}
+
+#[test]
+fn wave64_permutes_stay_within_each_32_lane_half() {
+    // RDNA 2 ISA §10.4.4: wave64 permutes lanes 0..31 and 32..63 independently.
+    // v1 = ((lane & 31) << 2) + 0x103 with offset:12 exercises both high/low
+    // bit masking and wrapping within each 32-lane half (29..31 -> 0..2,
+    // 61..63 -> 32..34; lane 32 pulls from lane 35, not lane 3).
+    let body = [
+        0x4A04_00FF,
+        0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+        0x3602_009F, // v_and_b32 v1, 31, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x4A02_02FF,
+        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+    ];
+    let want: Vec<u32> = (0..64)
+        .map(|l| 0x4000 + ((l & !31) | ((l + 3) & 31)))
+        .collect();
+    run_permute_cs(true, &body, &want);
+}
+
+#[test]
+fn wave64_permutes_check_exec_within_each_half() {
+    // Active lanes 0..39 in wave64: lanes 32..39 pull from upper-half lanes
+    // 40..47 (inactive -> 0), even though lower-half lanes 8..15 are active;
+    // inactive lanes 40..63 preserve 0xcafe0000 + lane.
+    let body = [
+        0x4A04_00FF,
+        0x0000_5000, // v_add_nc_u32 v2, 0x5000, v0
+        0x4A06_00FF,
+        0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+        0x3602_029F, // v_and_b32 v1, 31, v1
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xDACC_0000,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    ];
+    let want: Vec<u32> = (0..64)
+        .map(|l| {
+            if l < 32 {
+                0x5000 + ((l + 8) & 31)
+            } else if l < 40 {
+                0
+            } else {
+                0xCAFE_0000 + l
+            }
+        })
+        .collect();
+    run_permute_cs(true, &body, &want);
 }
 
 /// A lane mask joined with data at a uniform loop's header, as the title's
@@ -648,7 +815,6 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
         assert_eq!(out[0], want, "{label}");
     }
 }
-
 #[test]
 fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     // A pixel program's ordered section (POPS) as the title's compiler
@@ -728,4 +894,184 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
         panic!("translated a collision id outside an ordered section");
     };
     assert_eq!(what, "a hardware SGPR input");
+}
+
+#[test]
+fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
+    use super::container::SigElement;
+    use super::host::Draw;
+    use crate::native::{Usage, VsInput};
+
+    let pos_sig = |name: &str, kind: u8, interp: u8| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    let to_host = |native: &NativeProgram, inputs: Vec<SigElement>, outputs: Vec<SigElement>| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, native).expect("io");
+        let l = lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs,
+            outputs,
+            prims: Vec::new(),
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            host_wave32: false,
+            view_marks: false,
+        })
+        .expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = l.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        HostShader {
+            stage: native.stage,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            memory: l.memory,
+            memory_writes: l.memory_writes,
+            view_addresses: l.view_addresses,
+            heap: l.heap,
+            heap_writes: l.heap_writes,
+            view_marks: false,
+        }
+    };
+
+    // Pass-through full-screen vertex shader (attributes in v4..v7; v0..v3 hold hardware ids).
+    let vs_code: [u32; 3] = [
+        0xF800_08CF,
+        0x0706_0504, // exp pos0, v4, v5, v6, v7 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let vs_native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: true,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Vs {
+            inputs: vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0xF,
+                vgpr: 4,
+            }],
+            outputs: Vec::new(),
+        },
+        code: vs_code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let vs = to_host(
+        &vs_native,
+        vec![pos_sig("POSITION", 0, 0)],
+        vec![pos_sig("SV_Position", 3, 4)],
+    );
+
+    // Pixel shader with narrowed EXEC before the title's wrap-around POPS
+    // wait loop: lanes with SV_Position.x >= 2.0 have EXEC cleared at
+    // s_cbranch_vccnz so they fall into the wait loop, then restore EXEC and
+    // export the loop iteration count in s12. If the collision id has
+    // wave_id == collision_id (0 == 0), wave_id + ~collision_id is 0xffff_ffff
+    // so `s_cmp_lt_u32 s5, s0` never holds and the loop runs to LOOP_LIMIT
+    // (1 << 20) instead of exiting after one pass.
+    let ps_code: [u32; 28] = [
+        0xBE8C_0380, // s_mov_b32 s12, 0
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7C28_00F4, // v_cmpx_gt_f32 exec, 2.0, v0  (active for x < 2.0)
+        0x9382_FF09,
+        0x000A_0000, // s_bfe_u32 s2, s9, lit(0x000a0000) (collision id)
+        0x9385_FF09,
+        0x000A_0010, // s_bfe_u32 s5, s9, lit(0x000a0010) (wave id)
+        0xBE84_0702, // s_not_b32 s4, s2
+        0x9000_9F09, // s_lshr_b32 s0, s9, 31 (overlap bit)
+        0x8105_0405, // s_add_i32 s5, s5, s4
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+        0x8102_04EF, // s_add_i32 s2, src_pops_exiting_wave_id, s4
+        0xBF08_0502, // s_cmp_gt_u32 s2, s5
+        0x8582_807E, // s_cselect_b64 s[2:3], exec, 0
+        0x8880_0200, // s_or_b64 s[0:1], s[0:1], s[2:3]
+        0x87EA_007E, // s_and_b64 vcc, exec, s[0:1]
+        0xBF87_0005, // s_cbranch_vccnz +5
+        0xBF8E_FFFF, // s_sleep 0xffff
+        0x810C_810C, // s_add_i32 s12, s12, 1
+        0x8100_04EF, // s_add_i32 s0, src_pops_exiting_wave_id, s4
+        0xBF0A_0005, // s_cmp_lt_u32 s5, s0
+        0xBF84_FFFB, // s_cbranch_scc0 -5
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        0x7E08_0C0C, // v_cvt_f32_u32 v4, s12
+        0xF800_180F,
+        0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let ps_bytes: Vec<u8> = ps_code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ps_native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: true,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 1 << 8, // SV_Position.x in v0
+            db_shader_control: 1 << 16,
+            patches: Vec::new(),
+        },
+        code: ps_bytes,
+    };
+    let ps = to_host(
+        &ps_native,
+        vec![pos_sig("SV_Position", 3, 4)],
+        vec![pos_sig("SV_Target", 16, 0)],
+    );
+
+    // Wine has no WARP.
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no WARP device; skipped");
+        return;
+    };
+    let (root, pso) = host.pipeline(&vs, &ps).expect("pipeline");
+    let pixels = host
+        .draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &[
+                    -1.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0,
+                ],
+                stride: 16,
+                size: (4, 1),
+                mesh_groups: 0,
+            },
+        )
+        .expect("draw");
+    // Active pixels (x < 2.0) skip the wait loop (0 iterations); inactive
+    // pixels (x >= 2.0) fall through once and exit immediately (1 iteration),
+    // never spinning to LOOP_LIMIT (1 << 20).
+    assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }

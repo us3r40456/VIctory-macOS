@@ -53,9 +53,13 @@ WINE_DIR="$ALIAS/target/wine-cx"
 say "building the x86_64 libraries Wine needs (about 10 minutes the first time)"
 tools/macos/build-deps.sh "$ALIAS/target/deps-x86"
 
-# 5. CrossOver Wine.
-if [[ -x $WINE_DIR/bin/wine ]]; then
+# 5. CrossOver Wine, with the patches in tools/macos/patches. A Wine built
+# before a patch was added or changed gets only its server rebuilt.
+if [[ -x $WINE_DIR/bin/wine && "$(cat "$WINE_DIR/.victory-patches" 2> /dev/null)" == "$(tools/macos/build-crossover-wine.sh --stamp)" ]]; then
   say "Wine already built"
+elif [[ -x $WINE_DIR/bin/wine ]]; then
+  say "rebuilding Wine's server with the patches in tools/macos/patches (a few minutes)"
+  DEPS="$ALIAS/target/deps-x86" tools/macos/build-crossover-wine.sh
 else
   say "building CrossOver Wine (about 30 minutes the first time)"
   DEPS="$ALIAS/target/deps-x86" tools/macos/build-crossover-wine.sh

@@ -25,7 +25,7 @@
 // Each table is sorted by opcode. VOP3 holds only VOP3-only opcodes; VOP3
 // encodings of VOPC/VOP2/VOP1 ops (0x000-0x13f, 0x180-0x1ff) use those tables.
 
-pub(super) const SOP2: &[(u16, &str)] = &[
+pub(crate) const SOP2: &[(u16, &str)] = &[
     (0x000, "s_add_u32"),
     (0x001, "s_sub_u32"),
     (0x002, "s_add_i32"),
@@ -79,7 +79,7 @@ pub(super) const SOP2: &[(u16, &str)] = &[
     (0x036, "s_mul_hi_i32"),
 ];
 
-pub(super) const SOPK: &[(u16, &str)] = &[
+pub(crate) const SOPK: &[(u16, &str)] = &[
     (0x000, "s_movk_i32"),
     (0x001, "s_version"),
     (0x002, "s_cmovk_i32"),
@@ -109,7 +109,7 @@ pub(super) const SOPK: &[(u16, &str)] = &[
     (0x01c, "s_subvector_loop_end"),
 ];
 
-pub(super) const SOP1: &[(u16, &str)] = &[
+pub(crate) const SOP1: &[(u16, &str)] = &[
     (0x003, "s_mov_b32"),
     (0x004, "s_mov_b64"),
     (0x005, "s_cmov_b32"),
@@ -178,7 +178,7 @@ pub(super) const SOP1: &[(u16, &str)] = &[
     (0x049, "s_movrelsd_2_b32"),
 ];
 
-pub(super) const SOPC: &[(u16, &str)] = &[
+pub(crate) const SOPC: &[(u16, &str)] = &[
     (0x000, "s_cmp_eq_i32"),
     (0x001, "s_cmp_lg_i32"),
     (0x002, "s_cmp_gt_i32"),
@@ -199,7 +199,7 @@ pub(super) const SOPC: &[(u16, &str)] = &[
     (0x013, "s_cmp_lg_u64"),
 ];
 
-pub(super) const SOPP: &[(u16, &str)] = &[
+pub(crate) const SOPP: &[(u16, &str)] = &[
     (0x000, "s_nop"),
     (0x001, "s_endpgm"),
     (0x002, "s_branch"),
@@ -239,7 +239,7 @@ pub(super) const SOPP: &[(u16, &str)] = &[
     (0x028, "s_ttracedata_imm"),
 ];
 
-pub(super) const SMEM: &[(u16, &str)] = &[
+pub(crate) const SMEM: &[(u16, &str)] = &[
     (0x000, "s_load_dword"),
     (0x001, "s_load_dwordx2"),
     (0x002, "s_load_dwordx4"),
@@ -326,7 +326,7 @@ pub(super) const SMEM: &[(u16, &str)] = &[
     (0x0ac, "s_atomic_dec_x2"),
 ];
 
-pub(super) const VOP2: &[(u16, &str)] = &[
+pub(crate) const VOP2: &[(u16, &str)] = &[
     (0x001, "v_cndmask_b32"),
     (0x002, "v_dot2c_f32_f16"),
     (0x003, "v_add_f32"),
@@ -379,7 +379,7 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x03c, "v_pk_fmac_f16"),
 ];
 
-pub(super) const VOP1: &[(u16, &str)] = &[
+pub(crate) const VOP1: &[(u16, &str)] = &[
     (0x000, "v_nop"),
     (0x001, "v_mov_b32"),
     (0x002, "v_readfirstlane_b32"),
@@ -463,7 +463,7 @@ pub(super) const VOP1: &[(u16, &str)] = &[
     (0x068, "v_swaprel_b32"),
 ];
 
-pub(super) const VOPC: &[(u16, &str)] = &[
+pub(crate) const VOPC: &[(u16, &str)] = &[
     (0x000, "v_cmp_f_f32"),
     (0x001, "v_cmp_lt_f32"),
     (0x002, "v_cmp_eq_f32"),
@@ -656,7 +656,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
     (0x0ff, "v_cmpx_tru_f16"),
 ];
 
-pub(super) const VOP3: &[(u16, &str)] = &[
+pub(crate) const VOP3: &[(u16, &str)] = &[
     (0x140, "v_mad_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),
@@ -775,7 +775,7 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x37f, "v_add_nc_i32"),
 ];
 
-pub(super) const VOP3P: &[(u16, &str)] = &[
+pub(crate) const VOP3P: &[(u16, &str)] = &[
     (0x000, "v_pk_mad_i16"),
     (0x001, "v_pk_mul_lo_u16"),
     (0x002, "v_pk_add_i16"),
@@ -806,13 +806,13 @@ pub(super) const VOP3P: &[(u16, &str)] = &[
     (0x022, "v_fma_mixhi_f16"),
 ];
 
-pub(super) const VINTRP: &[(u16, &str)] = &[
+pub(crate) const VINTRP: &[(u16, &str)] = &[
     (0x000, "v_interp_p1_f32"),
     (0x001, "v_interp_p2_f32"),
     (0x002, "v_interp_mov_f32"),
 ];
 
-pub(super) const DS: &[(u16, &str)] = &[
+pub(crate) const DS: &[(u16, &str)] = &[
     (0x000, "ds_add_u32"),
     (0x001, "ds_sub_u32"),
     (0x002, "ds_rsub_u32"),
@@ -969,7 +969,7 @@ pub(super) const DS: &[(u16, &str)] = &[
     (0x0ff, "ds_read_b128"),
 ];
 
-pub(super) const MUBUF: &[(u16, &str)] = &[
+pub(crate) const MUBUF: &[(u16, &str)] = &[
     (0x000, "buffer_load_format_x"),
     (0x001, "buffer_load_format_xy"),
     (0x002, "buffer_load_format_xyz"),
@@ -1047,7 +1047,7 @@ pub(super) const MUBUF: &[(u16, &str)] = &[
     (0x087, "buffer_store_format_d16_xyzw"),
 ];
 
-pub(super) const MTBUF: &[(u16, &str)] = &[
+pub(crate) const MTBUF: &[(u16, &str)] = &[
     (0x000, "tbuffer_load_format_x"),
     (0x001, "tbuffer_load_format_xy"),
     (0x002, "tbuffer_load_format_xyz"),
@@ -1066,7 +1066,7 @@ pub(super) const MTBUF: &[(u16, &str)] = &[
     (0x00f, "tbuffer_store_format_d16_xyzw"),
 ];
 
-pub(super) const MIMG: &[(u16, &str)] = &[
+pub(crate) const MIMG: &[(u16, &str)] = &[
     (0x000, "image_load"),
     (0x001, "image_load_mip"),
     (0x002, "image_load_pck"),
@@ -1172,7 +1172,7 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0e7, "image_bvh64_intersect_ray"),
 ];
 
-pub(super) const FLAT: &[(u16, &str)] = &[
+pub(crate) const FLAT: &[(u16, &str)] = &[
     (0x008, "flat_load_ubyte"),
     (0x009, "flat_load_sbyte"),
     (0x00a, "flat_load_ushort"),
@@ -1229,7 +1229,7 @@ pub(super) const FLAT: &[(u16, &str)] = &[
     (0x060, "flat_atomic_fmax_x2"),
 ];
 
-pub(super) const GLOBAL: &[(u16, &str)] = &[
+pub(crate) const GLOBAL: &[(u16, &str)] = &[
     (0x008, "global_load_ubyte"),
     (0x009, "global_load_sbyte"),
     (0x00a, "global_load_ushort"),
@@ -1289,7 +1289,7 @@ pub(super) const GLOBAL: &[(u16, &str)] = &[
     (0x060, "global_atomic_fmax_x2"),
 ];
 
-pub(super) const SCRATCH: &[(u16, &str)] = &[
+pub(crate) const SCRATCH: &[(u16, &str)] = &[
     (0x008, "scratch_load_ubyte"),
     (0x009, "scratch_load_sbyte"),
     (0x00a, "scratch_load_ushort"),

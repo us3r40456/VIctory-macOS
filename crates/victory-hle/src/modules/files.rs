@@ -558,6 +558,9 @@ pub extern "system" fn ReadFile(
         );
     }
     drop(writing);
+    if super::read_stats::on() {
+        super::read_stats::add_handle(file, u64::from(len));
+    }
     // SAFETY: sets the thread's last error.
     unsafe { SetLastError(error) };
     done

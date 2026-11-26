@@ -20,7 +20,8 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+mod caption;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]
@@ -43,6 +44,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(all(windows, test))]
+mod list_bench;
 #[cfg(windows)]
 mod memory;
 pub mod object;
@@ -74,6 +77,9 @@ mod texture;
 mod twin;
 #[cfg(windows)]
 mod watch;
+// Whether the host opens heaps over process memory (ignored by default).
+#[cfg(all(windows, test))]
+mod inplace_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
@@ -81,8 +87,8 @@ pub use copystat::CountingAlloc;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, fault_tracking, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
+    title_memory_remapped, writing as kernel_will_write,
 };
 
 /// A whole file, read without asking for its size or other metadata.

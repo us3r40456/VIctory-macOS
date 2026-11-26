@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -60,14 +62,17 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    full_hash: [u8; 32],
     /// The container's length, as logged once its bytes are gone.
     size: usize,
-    /// The container, until `translated` has made its translation (or its
-    /// refusal) and let it go: a run holds one per distinct shader its title
-    /// passes, and nothing reads it after. Off Windows nothing translates,
-    /// so only tests keep it.
+    /// Released after translation unless an experimental mesh/pixel pair may need it.
     #[cfg(any(windows, test))]
     container: Mutex<Vec<u8>>,
+    /// Its full BLAKE3 once the container is on disk instead
+    /// (`VICTORY_SPILL_SHADERS`, [`spill`]).
+    #[cfg(windows)]
+    spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -84,25 +89,101 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
-        .clone()
+    let mut created = false;
+    let shader = {
+        let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        shaders
+            .get_or_insert_with(HashMap::new)
+            .entry(*full.as_bytes())
+            .or_insert_with(|| {
+                created = true;
+                Arc::new(Shader::with_hash(stage, bytes, full))
+            })
+            .clone()
+    };
+    // Written outside the lock every pipeline creation takes.
+    #[cfg(windows)]
+    if created {
+        spill(&shader, full.as_bytes());
+    }
+    #[cfg(not(windows))]
+    let _ = created;
+    shader
+}
+
+/// Folder for shader containers kept on disk until translated
+/// (`VICTORY_SPILL_SHADERS=1`): the title passes tens of thousands of
+/// distinct containers and draws with a few hundred, and holding them all
+/// was ~700 MB of an 8 GB Mac's memory (#135).
+#[cfg(windows)]
+static SPILL_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The file a container with BLAKE3 `full` is kept in.
+#[cfg(windows)]
+fn spill_path(dir: &std::path::Path, full: &[u8; 32]) -> std::path::PathBuf {
+    let hex = blake3::Hash::from(*full).to_hex();
+    dir.join(&hex[..2]).join(format!("{hex}.bin"))
+}
+
+/// Moves `shader`'s container to disk if spilling is on: written under a
+/// temporary name and renamed, so a file found there is whole; one already
+/// there from an earlier run is kept.
+#[cfg(windows)]
+fn spill(shader: &Shader, full: &[u8; 32]) {
+    if let Some(dir) = SPILL_DIR.get() {
+        spill_to(dir, shader, full);
+    }
+}
+
+/// [`spill`] into `dir`.
+#[cfg(windows)]
+fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
+    let path = spill_path(dir, full);
+    let there = std::fs::File::open(&path).is_ok();
+    if !there {
+        let Some(shard) = path.parent() else { return };
+        let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let ok = crate::make_dir(shard).is_ok()
+            && std::fs::write(&tmp, &*container).is_ok()
+            && std::fs::rename(&tmp, &path).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        *container = Vec::new();
+    } else {
+        *shader.container.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+    }
+    let _ = shader.spilled.set(*full);
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        Self::with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn with_hash(stage: &'static str, bytes: &[u8], digest: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: digest.to_hex()[..16].to_owned(),
+            #[cfg(windows)]
+            full_hash: *digest.as_bytes(),
             size: bytes.len(),
             #[cfg(any(windows, test))]
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
+            spilled: OnceLock::new(),
+            #[cfg(windows)]
             translated: OnceLock::new(),
         }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn for_test(stage: &'static str, translated: Translated) -> Arc<Shader> {
+        let shader = Shader::new(stage, b"");
+        let _ = shader.translated.set(Some(translated));
+        Arc::new(shader)
     }
 }
 
@@ -123,26 +204,61 @@ impl Shader {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 let (done, cached) = {
                     let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                    if container.is_empty()
+                        && let (Some(full), Some(dir)) = (self.spilled.get(), SPILL_DIR.get())
+                    {
+                        *container = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+                    }
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
-                    *container = Vec::new();
+                    let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
+                        self.stage == "pixel"
+                            || (self.stage == "mesh"
+                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
+                                    .is_some_and(|o| {
+                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+                                    }))
+                    });
+                    if !keep {
+                        *container = Vec::new();
+                    }
                     done
                 };
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            cached,
+                            ms,
+                            user_ms,
+                            kernel_ms,
+                            "shader translated"
+                        );
+                        // D3DMetal makes such a pipeline and marks it a no-op:
+                        // its draws are dropped without an error (#132).
+                        use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
+                        if let Some(o) = mesh_outputs(&t.host.dxil)
+                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
+                            .filter(|_| crate::shader_cache::under_wine())
+                        {
+                            tracing::warn!(
+                                hash = %self.hash,
+                                bytes = o.bytes(),
+                                limit = METAL_MESH_OUTPUT_BYTES,
+                                vertices = o.vertices,
+                                primitives = o.primitives,
+                                vertex_components = o.vertex_components,
+                                primitive_components = o.primitive_components,
+                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -213,6 +329,118 @@ fn with_resources(
     Ok(Translated { host, used })
 }
 
+#[cfg(windows)]
+fn link_mesh_outputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LINK_MESH_OUTPUTS"))
+}
+
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+#[cfg(windows)]
+type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+
+#[cfg(windows)]
+impl Shader {
+    fn with_translation(&self, translated: Translated) -> Arc<Shader> {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Arc::new(Shader {
+            stage: self.stage,
+            hash: self.hash.clone(),
+            full_hash: self.full_hash,
+            size: self.size,
+            container: Mutex::new(Vec::new()),
+            spilled: OnceLock::new(),
+            translated: cell,
+        })
+    }
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (if any)
+/// so arbitrary mesh outputs unread by the pixel shader are pruned under
+/// Metal's 32 KiB mesh output limit (`victory_shader::emit::METAL_MESH_OUTPUT_BYTES`).
+#[cfg(windows)]
+pub(crate) fn translate_linked(
+    ms: &Shader,
+    ps: Option<&Shader>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
+    let key = (ms.full_hash, ps.map(|p| p.full_hash));
+    if let Some(hit) = LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return hit
+            .as_ref()
+            .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    }
+    let mesh_bytes = ms
+        .container
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let pixel_bytes = ps.map(|p| {
+        p.container
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    });
+    let options = crate::shader_cache::runtime_options();
+    let result = match victory_shader::emit::translate_linked(
+        &mesh_bytes,
+        pixel_bytes.as_deref(),
+        options,
+    ) {
+        Ok((ms_host, ps_host)) => {
+            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let ms_used = ms.translated()?.used.clone();
+            let mesh = ms.with_translation(Translated {
+                host: ms_host,
+                used: ms_used,
+            });
+            let pixel = match (ps, ps_host) {
+                (Some(p), Some(host)) => Some(p.with_translation(Translated {
+                    host,
+                    used: p.translated()?.used.clone(),
+                })),
+                _ => None,
+            };
+            tracing::info!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                bytes = ms_bytes,
+                "mesh and pixel linked under 32 KiB output budget"
+            );
+            Some(LinkedPair { mesh, pixel })
+        }
+        Err(e) => {
+            tracing::warn!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                error = %e,
+                "linked mesh/pixel translation failed; using standalone translation"
+            );
+            None
+        }
+    };
+    let out = result
+        .as_ref()
+        .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    out
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -232,7 +460,12 @@ impl Pipeline {
     fn new(shaders: Vec<Arc<Shader>>, #[cfg(windows)] graphics: Option<Box<Graphics>>) -> Self {
         tracing::trace!(?shaders, "pipeline state");
         #[cfg(windows)]
-        let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+        let host = Arc::new(make::Pending::new(
+            shaders.clone(),
+            graphics,
+            #[cfg(feature = "diagnostics")]
+            skip_hashes(),
+        ));
         #[cfg(windows)]
         make::early(&host);
         Self::with_host(
@@ -280,9 +513,9 @@ pub(crate) fn bound(this: This) {
     }
 }
 
-/// The host pipeline of a title pipeline; `None` if one of its shaders does
-/// not translate, the host refuses it, or it is still being made (its first
-/// use starts that, see [`make`]).
+/// The host pipeline of a title pipeline; `None` if it is skipped, one of its
+/// shaders does not translate, the host refuses it, or it is still being made
+/// (its first use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
@@ -303,7 +536,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(feature = "diagnostics", any(windows, test)))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -324,16 +557,20 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
+    shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
@@ -341,7 +578,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).host.skipped_shader.is_some()
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
@@ -361,7 +598,9 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
+        p.host
+            .skipped_shader
+            .as_deref()
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
     };
@@ -574,9 +813,10 @@ fn read_stream(
             break;
         }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
-            shaders.extend(shader(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // slice does not promise to be aligned.
+            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -988,11 +1228,20 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
+    if std::env::var_os("VICTORY_SPILL_SHADERS").is_some_and(|v| v != "0") {
+        let spill = dir.with_file_name("shader-containers");
+        if crate::make_dir(&spill).is_ok() {
+            tracing::info!(dir = %spill.display(), "shader containers kept on disk until translated");
+            let _ = SPILL_DIR.set(spill);
+        }
+    }
     library::use_pipeline_cache(dir);
 }
 
@@ -1106,7 +1355,7 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -1118,6 +1367,43 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The slice a title's stream (or a pre-build's) is in need not be
+    /// 8-aligned: its bytecode is read as it lies.
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let mut backing = [0u64; 5];
+        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
+        stream[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
+        stream[16..24].copy_from_slice(&7usize.to_le_bytes());
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        let seen = std::cell::RefCell::new(Vec::new());
+        read_stream(stream, |stage, code| {
+            seen.borrow_mut().push((stage, code.code as usize, code.size));
+            None
+        });
+        assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
+    }
+
+    /// A spilled container leaves memory, is on disk whole, and one already
+    /// there is kept rather than written again.
+    #[cfg(windows)]
+    #[test]
+    fn spilled_containers_round_trip_through_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..5000u32).map(|i| (i * 31) as u8).collect();
+        let full = *blake3::hash(&bytes).as_bytes();
+        let s = Shader::new("pixel", &bytes);
+        spill_to(dir.path(), &s, &full);
+        assert!(s.container.lock().unwrap().is_empty(), "left memory");
+        assert_eq!(s.spilled.get(), Some(&full));
+        assert_eq!(crate::read_file(&spill_path(dir.path(), &full)).unwrap(), bytes);
+        let again = Shader::new("pixel", &bytes);
+        spill_to(dir.path(), &again, &full);
+        assert!(again.container.lock().unwrap().is_empty() && again.spilled.get() == Some(&full));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -1288,3 +1574,6 @@ mod tests {
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;

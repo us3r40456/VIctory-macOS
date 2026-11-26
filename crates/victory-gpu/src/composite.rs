@@ -1,16 +1,10 @@
 //! Draws a presented overlay plane over the picture plane (#15).
 //!
-//! On Series S Grand Theft Auto VI presents two planes: a 1920x1080
-//! overlay and the 3840x2160 picture. The console's display hardware blends
-//! the overlay over the picture. Here a compute pass does it into a texture
-//! of the picture's size, which is then copied to the swap chain:
-//! `picture * (1 - alpha) + overlay * alpha`, the overlay scaled to the
-//! picture by its nearest texel. The overlay's alpha is taken as straight
-//! (not premultiplied) until a run with the game shows otherwise.
-//!
-//! The pass is off unless `VICTORY_PRESENT_COMPOSITE=1`: if the overlay
-//! turns out opaque where the picture should show, compositing would bring
-//! the black window back.
+//! The title can present a scene and a UI plane at different resolutions.
+//! VIctory blends the other plane over the selected picture when
+//! `VICTORY_PRESENT_COMPOSITE=1`. The overlay uses straight alpha and
+//! nearest-texel sampling in picture coordinates. `VICTORY_PRESENT_MAX`
+//! fits the final picture into the requested size, with or without an overlay.
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -22,16 +16,52 @@ pub(crate) fn wanted() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").is_ok_and(|v| v == "1"))
 }
 
+/// Fit the final presentation texture inside a requested host size, keeping
+/// its aspect ratio. Guest render targets and upscaler inputs keep their sizes.
+fn fit_output(width: u32, height: u32, limit: (u32, u32)) -> (u32, u32) {
+    if width <= limit.0 && height <= limit.1 {
+        return (width, height);
+    }
+    let (w, h) = (u64::from(width), u64::from(height));
+    let (mw, mh) = (u64::from(limit.0), u64::from(limit.1));
+    if mw * h <= mh * w {
+        (limit.0, (h * mw / w).max(1) as u32)
+    } else {
+        ((w * mh / h).max(1) as u32, limit.1)
+    }
+}
+
+pub(crate) fn output_size(width: u32, height: u32) -> (u32, u32) {
+    static LIMIT: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    let limit = LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_PRESENT_MAX").ok()?;
+        let size = value.trim().split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            .filter(|&(w, h)| w > 0 && h > 0);
+        if size.is_none() {
+            tracing::warn!(%value, "invalid VICTORY_PRESENT_MAX (expected positive WIDTHxHEIGHT)");
+        }
+        size
+    });
+    limit.map_or((width, height), |limit| fit_output(width, height, limit))
+}
+
 const SOURCE: &str = r#"
-cbuffer C : register(b0) { uint width; uint height; uint overWidth; uint overHeight; };
+cbuffer C : register(b0) { uint width; uint height; uint overWidth; uint overHeight; uint outWidth; uint outHeight; };
 Texture2D<float4> picture : register(t0);
 Texture2D<float4> overlay : register(t1);
 RWTexture2D<float4> result : register(u0);
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= width || id.y >= height) return;
-    float4 p = picture.Load(int3(id.xy, 0));
-    float4 o = overlay.Load(int3(id.x * overWidth / width, id.y * overHeight / height, 0));
+    if (id.x >= outWidth || id.y >= outHeight) return;
+    uint2 pixel = id.xy;
+    if (width != outWidth || height != outHeight)
+        pixel = (2 * id.xy + 1) * uint2(width, height) / (2 * uint2(outWidth, outHeight));
+    float4 p = picture.Load(int3(pixel, 0));
+    if (overWidth == 0) {
+        result[id.xy] = p;
+        return;
+    }
+    float4 o = overlay.Load(int3(pixel.x * overWidth / width, pixel.y * overHeight / height, 0));
     result[id.xy] = float4(lerp(p.rgb, o.rgb, o.a), 1.0);
 }
 "#;
@@ -54,7 +84,7 @@ impl Compositor {
             Param::Table(&ranges),
             Param::Constants {
                 register: 0,
-                count: 4,
+                count: 6,
             },
         ];
         let (root, pso) = crate::compute::pipeline(SOURCE, s!("composite"), 0, &params)?;
@@ -77,8 +107,8 @@ impl Compositor {
         }
     }
 
-    /// Records the pass. `picture` and `overlay` must be in a non-pixel
-    /// shader resource state and `result` (picture-sized, in `format`) in
+    /// Records the pass. The picture and optional overlay must be in a non-pixel
+    /// shader resource state and the output-sized `result` (in `format`) in
     /// the unordered access state; they stay so.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
@@ -86,7 +116,7 @@ impl Compositor {
         device: &ID3D12Device,
         list: &ID3D12GraphicsCommandList,
         picture: (&ID3D12Resource, DXGI_FORMAT),
-        overlay: (&ID3D12Resource, DXGI_FORMAT),
+        overlay: Option<(&ID3D12Resource, DXGI_FORMAT)>,
         result: &ID3D12Resource,
         format: DXGI_FORMAT,
     ) {
@@ -96,7 +126,7 @@ impl Compositor {
             let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: at.ptr + (i * self.step) as usize,
             };
-            for (i, (texture, format)) in [picture, overlay].into_iter().enumerate() {
+            for (i, (texture, format)) in [picture, overlay.unwrap_or(picture)].into_iter().enumerate() {
                 let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: format,
                     ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -116,19 +146,24 @@ impl Compositor {
                 ..Default::default()
             };
             device.CreateUnorderedAccessView(result, None, Some(&view), slot(2));
-            let (p, o) = (picture.0.GetDesc(), overlay.0.GetDesc());
-            let constants = [p.Width as u32, p.Height, o.Width as u32, o.Height];
+            let p = picture.0.GetDesc();
+            let out = result.GetDesc();
+            let (ow, oh) = overlay.map_or((0, 0), |(texture, _)| {
+                let d = texture.GetDesc();
+                (d.Width as u32, d.Height)
+            });
+            let constants = [p.Width as u32, p.Height, ow, oh, out.Width as u32, out.Height];
             list.SetDescriptorHeaps(&[Some(self.heap.clone())]);
             list.SetComputeRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
             list.SetComputeRootDescriptorTable(0, self.heap.GetGPUDescriptorHandleForHeapStart());
-            list.SetComputeRoot32BitConstants(1, 4, constants.as_ptr().cast(), 0);
-            list.Dispatch(constants[0].div_ceil(8), constants[1].div_ceil(8), 1);
+            list.SetComputeRoot32BitConstants(1, constants.len() as u32, constants.as_ptr().cast(), 0);
+            list.Dispatch((out.Width as u32).div_ceil(8), out.Height.div_ceil(8), 1);
         }
     }
 }
 
-/// A picture-sized texture the pass writes, in `format`.
+/// An output-sized texture the pass writes, in `format`.
 pub(crate) fn result_texture(
     device: &ID3D12Device,
     width: u64,
@@ -244,7 +279,7 @@ mod tests {
                         Width: width,
                         Height: height,
                         Depth: 1,
-                        RowPitch: 256,
+                        RowPitch: (width * 4).next_multiple_of(256),
                     },
                 },
             },
@@ -265,7 +300,7 @@ mod tests {
             result_texture(device, width.into(), height, DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
         let upload = buffer(
             D3D12_HEAP_TYPE_UPLOAD,
-            256 * u64::from(height),
+            u64::from((width * 4).next_multiple_of(256)) * u64::from(height),
             D3D12_RESOURCE_STATE_GENERIC_READ,
         );
         let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -275,7 +310,7 @@ mod tests {
             upload.Map(0, None, Some(&mut data)).unwrap();
             for y in 0..height {
                 for x in 0..width {
-                    let at = data.cast::<u8>().add((y * 256 + x * 4) as usize);
+                    let at = data.cast::<u8>().add((y * (width * 4).next_multiple_of(256) + x * 4) as usize);
                     std::ptr::copy_nonoverlapping(texels[(y * width + x) as usize].as_ptr(), at, 4);
                 }
             }
@@ -300,6 +335,67 @@ mod tests {
         }
         keep.push(upload);
         texture
+    }
+
+    #[test]
+    fn the_presentation_cap_preserves_aspect_and_never_enlarges() {
+        let cap = (1280, 720);
+        assert_eq!(fit_output(1920, 1080, cap), cap);
+        assert_eq!(fit_output(3840, 2160, cap), cap);
+        assert_eq!(fit_output(1024, 768, cap), (960, 720));
+        assert_eq!(fit_output(2560, 1080, cap), (1280, 540));
+        assert_eq!(fit_output(640, 360, cap), (640, 360));
+        assert_eq!(fit_output(1, 1440, cap), (1, 720));
+    }
+
+    #[test]
+    fn the_720p_output_samples_the_whole_picture_and_overlay() {
+        let Some(host) = crate::host::host() else { return };
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let compositor = Compositor::new(&host.device).unwrap();
+        let (w, h) = fit_output(1920, 1080, (1280, 720));
+        let stride = (w * 4).next_multiple_of(256);
+        let picture_pixel = |x: u32, y: u32| [x as u8, y as u8, 37, 77];
+        let overlay_pixel = |x: u32, y: u32| [21, x as u8, y as u8, if (x + y).is_multiple_of(3) { 255 } else { 0 }];
+        let upload = host.new_list().unwrap();
+        let mut keep = Vec::new();
+        let picture = texture(1920, 1080, &(0..1920 * 1080).map(|n| picture_pixel(n % 1920, n / 1920)).collect::<Vec<_>>(), &upload.list, &mut keep);
+        let overlay = texture(3840, 2160, &(0..3840 * 2160).map(|n| overlay_pixel(n % 3840, n / 3840)).collect::<Vec<_>>(), &upload.list, &mut keep);
+        upload.close();
+        host.execute(&[&upload]);
+        for blend in [false, true] {
+            let run = host.new_list().unwrap();
+            let result = result_texture(&host.device, u64::from(w), h, format).unwrap();
+            compositor.record(&host.device, &run.list, (&picture, format),
+                blend.then_some((&overlay, format)), &result, format);
+            let back = buffer(D3D12_HEAP_TYPE_READBACK, u64::from(stride) * u64::from(h), D3D12_RESOURCE_STATE_COPY_DEST);
+            // SAFETY: live resources and a destination covering the full output.
+            unsafe {
+                run.list.ResourceBarrier(&[transition(&result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                run.list.CopyTextureRegion(&rows(&back, w, h), 0, 0, 0, &whole(&result), None);
+            }
+            run.close();
+            host.execute(&[&run]);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the copy finished and the buffer stays mapped through the checks.
+            unsafe { back.Map(0, None, Some(&mut data)) }.unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let (sx, sy) = ((2 * x + 1) * 1920 / (2 * w), (2 * y + 1) * 1080 / (2 * h));
+                    let mut expected = picture_pixel(sx, sy);
+                    if blend {
+                        let top = overlay_pixel(sx * 2, sy * 2);
+                        if top[3] == 255 { expected = top; }
+                        expected[3] = 255;
+                    }
+                    // SAFETY: x and y are inside the mapped output footprint.
+                    let actual = unsafe { *data.cast::<[u8; 4]>().add((y * stride / 4 + x) as usize) };
+                    assert_eq!(actual, expected, "pixel {x},{y}, overlay {blend}");
+                }
+            }
+            // SAFETY: this test owns the finished readback.
+            unsafe { back.Unmap(0, None) };
+        }
     }
 
     /// A 4x4 red picture under a 2x2 overlay whose top-left texel is opaque
@@ -330,7 +426,7 @@ mod tests {
             device,
             list,
             (&picture, format),
-            (&overlay, format),
+            Some((&overlay, format)),
             &result,
             format,
         );

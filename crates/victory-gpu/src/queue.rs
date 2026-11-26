@@ -234,7 +234,7 @@ fn pump(held: &mut Holding, why: Why) {
     }
     // Once work stays held, a timer tests it every 2 ms: memory the title
     // writes from the CPU, or the valve, may let it go with no call of ours.
-    if held.blocked(&read).is_empty() {
+    if held.is_empty() {
         return;
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
@@ -344,13 +344,16 @@ fn account_frame(frame: u64) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a `PresentX` call (0x48-byte stride): frame token,
+/// resource count, and pointer to the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -669,6 +672,7 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);

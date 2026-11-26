@@ -409,12 +409,14 @@ mod tests {
         held.push(2, Item::Signal(5, 1));
         pump(&mut held, &fake);
         let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
+        assert!(!held.is_empty());
         let blocked = held.blocked(&read);
         assert_eq!(blocked.len(), 1);
         assert_eq!((blocked[0].0, blocked[0].1, blocked[0].3.clone()), (2, 2, vec![ge(0x100, 2)]));
         fake.borrow_mut().memory.insert(0x100, 2);
         let p = pump(&mut held, &fake);
         assert_eq!(p.waited.len(), 1);
+        assert!(held.is_empty());
         assert_eq!(fake.borrow().log, ["q2: late", "signal 5 1"]);
     }
 

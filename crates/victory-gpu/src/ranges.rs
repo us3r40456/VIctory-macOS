@@ -1,6 +1,13 @@
 //! Sets of byte ranges, for the memory a submission has brought up to date
 //! and what it still has to (`crate::host`'s batch of refreshes).
 
+#[cfg(any(feature = "diagnostics", test))]
+use std::cmp::Reverse;
+#[cfg(any(feature = "diagnostics", test))]
+use std::collections::BinaryHeap;
+#[cfg(any(feature = "diagnostics", test))]
+use std::fmt;
+
 /// Byte ranges `[from, to)`, in order and apart: ranges that touch or
 /// overlap are one. A few per host copy, so a vector is the cheapest set.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -68,9 +75,137 @@ impl Ranges {
     }
 }
 
+/// How many of a submission's largest refresh ranges are logged.
+#[cfg(any(feature = "diagnostics", test))]
+const REFRESH_TOP: usize = 8;
+
+/// A bounded summary of the ranges a submission refreshed into host shadows.
+/// The ranges are attributed only to their host copy: a batch combines
+/// requests from lists, view heaps and page tables, and does not retain a
+/// reliable descriptor or view owner for each range.
+#[cfg(any(feature = "diagnostics", test))]
+#[derive(Default)]
+pub(crate) struct RefreshSummary {
+    bytes: u64,
+    ranges: u64,
+    largest: BinaryHeap<Reverse<RefreshedRange>>,
+}
+
+/// One refreshed range, ordered largest first and then by title address.
+#[cfg(any(feature = "diagnostics", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RefreshedRange {
+    len: u64,
+    title: u64,
+    host_gpu: u64,
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+impl Ord for RefreshedRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.len
+            .cmp(&other.len)
+            .then_with(|| other.title.cmp(&self.title))
+            .then_with(|| other.host_gpu.cmp(&self.host_gpu))
+    }
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+impl PartialOrd for RefreshedRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+impl RefreshSummary {
+    /// Counts a range of `len` title bytes and where it lands in host memory.
+    pub(crate) fn record(&mut self, title: u64, len: u64, host_gpu: u64) {
+        self.bytes = self.bytes.saturating_add(len);
+        self.ranges = self.ranges.saturating_add(1);
+        if len == 0 {
+            return;
+        }
+        let range = RefreshedRange {
+            len,
+            title,
+            host_gpu,
+        };
+        if self.largest.len() < REFRESH_TOP {
+            self.largest.push(Reverse(range));
+        } else if self.largest.peek().is_some_and(|worst| range > worst.0) {
+            self.largest.pop();
+            self.largest.push(Reverse(range));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ranges == 0
+    }
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+impl fmt::Display for RefreshSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ranges, {} bytes", self.ranges, self.bytes)?;
+        let mut largest: Vec<_> = self.largest.iter().copied().collect();
+        largest.sort_unstable();
+        for Reverse(range) in largest {
+            write!(
+                f,
+                "; title {:#x}+{:#x} host_gpu {:#x}",
+                range.title, range.len, range.host_gpu
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Ranges;
+    use super::{REFRESH_TOP, Ranges, RefreshSummary};
+
+    /// Synthetic ranges arrive out of order: totals cover all of them, while
+    /// the formatted largest are bounded and ties have a stable order.
+    #[test]
+    fn refresh_summary_orders_caps_and_formats_ranges() {
+        let ranges = [
+            (0x1000, 0x20, 0x2000),
+            (0x5000, 0x100, 0x9000),
+            (0x3000, 0x40, 0x5000),
+            (0x8000, 0xc0, 0xd000),
+            (0x2000, 0x100, 0x4000),
+            (0x6000, 0x10, 0xa000),
+            (0x7000, 0x200, 0xb000),
+            (0x9000, 0x60, 0xe000),
+            (0x4000, 0x80, 0x6000),
+            (0xa000, 0x8, 0xf000),
+        ];
+        let mut summary = RefreshSummary::default();
+        for &(title, len, host_gpu) in &ranges {
+            summary.record(title, len, host_gpu);
+        }
+        assert_eq!(summary.ranges, ranges.len() as u64);
+        assert_eq!(summary.bytes, ranges.iter().map(|r| r.1).sum());
+        assert_eq!(
+            summary.to_string(),
+            concat!(
+                "10 ranges, 1560 bytes",
+                "; title 0x7000+0x200 host_gpu 0xb000",
+                "; title 0x2000+0x100 host_gpu 0x4000",
+                "; title 0x5000+0x100 host_gpu 0x9000",
+                "; title 0x8000+0xc0 host_gpu 0xd000",
+                "; title 0x4000+0x80 host_gpu 0x6000",
+                "; title 0x9000+0x60 host_gpu 0xe000",
+                "; title 0x3000+0x40 host_gpu 0x5000",
+                "; title 0x1000+0x20 host_gpu 0x2000",
+            ),
+            "only the top {REFRESH_TOP} are logged, largest first"
+        );
+        assert!(!summary.to_string().contains("0x6000+0x10"));
+        assert!(!summary.to_string().contains("0xa000+0x8"));
+    }
 
     fn set(ranges: &[(usize, usize)]) -> Ranges {
         let mut r = Ranges::default();

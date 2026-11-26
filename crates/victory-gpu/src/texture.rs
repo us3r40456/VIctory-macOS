@@ -10,7 +10,11 @@
 //! same physical pages) in the runtime's memory; elsewhere, the whole memory
 //! compared with the bytes last detiled at every submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Both refresh paths detile only the subresources whose bytes changed: the
+//! tracked one those whose bytes hash differently from the bytes last
+//! detiled, the compared one those that a differing run touches. A change
+//! inside one mip does not detile the others.
+//!
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
@@ -649,13 +653,12 @@ impl Staging {
         // faulting: asking `VirtualQuery` first cost about 2 ms in the
         // title's big pools (see `crate::host::copy_mapped`).
         let memory = self.memory;
-        let changed = COMPARE_SCRATCH.with_borrow_mut(|scratch| {
+        let Some(runs) = COMPARE_SCRATCH.with_borrow_mut(|scratch| {
             scratch.resize(COMPARE_CHUNK, 0);
             read_changed(last, size, scratch, |at, to| {
                 crate::host::read_into(memory.wrapping_add(at), to)
             })
-        });
-        let Some(changed) = changed else {
+        }) else {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -676,11 +679,23 @@ impl Staging {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if !changed {
+        if runs.is_empty() {
             return (size, None);
         }
-        let every = all();
-        let buffer = self.detile(&last.read, &every);
+        // Only the subresources the changed runs touch, as the tracked path
+        // above does from the tracker's pages: the others would detile and
+        // upload the bytes their host texture already holds. (Runs in bytes
+        // no subresource lies in touch nothing, and detile nothing.)
+        let n = self.footprints.len();
+        let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+        let fresh: Vec<u32> = (0..n)
+            .filter(|&i| {
+                let (a, b) = span(i);
+                touches(&runs, a, b)
+            })
+            .map(|i| i as u32)
+            .collect();
+        let buffer = if fresh.is_empty() { None } else { self.detile(&last.read, &fresh) };
         last.uploaded = last.uploaded || buffer.is_some();
         if buffer.is_none() {
             // Read again (and detiled) at the next refresh.
@@ -688,7 +703,7 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, every)))
+        (size, buffer.map(|(b, at)| (b, at, fresh)))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
@@ -780,39 +795,67 @@ thread_local! {
 ///
 /// The memory is read a `scratch` at a time and compared with `last.read`
 /// there, so memory that did not change is read once, as comparing it alone
-/// reads it, and not copied; from the first chunk that differs, the rest is
-/// read straight into `last.read`. A read that fails after that leaves
-/// `last.read` half new: it stays invalid until all of the memory has been
-/// read, which then counts as a change however the bytes compare.
+/// reads it, and not copied. The answer is the runs of bytes that differ
+/// (they need not be maximal across the chunks), kept up to date in
+/// `last.read`; a memory not read whole yet is one run of everything. A
+/// read that fails part way leaves `last.read` half new: it stays invalid
+/// until all of the memory has been read, which then counts as a change
+/// however the bytes compare.
 fn read_changed(
     last: &mut Last,
     size: usize,
     scratch: &mut [u8],
     read: impl Fn(usize, &mut [u8]) -> bool,
-) -> Option<bool> {
+) -> Option<Vec<(usize, usize)>> {
     last.read.resize(size, 0);
+    if !last.valid {
+        // Not the memory's yet (never read, or a read failed part way):
+        // read it all, which counts as a change however the bytes compare.
+        if !read(0, &mut last.read) {
+            return None;
+        }
+        last.valid = true;
+        return Some(vec![(0, size)]);
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut at = 0;
-    while last.valid && at < size {
+    while at < size {
         let n = scratch.len().min(size - at);
         let chunk = &mut scratch[..n];
         if !read(at, chunk) {
+            // Where no differing byte was kept, `last.read` is still the
+            // memory's; where one was, it is half new, and not trusted.
+            last.valid = runs.is_empty();
             return None;
         }
         let kept = &mut last.read[at..at + n];
-        at += n;
-        if *kept != *chunk {
-            kept.copy_from_slice(chunk);
-            last.valid = false;
+        if *kept == *chunk {
+            // The usual case: one slice comparison, no byte walk.
+            at += n;
+            continue;
         }
+        let mut i = 0;
+        while i < n {
+            if kept[i] != chunk[i] {
+                let first = i;
+                while i < n && kept[i] != chunk[i] {
+                    i += 1;
+                }
+                runs.push((at + first, i - first));
+                kept[first..i].copy_from_slice(&chunk[first..i]);
+            } else {
+                i += 1;
+            }
+        }
+        at += n;
     }
-    if last.valid {
-        return Some(false);
-    }
-    if at < size && !read(at, &mut last.read[at..]) {
-        return None;
-    }
-    last.valid = true;
-    Some(true)
+    Some(runs)
+}
+
+/// Whether any changed run of a texture's memory (offset, length) touches
+/// the subresource's bytes `[a, b)`.
+fn touches(runs: &[(usize, usize)], a: usize, b: usize) -> bool {
+    runs.iter().any(|&(at, len)| at < b && a < at + len)
 }
 
 /// Bytes available in the staging buffer for a subresource at `offset`.
@@ -936,7 +979,8 @@ mod tests {
 
     /// `read_changed` over `memory` in chunks of 1000 bytes, the bytes from
     /// `hole` on unreadable (a read of them copies what comes before it and
-    /// fails, as the kernel's does): its answer, and the bytes read.
+    /// fails, as the kernel's does): whether the memory changed (any run),
+    /// and the bytes read.
     fn changed(last: &mut Last, memory: &[u8], hole: usize) -> (Option<bool>, usize) {
         let read_bytes = std::cell::Cell::new(0);
         let answer = read_changed(last, memory.len(), &mut [0u8; 1000], |at, to| {
@@ -945,7 +989,7 @@ mod tests {
             read_bytes.set(read_bytes.get() + n);
             n == to.len()
         });
-        (answer, read_bytes.get())
+        (answer.map(|runs| !runs.is_empty()), read_bytes.get())
     }
 
     #[test]
@@ -972,6 +1016,49 @@ mod tests {
             assert_eq!(last.read, memory);
             assert_eq!(changed(&mut last, &memory, all), (Some(false), 4500));
         }
+    }
+
+    #[test]
+    fn untracked_memory_reports_the_runs_that_changed() {
+        fn read(last: &mut Last, memory: &[u8]) -> Vec<(usize, usize)> {
+            let mut scratch = [0u8; 1000];
+            read_changed(last, memory.len(), &mut scratch, |at, to| {
+                to.copy_from_slice(&memory[at..at + to.len()]);
+                true
+            })
+            .unwrap()
+        }
+        let mut last = Last::default();
+        let mut memory = vec![0u8; 4500];
+        // Memory not read whole yet: everything counts as changed, once.
+        assert_eq!(read(&mut last, &memory), vec![(0, 4500)]);
+        assert_eq!(read(&mut last, &memory), Vec::<(usize, usize)>::new());
+        // A run of two bytes, and a lone one at the end of the memory.
+        memory[1] = 1;
+        memory[2] = 2;
+        memory[4499] = 3;
+        assert_eq!(read(&mut last, &memory), vec![(1, 2), (4499, 1)]);
+        assert_eq!(last.read, memory);
+        // A run stops at the scratch's edge; the intersection does not
+        // need runs maximal.
+        memory[999] = 9;
+        memory[1000] = 10;
+        assert_eq!(read(&mut last, &memory), vec![(999, 1), (1000, 1)]);
+        assert_eq!(last.read, memory);
+        // Only the runs' bytes are kept from the read; the rest keep theirs.
+        assert_eq!(read(&mut last, &memory), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn changed_runs_touch_only_the_subresources_they_overlap() {
+        let runs = [(10usize, 5usize), (100, 1)];
+        assert!(touches(&runs, 0, 16));
+        assert!(touches(&runs, 14, 20));
+        assert!(!touches(&runs, 15, 20));
+        assert!(touches(&runs, 0, 200));
+        assert!(!touches(&runs, 101, 500));
+        assert!(!touches(&runs, 99, 100));
+        assert!(!touches(&[], 0, 500));
     }
 
     #[test]
@@ -1034,12 +1121,9 @@ mod tests {
         assert!(committed(base, 3 * PAGE));
         assert_eq!(
             read_changed(&mut last, 3 * PAGE, &mut scratch, read),
-            Some(true)
+            Some(vec![(0, 3 * PAGE)])
         );
-        assert_eq!(
-            read_changed(&mut last, 3 * PAGE, &mut scratch, read),
-            Some(false)
-        );
+        assert_eq!(read_changed(&mut last, 3 * PAGE, &mut scratch, read), Some(Vec::new()));
         // Out of reach again: unchanged as far as can be told.
         protect(PAGE_NOACCESS);
         assert_eq!(read_changed(&mut last, 3 * PAGE, &mut scratch, read), None);

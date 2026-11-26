@@ -10,7 +10,7 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::descriptor::View;
@@ -315,10 +315,31 @@ impl Uploads {
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, _, bit) in inner.hulls.values() {
+    for (shadow, address, len, uav, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
-            add(shadow, *address as usize, *len as usize);
+            let (address, len) = if *uav && shadow.marked() {
+                shadow.page_range(*address, *len)
+            } else {
+                (*address, *len)
+            };
+            add(shadow, address as usize, len as usize);
         }
+    }
+}
+
+/// Per submission: the buffer range of the view currently in `index`. A
+/// table draw may have been recorded with another view in that slot.
+pub(crate) fn refresh_slot(
+    viewed: &Viewed,
+    index: u32,
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
+        return;
+    };
+    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+        add(shadow, *address as usize, *len as usize);
     }
 }
 
@@ -334,7 +355,28 @@ pub(crate) fn note_draw(writes: bool) {
     HEAP_DRAWS[0].fetch_add(1, Relaxed);
     if writes {
         HEAP_DRAWS[1].fetch_add(1, Relaxed);
+        if !HEAP_WRITTEN.swap(true, Relaxed) {
+            REMAKE.store(true, Relaxed);
+        }
     }
+}
+
+/// A shader wrote through a heap's views (ever): textures viewed for
+/// unordered access there may hold what the GPU wrote, which no state move
+/// shows (`crate::resource::evictable`).
+static HEAP_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// The unordered views left null are to be made again before the next
+/// submission ([`take_remake`]).
+static REMAKE: AtomicBool = AtomicBool::new(false);
+
+/// Whether any shader wrote through a heap yet.
+pub(crate) fn heap_written() -> bool {
+    HEAP_WRITTEN.load(Relaxed)
+}
+
+/// Whether the null unordered views are to be made again now (once).
+pub(crate) fn take_remake() -> bool {
+    REMAKE.swap(false, Relaxed)
 }
 
 /// Every view heap's registry.

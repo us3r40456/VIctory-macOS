@@ -266,6 +266,9 @@ parse_cargo() { # LOG
             gsub(/0x[0-9a-fA-F]+/, "@HEX@", t)
             gsub(/[0-9]+(\.[0-9]+)?/, "#", t)
             gsub(/@HEX@/, "0x#", t)
+            # Windows OS error messages are localized; code and kind carry
+            # the stable meaning (for example PermissionDenied on every Mac).
+            gsub(/, message: "[^"]*"/, "", t)
             gsub(/[ \t]+/, " ", t)
             sub(/^ /, "", t)
             return substr(t, 1, 400)

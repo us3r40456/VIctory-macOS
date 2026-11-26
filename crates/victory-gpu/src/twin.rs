@@ -178,10 +178,38 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             routes.push(route);
         }
     }
-    let scratch = scratch_buffer(at)?;
-    crate::host::name(&scratch, || format!("depth twin copies {at:#x}"));
+    let scratch = shared_scratch(at)?;
     tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
     Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
+}
+
+/// Scratch buffers shared by the twins, one per power-of-two size: a
+/// buffer each held as much video memory as its twin's planes for good
+/// (about 325 MB for Grand Theft Auto VI's 315 twins in the menu).
+/// Sharing is safe: every copy through one ([`Twin::copy`]) starts in the
+/// common state and returns the buffer to it, so copies in one list are
+/// ordered by those transitions, and lists run one after another on the
+/// host's single queue.
+struct Scratch(Vec<(u64, ID3D12Resource)>);
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Scratch {}
+
+static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::new()));
+
+/// The shared scratch buffer of at least `size` bytes: the one of `size`'s
+/// power-of-two class, made on first use. All of them together hold at
+/// most twice the largest.
+fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
+    let class = size.max(1 << 16).next_power_of_two();
+    let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
+        return Some(buffer.clone());
+    }
+    let buffer = scratch_buffer(class)?;
+    crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
+    all.0.push((class, buffer.clone()));
+    Some(buffer)
 }
 
 /// A default-heap buffer of `size` bytes shaders may write, in the common

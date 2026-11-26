@@ -107,6 +107,17 @@ no "seconds with too many decimals" bad '.binaries[0].seconds = 1.234'
 ok "seconds as cargo prints them" bad '.binaries = [{suite: "native", name: "census", seconds: 0.28},
     {suite: "native", name: "victory_formats", seconds: 4.89}, {suite: "wine", name: "victory", seconds: 0.07}]'
 ok "every time to two decimals" bad '.binaries = [range(80) | {suite: "native", name: "b\(.)", seconds: ("0.\(. + 10)" | tonumber)}]'
+# Includes task #98's rejected values and valid hundredths near the bounds.
+for seconds in 0.55 0.07 0.28 0 0.01 0.29 1.13 1.14 9.49 14.23 25.15 99999.99 100000; do
+    ok "binary seconds $seconds" bad ".binaries[0].seconds = $seconds"
+    ok "suite seconds $seconds" bad ".timings.native = $seconds"
+done
+for seconds in -0.01 100000.01 0.551 0.5500000000000001 99999.999; do
+    no "invalid binary seconds $seconds" bad ".binaries[0].seconds = $seconds"
+    no "invalid suite seconds $seconds" bad ".timings.native = $seconds"
+done
+no "numeric text is not binary seconds" bad '.binaries[0].seconds = "0.55"'
+no "numeric text is not suite seconds" bad '.timings.native = "0.55"'
 no "binary name with text" bad '.binaries[0].name = "see https://x"'
 no "unknown suite" bad '.binaries[0].suite = "game"'
 ok "null timings" bad '.timings = {setup: 5, native: null, wine: null}'
@@ -200,6 +211,19 @@ ok "signature is 12 hex" grep -Eq '^[0-9a-f]{12}$' <<< "$(jq -r '.[0].sig' <<< "
 sed 's/0x7ff3a0/0x1234/; s/left: 3/left: 9/; s|/Users/someone/src|/home/runner/work|' "$tmp/native.log" > "$tmp/other-mac.log"
 eq "same failure on another Mac gives the same signature" "$(jq -r '.[0].sig' <<< "$failures")" \
     "$(failures_json "$(parse_cargo "$tmp/other-mac.log")" native | jq -r '.[0].sig')"
+cat > "$tmp/english-os.log" << 'EOF'
+      Running unittests src/lib.rs (target/debug/deps/victory_loader-0f1e2d3c4b5a6978)
+running 1 test
+test publish::tests::concurrent_publishers_do_not_share_a_staging_file ... FAILED
+failures:
+---- publish::tests::concurrent_publishers_do_not_share_a_staging_file stdout ----
+called `Result::unwrap()` on an `Err` value: Os { code: 5, kind: PermissionDenied, message: "Access is denied." }
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+EOF
+sed 's/Access is denied\./Accès refusé./' "$tmp/english-os.log" > "$tmp/french-os.log"
+english_sig=$(failures_json "$(parse_cargo "$tmp/english-os.log")" wine | jq -r '.[0].sig')
+french_sig=$(failures_json "$(parse_cargo "$tmp/french-os.log")" wine | jq -r '.[0].sig')
+eq "localized OS error text gives the same signature" "$english_sig" "$french_sig"
 eq "binaries json" '[{"suite":"wine","name":"victory_gpu","seconds":0.52},{"suite":"wine","name":"load_probe","seconds":12},{"suite":"wine","name":"doc_victory_core","seconds":0}]' "$(binaries_json "$parsed" wine)"
 eq "signature lines keep the text locally" "native/victory_gpu::tests::two" "$(signature_lines "$parsed" native | head -n 1 | cut -f 2)"
 eq "topic: timeout wins" timeout "$(failure_topic "victory_gpu::x" "timed out after #s")"

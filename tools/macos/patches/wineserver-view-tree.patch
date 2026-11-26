@@ -1,0 +1,216 @@
+wineserver: index a process's memory views by base address as well.
+
+Wine's server keeps a process's views in a list and walks it on every map
+and unmap request. VIctory-macOS #155 reports the title mapping and
+unmapping 64 KiB views thousands of times a frame, at about 1 ms a request
+with about 20,000 views mapped (WineHQ bug 60868). With the views also in a
+red-black tree by base, find_mapped_view, find_mapped_addr and
+is_valid_view_addr are O(log n). No protocol change.
+
+By UwUCammie, posted in fxceless/victory-fork#184 against Wine 11.22. It
+applies to CrossOver 26.3.0's Wine 11.0 unchanged. One line added here:
+add_view_to_tree clears view->tree first, so a view the tree refuses
+(a base already in it, which cannot happen while views do not overlap)
+never leaves mem_alloc's garbage there for free_memory_view to remove.
+
+Like Wine, this patch is under the LGPL 2.1 or later. Applied by
+tools/macos/build-crossover-wine.sh.
+
+diff --git a/server/file.h b/server/file.h
+index 99215b8..15aa296 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -180,6 +180,7 @@ extern struct file *get_view_file( const struct memory_view *view, unsigned int
+ extern const struct pe_image_info *get_view_image_info( const struct memory_view *view, client_ptr_t *base );
+ extern int get_view_nt_name( const struct memory_view *view, struct unicode_str *name );
+ extern void free_mapped_views( struct process *process );
++extern void init_mapped_views( struct process *process );
+ extern size_t get_page_size(void);
+ extern struct mapping *create_fd_mapping( struct object *root, struct unicode_str name, struct fd *fd,
+                                           unsigned int attr, const struct security_descriptor *sd );
+diff --git a/server/mapping.c b/server/mapping.c
+index d1b0fc3..4233509 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -98,6 +98,8 @@ static struct list shared_map_list = LIST_INIT( shared_map_list );
+ struct memory_view
+ {
+     struct list     entry;           /* entry in per-process view list */
++    struct wine_rb_entry rb_entry;   /* entry in the per-process tree of views by base */
++    struct wine_rb_tree *tree;       /* the tree rb_entry is in, NULL if the view is only in the list */
+     struct fd      *fd;              /* fd for mapped file */
+     struct ranges  *committed;       /* list of committed ranges in this mapping */
+     struct shared_map *shared;       /* temp file for shared PE mapping */
+@@ -384,13 +386,57 @@ static int create_temp_file( file_pos_t size )
+     return fd;
+ }
+ 
++/* The views of a process never overlap, so they are also kept in a tree by base address: the map and unmap
++ * requests then cost O(log n) instead of a walk over every view of the process (a title that maps 64 KiB pages by
++ * the thousand made wineserver spend most of a core in these loops). A view whose base is already in the tree
++ * (cannot happen while views do not overlap) stays list-only and is found by a walk of the list. */
++static int untracked_views;
++
++static int compare_view_base( const void *key, const struct wine_rb_entry *entry )
++{
++    const struct memory_view *view = WINE_RB_ENTRY_VALUE( entry, struct memory_view, rb_entry );
++    client_ptr_t base = *(const client_ptr_t *)key;
++
++    if (base < view->base) return -1;
++    return base > view->base;
++}
++
++void init_mapped_views( struct process *process )
++{
++    wine_rb_init( &process->views_tree, compare_view_base );
++}
++
++/* the view with the greatest base not above addr, or NULL */
++static struct memory_view *find_view_at_or_below( struct process *process, client_ptr_t addr )
++{
++    struct wine_rb_entry *entry = process->views_tree.root, *best = NULL;
++
++    while (entry)
++    {
++        struct memory_view *view = WINE_RB_ENTRY_VALUE( entry, struct memory_view, rb_entry );
++        if (view->base <= addr)
++        {
++            best = entry;
++            entry = entry->right;
++        }
++        else entry = entry->left;
++    }
++    return best ? WINE_RB_ENTRY_VALUE( best, struct memory_view, rb_entry ) : NULL;
++}
++
+ /* find a memory view from its base address */
+ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base )
+ {
+     struct memory_view *view;
++    struct wine_rb_entry *entry = wine_rb_get( &process->views_tree, &base );
+ 
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (view->base == base) return view;
++    if (entry) return WINE_RB_ENTRY_VALUE( entry, struct memory_view, rb_entry );
++
++    if (untracked_views)
++    {
++        LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
++            if (!view->tree && view->base == base) return view;
++    }
+ 
+     set_error( STATUS_NOT_MAPPED_VIEW );
+     return NULL;
+@@ -399,10 +445,15 @@ struct memory_view *find_mapped_view( struct process *process, client_ptr_t base
+ /* find a memory view from any address inside it */
+ static struct memory_view *find_mapped_addr( struct process *process, client_ptr_t addr )
+ {
+-    struct memory_view *view;
++    struct memory_view *view = find_view_at_or_below( process, addr );
+ 
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+-        if (addr >= view->base && addr < view->base + view->size) return view;
++    if (view && addr < view->base + view->size) return view;
++
++    if (untracked_views)
++    {
++        LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
++            if (!view->tree && addr >= view->base && addr < view->base + view->size) return view;
++    }
+ 
+     set_error( STATUS_NOT_MAPPED_VIEW );
+     return NULL;
+@@ -417,12 +468,19 @@ static int is_valid_view_addr( struct process *process, client_ptr_t addr, mem_s
+     if (addr & (process->page_size - 1)) return 0;
+     if (addr + size < addr) return 0;  /* overflow */
+ 
+-    /* check for overlapping view */
+-    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
++    /* check for overlapping view: the last view starting below the end of the range is the only candidate,
++     * as the views before it end before it starts */
++    if ((view = find_view_at_or_below( process, addr + size - 1 )) && view->base + view->size > addr) return 0;
++
++    if (untracked_views)
+     {
+-        if (view->base + view->size <= addr) continue;
+-        if (view->base >= addr + size) continue;
+-        return 0;
++        LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
++        {
++            if (view->tree) continue;
++            if (view->base + view->size <= addr) continue;
++            if (view->base >= addr + size) continue;
++            return 0;
++        }
+     }
+     return 1;
+ }
+@@ -440,6 +498,13 @@ static int generate_dll_event( struct thread *thread, int code, struct memory_vi
+     return 1;
+ }
+ 
++static void add_view_to_tree( struct process *process, struct memory_view *view )
++{
++    view->tree = NULL;
++    if (!wine_rb_put( &process->views_tree, &view->base, &view->rb_entry )) view->tree = &process->views_tree;
++    else untracked_views++;
++}
++
+ /* add a view to the process list */
+ /* return 1 if this is the main exe view */
+ static int add_process_view( struct thread *thread, struct memory_view *view )
+@@ -462,10 +526,12 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
+                 process->imagelen = name.len;
+             process->image_info = view->image;
+             list_add_head( &process->views, &view->entry );
++            add_view_to_tree( process, view );
+             return 1;
+         }
+     }
+     list_add_tail( &process->views, &view->entry );
++    add_view_to_tree( process, view );
+     return 0;
+ }
+ 
+@@ -474,6 +540,8 @@ static void free_memory_view( struct memory_view *view )
+     if (view->fd) release_object( view->fd );
+     if (view->committed) release_object( view->committed );
+     if (view->shared) release_object( view->shared );
++    if (view->tree) wine_rb_remove( view->tree, &view->rb_entry );
++    else if (view->entry.next) untracked_views--;
+     list_remove( &view->entry );
+     free( view );
+ }
+diff --git a/server/process.c b/server/process.c
+index 510faf1..a3aa6e3 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -648,6 +648,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     list_init( &process->asyncs );
+     list_init( &process->classes );
+     list_init( &process->views );
++    init_mapped_views( process );
+ 
+     process->end_time = 0;
+ 
+diff --git a/server/process.h b/server/process.h
+index dff766d..f907e56 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -22,6 +22,7 @@
+ #define __WINE_SERVER_PROCESS_H
+ 
+ #include "object.h"
++#include "wine/rbtree.h"
+ 
+ struct atom_table;
+ struct handle_table;
+@@ -80,6 +81,7 @@ struct process
+     obj_handle_t         desktop;         /* handle to desktop to use for new threads */
+     struct token        *token;           /* security token associated with this process */
+     struct list          views;           /* list of memory views */
++    struct wine_rb_tree  views_tree;      /* the same views by base address (they never overlap) */
+     client_ptr_t         peb;             /* PEB address in client address space */
+     struct dir_cache    *dir_cache;       /* map of client-side directory cache */
+     unsigned int         trace_data;      /* opaque data used by the process tracing mechanism */
+

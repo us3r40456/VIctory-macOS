@@ -5,6 +5,12 @@
 //! other's bytes or rename a file the other already published. The final
 //! rename is atomic within the directory, and the staging file is removed
 //! if publication fails.
+//!
+//! A rename can be refused with nothing wrong: Wine does not replace a file
+//! that is open, and when two writers race, the second rename can find the
+//! first writer's file still open. A writer whose rename fails therefore
+//! looks at the destination again, and has nothing left to do when its
+//! bytes are already there.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,9 +20,21 @@ static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 /// Writes `bytes` to `path` unless it is already there, using a staging file
 /// unique to this process and call.
 pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+    if holds(path, bytes) {
         return Ok(());
     }
+    publish(path, bytes)
+}
+
+/// Whether `path` can be read and holds exactly `bytes`.
+fn holds(path: &Path, bytes: &[u8]) -> bool {
+    std::fs::read(path).is_ok_and(|existing| existing == bytes)
+}
+
+/// Stages `bytes` next to `path` and renames the staging file over it. A
+/// refused rename still counts when `path` holds `bytes` by then, because
+/// another writer has published the same bytes.
+fn publish(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -29,6 +47,9 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(&staging, bytes)?;
     if let Err(error) = std::fs::rename(&staging, path) {
         let _ = std::fs::remove_file(&staging);
+        if holds(path, bytes) {
+            return Ok(());
+        }
         return Err(error);
     }
     Ok(())
@@ -60,6 +81,30 @@ mod tests {
             .filter(|entry| entry.path() != path)
             .collect();
         assert!(leftovers.is_empty(), "staging files were removed: {leftovers:?}");
+    }
+
+    /// The publisher that loses that race: the destination already holds
+    /// its bytes and is open, which is when Wine refuses the rename. It
+    /// still succeeds, and removes its staging file.
+    #[test]
+    fn a_rename_onto_an_open_file_with_the_same_bytes_is_a_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let bytes = b"a prepared image";
+        std::fs::write(&path, bytes).unwrap();
+        let open = std::fs::File::open(&path).unwrap();
+        publish(&path, bytes).unwrap();
+        drop(open);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path() != path)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging files were removed: {leftovers:?}"
+        );
     }
 
     #[test]

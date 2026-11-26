@@ -102,21 +102,25 @@ pub fn log_crash(text: &str) {
 }
 
 fn append_to_log(text: &str) {
-    use std::io::Write;
     let Some(file) = LOG.get() else { return };
+    let _ = append_record(file, text);
+}
+
+fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(
-            f,
-            "unix time {now}, process {}\n{text}\n",
-            std::process::id()
-        );
+    let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    // Formatting directly into the file can append fragments separately.
+    // Use one append, with no lock to acquire from an exception handler.
+    if file.write(record.as_bytes())? == record.len() {
+        Ok(())
+    } else {
+        // Retrying a short write could put another report between its pieces.
+        Err(Error::new(ErrorKind::WriteZero, "incomplete crash record append"))
     }
 }
 
@@ -400,6 +404,75 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
         return None;
     }
     (limit != base).then_some(ClwbLoop { base, limit, len })
+}
+
+/// Where `code` has a [`clwb_loop`]: the offset of its `clwb` and that
+/// instruction's length (66, an optional REX, 0f ae, ModRM).
+fn clwb_loop_sites(code: &[u8]) -> Vec<(usize, usize)> {
+    (0..code.len())
+        .filter(|&at| code[at] == 0x66)
+        .filter_map(|at| {
+            clwb_loop(&code[at..(at + 32).min(code.len())])?;
+            Some((at, if matches!(code[at + 1], 0x40 | 0x41) { 5 } else { 4 }))
+        })
+        .collect()
+}
+
+/// The write-back loops the supported build has (#135). Anything else is
+/// not that build, or a pattern that is no loop, and nothing is patched.
+const CLWB_LOOPS: usize = 8;
+
+/// Turns the `clwb` of every [`clwb_loop`] in the executable sections of
+/// the image mapped at `base` into a NOP of its length, and returns how
+/// many. Under Rosetta `clwb` faults and each loop costs an exception
+/// (~300 us through Wine): the world load ran ~15,000 a second on job
+/// threads and crawled (#135). The loop's `add`/`cmp`/`jbe` stay, so its
+/// registers end as before. Before any title thread runs.
+///
+/// Nothing is patched, and 0 returned, unless exactly [`CLWB_LOOPS`] loops
+/// are found: the count found is logged otherwise.
+pub fn nop_clwb_loops(base: u64, info: &victory_pe::ImageInfo) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const EXECUTE: u32 = 0x2000_0000;
+    let mut sites = Vec::new();
+    for s in info.sections.iter().filter(|s| s.characteristics & EXECUTE != 0) {
+        let start = base + u64::from(s.rva);
+        let len = s.virtual_size.min(s.file_size) as usize;
+        // SAFETY: the mapped section, readable code.
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+        sites.extend(clwb_loop_sites(code).into_iter().map(|(at, n)| (start, at, n)));
+    }
+    if sites.len() != CLWB_LOOPS {
+        tracing::warn!(
+            found = sites.len(),
+            expected = CLWB_LOOPS,
+            "clwb write-back loops are not patched: this is not the build they were counted in"
+        );
+        return 0;
+    }
+    let mut patched = 0;
+    for (start, at, n) in sites {
+        const NOP4: [u8; 4] = [0x0f, 0x1f, 0x40, 0x00];
+        const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
+        let site = (start + at as u64) as *mut u8;
+        let mut old = 0;
+        // SAFETY: the title's code, writable for the moment of the
+        // write, before any title thread runs.
+        unsafe {
+            if VirtualProtect(site.cast(), n, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                continue;
+            }
+            let nop: &[u8] = if n == 5 { &NOP5 } else { &NOP4 };
+            std::ptr::copy_nonoverlapping(nop.as_ptr(), site, n);
+            VirtualProtect(site.cast(), n, old, &mut old);
+        }
+        patched += 1;
+    }
+    // SAFETY: flushes the whole instruction cache of our process.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0) };
+    patched
 }
 
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
@@ -1050,6 +1123,49 @@ mod tests {
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
+    #[test]
+    fn concurrent_crash_records_stay_together() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("synthetic-crashes.txt");
+        let ready = std::sync::Barrier::new(THREADS);
+        let body = "x".repeat(8192);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (file, ready, body) = (&file, &ready, &body);
+                scope.spawn(move || {
+                    ready.wait();
+                    for record in 0..RECORDS {
+                        super::append_record(file, &format!("record {thread}:{record}\n{body}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let log = std::fs::read_to_string(file).unwrap();
+        let mut lines = log.lines();
+        let mut seen = std::collections::BTreeSet::new();
+        let process = std::process::id().to_string();
+        while let Some(header) = lines.next() {
+            let (time, pid) = header
+                .strip_prefix("unix time ")
+                .and_then(|line| line.split_once(", process "))
+                .expect("each record starts with a complete header");
+            assert!(time.parse::<u64>().is_ok());
+            assert_eq!(pid, process);
+            assert!(seen.insert(lines.next().expect("record identifier")));
+            assert!(lines.next().is_some_and(|line| line == body));
+        }
+        for thread in 0..THREADS {
+            for record in 0..RECORDS {
+                assert!(seen.remove(format!("record {thread}:{record}").as_str()));
+            }
+        }
+        assert!(seen.is_empty());
+    }
+
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
 
@@ -1206,7 +1322,10 @@ mod tests {
         assert_eq!(memory_at(base + 0x3008), "no access");
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
-        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        // The released range is not asked about: another test's thread can
+        // reserve or map it again at once, and the answer is then that
+        // thread's memory (#162). Address 0 is free in the same way and
+        // stays free.
         assert_eq!(memory_at(0), "nothing mapped there");
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
@@ -1289,6 +1408,24 @@ mod tests {
         // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
         assert_eq!(run(0, u64::MAX - 10), (4, 0));
         assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
+    }
+
+    #[test]
+    fn clwb_write_back_loops_are_found_for_nops() {
+        // The title's loop (#135), behind a lea and a lone clwb that is no loop.
+        let code = [
+            0x48, 0x8d, 0x44, 0x0a, 0xff, // lea rax, [rdx+rcx-1]
+            0x66, 0x0f, 0xae, 0x39, // clflushopt [rcx], no loop
+            0x66, 0x0f, 0xae, 0x31, // top: clwb [rcx]
+            0x48, 0x83, 0xc1, 0x40, //      add rcx, 0x40
+            0x48, 0x39, 0xc1, //            cmp rcx, rax
+            0x76, 0xf3, //                  jbe top
+            0xc3,
+        ];
+        assert_eq!(clwb_loop_sites(&code), vec![(9, 4)]);
+        // With REX.B: clwb [r9]; add r9, 0x40; cmp r9, rax.
+        let rex = [0x66, 0x41, 0x0f, 0xae, 0x31, 0x49, 0x83, 0xc1, 0x40, 0x49, 0x39, 0xc1, 0x76, 0xf2];
+        assert_eq!(clwb_loop_sites(&rex), vec![(0, 5)]);
     }
 
     #[test]

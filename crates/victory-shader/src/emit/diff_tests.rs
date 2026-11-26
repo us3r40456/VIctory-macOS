@@ -926,9 +926,7 @@ fn translated_shaders_draw_as_pc_ones() {
             compile(&pc, &dir, src, vs, "vs_6_5"),
             compile(&pc, &dir, src, "ps", "ps_6_5"),
         );
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &ps_p) }.unwrap();
+        let root_p = host.root_signature_bytes(&ps_p).unwrap();
         let pso_p = host.pipeline_with(&root_p, &vs_p, &ps_p).unwrap();
         let theirs = host
             .draw(
@@ -1043,9 +1041,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             compile(&pc, &dir, src, "ms", "ms_6_5"),
             compile(&pc, &dir, src, "mps", "ps_6_5"),
         );
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &ms_p) }.unwrap();
+        let root_p = host.root_signature_bytes(&ms_p).unwrap();
         let pso_p = host.mesh_pipeline_with(&root_p, &ms_p, &ps_p).unwrap();
         let theirs = host
             .draw(
@@ -1509,9 +1505,7 @@ fn translated_compute_matches_pc() {
         }
         let ours = ours.unwrap();
         let cs_p = compile(&pc, &dir, src, "cs", "cs_6_5");
-        // SAFETY: the PC container carries its root signature.
-        let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
+        let root_p = host.root_signature_bytes(&cs_p).unwrap();
         let pso_p = host.compute_pipeline_with(&root_p, &cs_p).unwrap();
         let table = |sampler, index| Root::Table { sampler, index };
         let theirs = host

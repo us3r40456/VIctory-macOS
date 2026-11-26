@@ -7,5 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bench]]
+name = "tex_refresh"
+harness = false
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "table_runs"
+harness = false
+
+[[bench]]
+name = "title_copies"
+harness = false

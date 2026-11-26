@@ -44,6 +44,7 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
+            28 => 23, // barycentrics: DXIL semantic kind -> D3D_NAME
             30 => 25, // cull primitive
             _ => 0,
         }
@@ -347,6 +348,52 @@ pub(crate) fn shader_hash(dxil: &[u8]) -> [u8; 20] {
     out
 }
 
+/// Gives a container from another compiler the hashes D3D12 and D3DMetal
+/// read: the digest of its `HASH` part, and the container digest in the
+/// header. DXC leaves both as zeros when `dxil.dll` is not beside it and it
+/// cannot sign. Hashes that are already set are kept. Returns whether
+/// anything changed, or why the container is not one we can sign: it needs
+/// a `DXIL` part and a `HASH` part.
+pub fn sign(container: &mut [u8]) -> Result<bool, String> {
+    let word = |at: usize| -> Option<usize> {
+        let bytes = container.get(at..at + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?) as usize)
+    };
+    if container.get(..4) != Some(b"DXBC") || word(24) != Some(container.len()) {
+        return Err("not a DXBC container of its stated size".into());
+    }
+    let count = word(28).ok_or("truncated container")?;
+    let (mut program, mut digest) = (None, None);
+    for i in 0..count {
+        let at = word(32 + 4 * i).ok_or("truncated part table")?;
+        let size = word(at + 4).ok_or("truncated part")?;
+        let data = at + 8..at + 8 + size;
+        if container.get(data.clone()).is_none() {
+            return Err("a part runs past the container".into());
+        }
+        match &container[at..at + 4] {
+            b"DXIL" => program = Some(data),
+            b"HASH" if size == 20 => digest = Some(data.start + 4..data.end),
+            _ => {}
+        }
+    }
+    let (Some(program), Some(digest)) = (program, digest) else {
+        return Err("the container has no DXIL part or no HASH part".into());
+    };
+    let mut changed = false;
+    if container[digest.clone()] == [0; 16] {
+        let md5 = md5(&container[program]);
+        container[digest].copy_from_slice(&md5);
+        changed = true;
+    }
+    if changed || container[4..20] == [0; 16] {
+        let outer = hash(&container[20..]);
+        container[4..20].copy_from_slice(&outer);
+        changed = true;
+    }
+    Ok(changed)
+}
+
 /// Standard MD5.
 pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
     let len = data.len();
@@ -503,6 +550,23 @@ mod tests {
         }
         assert_eq!(hex(md5(&[0x61; 55])), "ef1772b6dff9a122358552954ad0df65");
         assert_eq!(hex(md5(&[0x61; 56])), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    #[test]
+    fn sign_fills_zero_hashes_and_keeps_set_ones() {
+        let zeros = [0u8; 20];
+        let mut bytes = build(&[(b"PSV0", b"info"), (b"HASH", &zeros), (b"DXIL", b"program a")]);
+        bytes[4..20].fill(0);
+        assert_eq!(sign(&mut bytes), Ok(true));
+        let (part, outer) = (bytes.len() - 9 - 8 - 20, hash(&bytes[20..]));
+        assert_eq!(bytes[4..20], outer);
+        assert_eq!(bytes[part + 4..part + 20], md5(b"program a"));
+        let again = bytes.clone();
+        assert_eq!(sign(&mut bytes), Ok(false));
+        assert_eq!(bytes, again);
+        let mut bare = build(&[(b"DXIL", b"program a")]);
+        assert!(sign(&mut bare).is_err());
+        assert!(sign(&mut bytes[..30]).is_err());
     }
 
     #[test]

@@ -294,6 +294,8 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        host_wave32: false,
+        narrow_waves: false,
         view_marks: false,
     })
     .map_err(e)?;
@@ -1322,6 +1324,66 @@ fn min_max_and_clamp_match_the_hardware() {
     assert_clean(check(&passing(min_max_probes())));
 }
 
+/// `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32` and `v_cubema_f32` of
+/// (x, y, z) (RDNA2 ISA: the major axis is z when |z| >= |x| and |z| >= |y|,
+/// else y when |y| >= |x|, else x), with the coordinates' denormals read as
+/// zeros of their sign.
+fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
+    let (x, y, z) = (ftz(x), ftz(y), ftz(z));
+    let (ax, ay, az) = (fl(x).abs(), fl(y).abs(), fl(z).abs());
+    let zmaj = az >= ax && az >= ay;
+    let ymaj = ay >= ax;
+    let neg = |v: u32| fl(v) < 0.0;
+    let minus = |v: u32| v ^ 0x8000_0000;
+    let pick = |zv: u32, yv: u32, xv: u32| {
+        if zmaj {
+            zv
+        } else if ymaj {
+            yv
+        } else {
+            xv
+        }
+    };
+    match op {
+        0x144 => {
+            let id = pick(
+                if neg(z) { 5 } else { 4 },
+                if neg(y) { 3 } else { 2 },
+                u32::from(neg(x)),
+            );
+            (id as f32).to_bits()
+        }
+        0x145 => pick(
+            if neg(z) { minus(x) } else { x },
+            x,
+            if neg(x) { z } else { minus(z) },
+        ),
+        0x146 => pick(minus(y), if neg(y) { minus(z) } else { z }, minus(y)),
+        _ => out(fl(pick(z, y, x)) * 2.0),
+    }
+}
+
+/// The cube-map face instructions over signed zeros, denormals, infinities
+/// and NaN in each coordinate.
+fn cube_probes() -> Vec<Probe> {
+    let xyz = triples(F32_EDGES, F32_EDGES, F32_THIRD);
+    (0x144u16..=0x147)
+        .map(|op| {
+            probe(
+                vop3(op, 5, [v(1), v(2), v(3)], NONE),
+                xyz.clone(),
+                F32,
+                move |i| vec![cube(op, i[0], i[1], i[2])],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn cube_faces_match_the_hardware() {
+    assert_clean(check(&cube_probes()));
+}
+
 /// The 16 float predicates of `v_cmp_*_f32` (RDNA2 ISA: `o` ordered, `u`
 /// unordered, `n*` true when unordered).
 fn compare(op: u16, a: u32, b: u32) -> bool {
@@ -1469,6 +1531,17 @@ fn class_compares_match_the_hardware() {
 fn conversion_probes() -> Vec<Probe> {
     let xs = unary(F32_EDGES);
     let ints = unary(U32_EDGES);
+    let mut unsigned = U32_EDGES.to_vec();
+    // Two observed WARP misroundings, then the neighbors of midpoints
+    // with even and odd lower significands at every inexact exponent.
+    unsigned.extend([0xDE84_975E, 0xFFFF_FF7F]);
+    for exponent in 24..32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            unsigned.extend([midpoint - 1, midpoint, midpoint + 1]);
+        }
+    }
     let mut p = vec![
         probe([vop1(0x08, 5, v(1))], xs.clone(), INT, |i| {
             vec![to_i32(i[0])]
@@ -1498,7 +1571,7 @@ fn conversion_probes() -> Vec<Probe> {
         probe([vop1(0x05, 5, v(1))], ints.clone(), F32, |i| {
             vec![(i[0] as i32 as f32).to_bits()]
         }),
-        probe([vop1(0x06, 5, v(1))], ints.clone(), F32, |i| {
+        probe([vop1(0x06, 5, v(1))], unary(&unsigned), INT, |i| {
             vec![(i[0] as f32).to_bits()]
         }),
         // An f16 result keeps the destination's high half (v5 = d).
@@ -1548,6 +1621,59 @@ fn conversion_probes() -> Vec<Probe> {
     p.push(probe([vop1(0x0B, 5, v(1))], unary(&halves), F32, |i| {
         vec![from_f16(i[0] & 0xFFFF).to_bits()]
     }));
+    // VOP3 source modifiers apply to the selected low f16, before widening.
+    for m in [
+        NONE,
+        M { neg: 1, ..NONE },
+        M { abs: 1, ..NONE },
+        M {
+            abs: 1,
+            neg: 1,
+            ..NONE
+        },
+        M {
+            neg: 1,
+            clamp: true,
+            ..NONE
+        },
+    ] {
+        p.push(probe(
+            vop3(0x18B, 5, [v(1), 0, 0], m),
+            unary(&halves),
+            F32,
+            move |i| {
+                let mut h = i[0] & 0xFFFF;
+                if m.abs & 1 != 0 {
+                    h &= 0x7FFF;
+                }
+                if m.neg & 1 != 0 {
+                    h ^= 0x8000;
+                }
+                vec![mods_out(from_f16(h).to_bits(), m)]
+            },
+        ));
+    }
+    // VOP3 clamp precedes narrowing; an f16 result keeps v5's high half.
+    let exact = unary(&[
+        0x4000_0000,
+        0xC000_0000,
+        0x3F00_0000,
+        0xBF00_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x7FC0_0000,
+    ]);
+    for m in [NONE, M { clamp: true, ..NONE }] {
+        p.push(probe(
+            vop3(0x18A, 5, [v(1), 0, 0], m),
+            exact.clone(),
+            F16,
+            move |i| {
+                let x = mods_out(mods_in(ftz(i[0]), 0, m), m);
+                vec![i[3] & 0xFFFF_0000 | to_f16(f64::from(fl(x)), false)]
+            },
+        ));
+    }
     p
 }
 
@@ -3010,5 +3136,52 @@ fn lds_bytes_and_halves_match_the_hardware() {
         probe(writes, inputs, INT, move |i| {
             vec![i[3] & 0xFF | byte(i[0], 0) << 8 | (i[1] & 0xFFFF) << 16]
         }),
+    ]));
+}
+
+/// DS `op` with both offset bytes: `offset0` | `offset1` << 8.
+fn ds_at(op: u32, vdst: u8, addr: u8, data: u8, offset: u16) -> [u32; 2] {
+    [
+        0xD800_0000 | op << 18 | u32::from(offset),
+        u32::from(vdst) << 24 | u32::from(data) << 8 | u32::from(addr),
+    ]
+}
+
+/// LDS accesses past the program's allocation (512 bytes here) read 0 and
+/// drop writes (RDNA2 ISA DS), for dwords, bytes, read2 and returning
+/// atomics; a dropped write must not land in bounds, an address that wraps
+/// at 32 bits back inside is inside, and lanes EXEC leaves out keep their
+/// registers. Each thread uses its
+/// own dword and the dword 512 bytes past it.
+#[test]
+fn lds_out_of_bounds_reads_zero_and_drops_writes() {
+    let inputs = pairs(U32_EDGES, &U32_EDGES[..10]);
+    let mut plain = vec![vop2(0x1A, 11, int(2), 0)];
+    plain.extend(ds_at(0x0D, 0, 11, 1, 0)); // ds_write_b32 [own], a
+    plain.extend(ds_at(0x0D, 0, 11, 2, 512)); // ds_write_b32 [own + 512], b
+    plain.extend(ds_at(0x36, 5, 11, 0, 0)); // ds_read_b32 v5, [own]
+    plain.extend(ds_at(0x36, 6, 11, 0, 512)); // ds_read_b32 v6, [own + 512]
+    plain.extend(ds_at(0x36, 7, 11, 0, 0xFFFC)); // ds_read_b32 v7, [own + 65532]
+    plain.extend(ds_at(0x39, 8, 11, 0, 600)); // ds_read_i8 v8, [own + 600]
+    let mut more = vec![vop2(0x1A, 11, int(2), 0)];
+    more.extend(ds_at(0x0D, 0, 11, 1, 0)); // ds_write_b32 [own], a
+    more.extend(ds_at(0x1E, 0, 11, 2, 513)); // ds_write_b8 [own + 513], b
+    more.extend(ds_at(0x37, 5, 11, 0, 200 << 8)); // ds_read2_b32 v[5:6], [own], [own + 800]
+    more.extend(ds_at(0x20, 7, 11, 2, 512)); // ds_add_rtn_u32 v7, [own + 512], b
+    // The address wraps at 32 bits, as LLVM's DS offset folding takes it
+    // on CI and later (a base below 0 plus the offset): own - 16 + 16.
+    more.push(vop2(0x25, 12, 208, 11)); // v_add_nc_u32 v12, -16, v11
+    more.extend(ds_at(0x36, 8, 12, 0, 16)); // ds_read_b32 v8, [own - 16 + 16]
+    // Lanes EXEC leaves out keep the old register; active lanes outside
+    // the LDS get 0 from a returning atomic.
+    let mut masked = vec![vop2(0x1A, 11, int(2), 0)];
+    masked.push(vopc(0xC4, v(1), 2)); // v_cmp_gt_u32 vcc, v1, v2
+    masked.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+    masked.extend(ds_at(0x20, 5, 11, 2, 512)); // ds_add_rtn_u32 v5, [own + 512], b
+    masked.push(sop1(0x03, 126, s(20)));
+    assert_clean(check(&[
+        probe(plain, inputs.clone(), INT, |i| vec![i[0], 0, 0, 0]),
+        probe(more, inputs.clone(), INT, |i| vec![i[0], 0, 0, i[0]]),
+        probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }

@@ -29,108 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::host::{HostList, host, transition};
 
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
-// The title's records, read only; the clamped ones go to the list's own.
-ByteAddressBuffer args : register(t0);
-RWByteAddressBuffer dest : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
-// The title's record count: read only if `counted`.
-ByteAddressBuffer countWord : register(t1);
-static const uint BUDGET = 1u << 27;
-// Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` into `dest`; its cost.
-uint clamped(uint at) {
-    uint cost;
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        dest.Store2(at, uint2(count, instances));
-        // The rest of the record as it is: first vertex and instance (4 words
-        // in all), or first index, base vertex and first instance (5).
-        if (kind == 1) {
-            dest.Store3(at + 8, args.Load3(at + 8));
-        } else {
-            dest.Store2(at + 8, args.Load2(at + 8));
-        }
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64;
-        dest.Store3(at, g);
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
-        dest.Store3(at, g);
-    }
-    return cost;
-}
-// A record past the budget (no cost reaches it).
-static const uint PAST = 0xffffffffu;
-groupshared uint costs[64];
-// One group walks the records in tiles of 64: every lane clamps its own
-// record, then the first lane charges the tile's records in order. No
-// other group shares the budget: a shared add wraps once enough records
-// are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint lane : SV_GroupIndex) {
-    uint left = 0;
-    if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
-    }
-    // ExecuteIndirect runs min(max, count) records: no others are clamped or
-    // charged. The loop still counts tiles up to `records`, a constant, as
-    // the compiler cannot prove that a value read from memory is the same
-    // in every lane, and barriers need that; tiles past `walked` only wait
-    // at them.
-    uint walked = records;
-    if (counted != 0) {
-        walked = min(records, countWord.Load(0));
-    }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
-        uint record = tile * 64 + lane;
-        uint at = record * stride;
-        uint cost = 0;
-        if (record < walked) {
-            cost = clamped(at);
-        }
-        costs[lane] = cost;
-        GroupMemoryBarrierWithGroupSync();
-        if (lane == 0 && tile * 64 < walked) {
-            for (uint i = 0; i < 64; i++) {
-                if (costs[i] > left) {
-                    // The first record that does not fit takes what is
-                    // left, so those after it run empty too.
-                    costs[i] = PAST;
-                    left = 0;
-                } else {
-                    left -= costs[i];
-                }
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == PAST) {
-            // Draws keep their layout with no vertices; groups become zero.
-            dest.Store(at, 0);
-        }
-    }
-    if (lane == 0) {
-        budget.Store(0, BUDGET - left);
-    }
-}
-"#;
+const SOURCE: &str = include_str!("indirect-clamp.hlsl");
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -159,10 +58,34 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
+    #[cfg(victory_dxc_clamp)]
+    match precompiled() {
+        Ok(clamp) => {
+            tracing::info!("argument clamp: using precompiled 64-thread shader");
+            return Ok(clamp);
+        }
+        Err(e) => tracing::warn!(error = %e, "precompiled argument clamp unavailable"),
+    }
     make_fxc().or_else(|e| {
         tracing::info!(error = %e, "argument clamp: building the one-thread form");
         make_words()
     })
+}
+
+/// The clamp compiled by DXC at build time. D3DMetal finds a shader by the
+/// `HASH` part of its container, and DXC leaves that and the container
+/// digest as zeros when it cannot find `dxil.dll` to sign with, which would
+/// make this shader share a cache entry with every other unsigned one (issue
+/// #4). So both are checked here and set when they are zero.
+#[cfg(victory_dxc_clamp)]
+fn precompiled() -> windows::core::Result<Clamp> {
+    let mut bytes = include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil")).to_vec();
+    match victory_shader::emit::sign_container(&mut bytes) {
+        Ok(true) => tracing::info!("argument clamp: the compiled shader was unsigned, its digests are set"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "argument clamp: could not check the compiled shader's digests"),
+    }
+    from_bytes(&bytes)
 }
 
 /// The clamp for Wine's HLSL compiler (vkd3d-shader), which has no `Load`
@@ -245,7 +168,6 @@ fn make_words() -> windows::core::Result<Clamp> {
 }
 
 fn make_fxc() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -275,9 +197,15 @@ fn make_fxc() -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the compiler owns the blob until this call returns.
+    let bytes = unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) };
+    from_bytes(bytes)
+}
+
+fn from_bytes(bytes: &[u8]) -> windows::core::Result<Clamp> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    // SAFETY: D3D12 validates the bytecode and its embedded root signature.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -320,9 +248,18 @@ pub(crate) fn bound(
     (kind, stride, records): (u32, u32, u32),
     count: Option<u64>,
 ) -> Option<ID3D12Resource> {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return None;
-    };
+    bound_with(clamp()?, list, gpu, (kind, stride, records), count)
+}
+
+/// [`bound`] with a given clamp.
+fn bound_with(
+    c: &Clamp,
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    count: Option<u64>,
+) -> Option<ID3D12Resource> {
+    let budget = list.budget()?;
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
@@ -402,6 +339,63 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Every word the clamp `c` writes for `records` records of `kind` made
+    /// from `seed` by a small generator, in one list with no count buffer.
+    /// `None` without a host GPU.
+    #[cfg(victory_dxc_clamp)]
+    fn clamp_all(c: &super::Clamp, kind: u32, seed: u32, records: u32) -> Option<Vec<u32>> {
+        let host = super::host()?;
+        let per = match kind {
+            0 => 4,
+            1 => 5,
+            _ => 3,
+        };
+        let all = per * records as usize;
+        let (buffer, data) = host.shared_buffer(all as u64 * 4 + 16).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        let mut state = seed;
+        // SAFETY: our mapped buffer, written before the list runs and read
+        // after it has; a live buffer.
+        unsafe {
+            for at in 0..all {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Mostly small values, now and then a wild one.
+                let word = if state >> 28 == 0 { state } else { (state >> 8) % 9000 };
+                data.add(at).write_volatile(word);
+            }
+            let spec = (kind, per as u32 * 4, records);
+            let out = super::bound_with(c, &list, buffer.GetGPUVirtualAddress(), spec, None).unwrap();
+            super::done(&list, &out);
+            list.close();
+            host.execute(&[&list]);
+            let mut out_data = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut out_data)).unwrap();
+            Some((0..all).map(|i| out_data.cast::<u32>().add(i).read_volatile()).collect())
+        }
+    }
+
+    /// The precompiled clamp is the one in use when it builds, and it writes
+    /// what the clamp compiled at run time writes for the same records of
+    /// every kind.
+    #[cfg(victory_dxc_clamp)]
+    #[test]
+    #[ignore = "requires a hardware D3D12 queue and the build-time DXC shader"]
+    fn hardware_uses_precompiled_clamp() {
+        if super::host().is_none() {
+            return; // no host GPU here
+        }
+        let precompiled = super::precompiled().expect("create pipeline from the compiled clamp");
+        assert!(!precompiled.words);
+        assert!(!super::clamp().expect("argument clamp").words);
+        let reference = super::make_fxc().or_else(|_| super::make_words()).expect("the existing clamp");
+        for (kind, seed, records) in [(0, 1, 200), (1, 2, 200), (2, 3, 130), (10, 4, 70), (0, 5, 3)] {
+            let new = clamp_all(&precompiled, kind, seed, records).unwrap();
+            let old = clamp_all(&reference, kind, seed, records).unwrap();
+            assert_eq!(new, old, "kind {kind}, {records} records");
+        }
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,

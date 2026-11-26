@@ -821,6 +821,15 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// A list moved it to a GPU write state (render target, depth write,
+    /// unordered access): its flags alone do not say so, since a memory's
+    /// host texture takes the uses of every title texture there. Never
+    /// cleared: a texture the GPU wrote once is never given up, even if the
+    /// title later overwrites it from memory.
+    gpu_written: std::sync::atomic::AtomicBool,
+    /// A heap slot views it for unordered access (`VICTORY_EVICT_HEAP_UAV`):
+    /// written by the GPU once shaders write through heaps.
+    heap_writable: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -861,6 +870,8 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            gpu_written: false.into(),
+            heap_writable: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -905,6 +916,20 @@ impl HostTexture {
     pub(crate) fn used_recently(&self) -> bool {
         let frame = self.last[0].load(std::sync::atomic::Ordering::Relaxed);
         frame != NEVER && frame.saturating_add(1) >= crate::queue::presented()
+    }
+
+    /// A list moves it to `state` (a host state): a write state marks it
+    /// written by the GPU, never to be given up.
+    pub(crate) fn note_state(&self, state: u32) {
+        const RENDER_TARGET_UNORDERED_DEPTH_WRITE: u32 = 0x4 | 0x8 | 0x10;
+        if state & RENDER_TARGET_UNORDERED_DEPTH_WRITE != 0 {
+            self.gpu_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A heap slot views it for unordered access.
+    pub(crate) fn note_heap_writable(&self) {
+        self.heap_writable.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
@@ -1245,8 +1270,11 @@ fn shared_texture(
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
-            // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+            // The live texture's own description: `d` may ask for uses its
+            // format does not take on this host (unordered access on
+            // B5G5R5A1 on NVIDIA), which the query rejects by removing the
+            // device. SAFETY: plain queries on a live resource.
+            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[t.texture.GetDesc()]) };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
         return live;
@@ -1578,7 +1606,7 @@ const BUDGET_LOW: f64 = 0.85;
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
-const SOON_FRAMES: u64 = 10;
+pub(crate) const SOON_FRAMES: u64 = 10;
 
 /// Host textures given up, their bytes, those made again since, and those
 /// made again within [`SOON_FRAMES`].
@@ -1602,12 +1630,28 @@ fn remade(k: &MemoryKey) {
     }
 }
 
-/// Whether host texture `t` may be given up: its contents come from title
-/// memory alone (no render target, depth or unordered access, no host copy
-/// or resolve wrote it), so a texture made again has them back.
+/// Whether host texture `t` may be given up: nothing on the host wrote it
+/// (no list moved it to a write state, no heap slot views it for unordered
+/// access, no host copy or resolve), so a texture made again has its
+/// contents back: title memory's, or none for one with GPU uses that
+/// nothing wrote yet (#135: 2 GB of those, viewed by heap slots alone,
+/// filled an 8 GB Mac).
 #[cfg(windows)]
 fn evictable(t: &HostTexture) -> bool {
-    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::Ordering::Relaxed;
+    t.key.is_some()
+        && !t.host_written.load(Relaxed)
+        && !t.gpu_written.load(Relaxed)
+        && !(t.heap_writable.load(Relaxed) && crate::bindless::heap_written())
+}
+
+/// `VICTORY_EVICT_HEAP_UAV=1`: textures viewed for unordered access in
+/// shader-visible heaps may be given up until a shader writes through a
+/// heap (#135: ~1.5 GB on an 8 GB Mac, where none did); their null slots
+/// are made again before that write reaches the GPU.
+pub(crate) fn evict_heap_uav() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_HEAP_UAV").is_some_and(|v| v != "0"))
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
@@ -1623,12 +1667,45 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        let budget = budget_mb(budget);
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
+}
+
+/// The card's budget in MB that [`evict_unused`] keeps host textures under:
+/// `VICTORY_GPU_BUDGET_MB` when set, else the device's (`device`). Under
+/// D3DMetal the device's is about four fifths of the Mac's memory, which the
+/// title's own memory shares, and memory freed through D3DMetal stays with
+/// the process for its next resources: on a Mac with 8 GB, unused textures
+/// filled memory into swap long before the pass would start (#135).
+#[cfg(windows)]
+fn budget_mb(device: f64) -> f64 {
+    static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        let mb = budget_setting(std::env::var("VICTORY_GPU_BUDGET_MB").ok().as_deref());
+        if let Some(mb) = mb {
+            tracing::info!(
+                mb,
+                "host textures kept under a card budget of VICTORY_GPU_BUDGET_MB"
+            );
+        }
+        mb
+    });
+    set.unwrap_or(device)
+}
+
+/// A `VICTORY_GPU_BUDGET_MB` value: a number of MB above zero, else none.
+#[cfg(windows)]
+fn budget_setting(value: Option<&str>) -> Option<f64> {
+    value?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|mb| mb.is_finite() && *mb > 0.0)
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -1821,6 +1898,10 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 #[cfg(windows)]
 pub(crate) fn alias_source(placed: This) -> Option<This> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
+    // A shader view of no resource (a null view) has no memory.
+    if placed.is_null() {
+        return None;
+    }
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
@@ -2319,6 +2400,12 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn a_null_view_has_no_alias_source() {
+        assert_eq!(alias_source(std::ptr::null()), None);
+    }
+
     #[test]
     fn a_regions_rows_in_a_footprint() {
         // R32_FLOAT (41) 100x8x1, pitch 512.
@@ -2432,13 +2519,14 @@ mod tests {
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
-    /// Host textures the GPU writes (render target, depth, unordered access)
-    /// are never given up, and the title releasing its texture frees its
-    /// host texture (nothing else holds it); one fed from title memory is
-    /// given up and made again on its next use.
+    /// Host textures the GPU wrote (a list moved them to a write state) are
+    /// never given up, and the title releasing its texture frees its host
+    /// texture (nothing else holds it); one fed from title memory, or one
+    /// with GPU uses that nothing wrote yet, is given up and made again on
+    /// its next use.
     #[cfg(windows)]
     #[test]
-    fn only_textures_fed_from_title_memory_are_given_up() {
+    fn only_textures_the_gpu_did_not_write_are_given_up() {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -2451,10 +2539,17 @@ mod tests {
         };
         let read = place(0, &texture(64, 64, 28, 1));
         let target = place(1 << 18, &ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) });
+        let unwritten = place(1 << 19, &ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) });
         let (r, t) = (host_copy(read).unwrap(), host_copy(target).unwrap());
+        assert!(owned(target).is_some(), "a render target nothing wrote yet");
+        t.note_state(0x4);
         let listed = candidates();
         assert!(listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &r)), "fed from title memory");
-        assert!(!listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &t)), "the GPU writes it");
+        assert!(!listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &t)), "the GPU wrote it");
+        assert!(host_copy(unwritten).is_some());
+        assert!(give_up_now(unwritten), "nothing wrote it");
+        assert!(made(resource(unwritten)).is_none(), "given up");
+        assert_eq!(slot::<Release>(unwritten, 0x10)(unwritten), 0);
         let (weak_r, weak_t) = (std::sync::Arc::downgrade(&r), std::sync::Arc::downgrade(&t));
         drop((listed, r, t));
         let (r, t) = (weak_r, weak_t);
@@ -2510,6 +2605,19 @@ mod tests {
         assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
         let early = (frame - 1, now - IDLE_MS, 10);
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+    }
+
+    /// `VICTORY_GPU_BUDGET_MB` takes a number of MB above zero; anything
+    /// else leaves the device's budget.
+    #[cfg(windows)]
+    #[test]
+    fn a_budget_setting_is_megabytes_above_zero() {
+        assert_eq!(budget_setting(Some("2500")), Some(2500.0));
+        assert_eq!(budget_setting(Some(" 3072.5 ")), Some(3072.5));
+        for bad in ["", "0", "-1", "lots", "NaN", "inf"] {
+            assert_eq!(budget_setting(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(budget_setting(None), None);
     }
 
     /// Title textures of one memory share a key in any format of the same

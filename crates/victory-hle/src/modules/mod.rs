@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+pub mod read_stats;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;

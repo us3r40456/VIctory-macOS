@@ -15,6 +15,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Source patches applied to the Wine VIctory runs on (tools/macos/patches).
+    "patch",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -171,6 +173,11 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
             problems.push(format!("looks like a {what}"));
         }
     }
+    // A patch can carry binary files as text (base85 lines, short and full
+    // of punctuation, so the run checks below do not see them).
+    if ext.as_deref() == Some("patch") && has_binary_patch(content) {
+        problems.push("a binary patch (embedded data)".to_owned());
+    }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
     } else if let Some(run) = longest_encoded_run(content)
@@ -186,6 +193,14 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
         }
     }
     problems
+}
+
+/// Whether a patch has a section that carries a binary change as text,
+/// which is how `git diff --binary` writes one.
+fn has_binary_patch(content: &[u8]) -> bool {
+    content
+        .split(|&b| b == b'\n')
+        .any(|line| line.starts_with(b"GIT binary patch"))
 }
 
 /// Longest run of characters that could be hex or base64 payload.
@@ -251,6 +266,40 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("tools/macos/patches/x.patch", b"--- a/x.c\n+++ b/x.c\n").is_empty());
+    }
+
+    /// `.patch` files get the same size, magic, binary and hex checks as
+    /// any other file, and a binary patch is refused.
+    #[test]
+    fn patches_pass_the_same_checks() {
+        let diff = |body: &str| format!("--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n{body}\n");
+        assert!(check("p.patch", diff("+int x;").as_bytes()).is_empty());
+        let hex: String = synthetic(600).map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !check("p.patch", diff(&format!("+\"{hex}\"")).as_bytes()).is_empty(),
+            "hex run"
+        );
+        let escapes: String = synthetic(600).map(|b| format!("\\x{b:02x}")).collect();
+        assert!(
+            !check("p.patch", diff(&format!("+\"{escapes}\"")).as_bytes()).is_empty(),
+            "escaped run"
+        );
+        let mut nul = diff("+int x;").into_bytes();
+        nul.push(0);
+        assert!(!check("p.patch", &nul).is_empty(), "NUL byte");
+        assert!(!check("p.patch", b"DXBC\x01").is_empty(), "magic");
+        assert!(
+            !check("p.patch", &vec![b'a'; 600 * 1024]).is_empty(),
+            "too big"
+        );
+        let binary = "diff --git a/f b/f\nGIT binary patch\nliteral 5\nMcmZQz00;m8000000\n\n";
+        assert!(
+            !check("p.patch", binary.as_bytes()).is_empty(),
+            "binary patch"
+        );
+        // Other extensions are unchanged.
+        assert!(check("notes.md", b"GIT binary patch is a phrase\n").is_empty());
     }
 
     #[test]
