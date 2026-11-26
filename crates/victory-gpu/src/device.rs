@@ -233,40 +233,75 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
-/// Diagnostics probe for the `+0x1dac734` start-up assert (#24). The title
-/// calls three D3D12.X device methods — vtable slots `0x1b8`, `0x1c8`, `0x218`,
-/// each `(…, REFIID 765a30f3-f624-4c6f-a828-ace948622445, out)` — and takes an
-/// error branch when the HRESULT is negative. We have no implementation, so
-/// they return `E_NOTIMPL`, the title takes the error branch, and the path that
-/// would register its subsystem (the one `+0x1dac734` checks) never runs.
-///
-/// By default this is unchanged (`E_NOTIMPL`). With `VICTORY_STUB_DEVICE_QUERY`
-/// set, in a diagnostics build, it answers `S_OK` with a null `out` so the
-/// title takes the success branch: `+0x1dac734` then no longer fires, which
-/// confirms these slots gate it. (Init still stops later, at `+0x247a098`,
-/// where the title wants a real object of that IID — not null and not the
-/// device — so this is a probe, not a fix.)
-extern "system" fn query_feature_x(
+/// CreateDerivedPipelineStateX at `0x1b8`. The patch count and patch map come
+/// before the IID and output pointer in this slot's calling convention.
+extern "system" fn create_derived_pipeline_x_probe(
     _this: This,
-    _a: usize,
-    _iid: *const Iid,
-    out: *mut usize,
+    base: This,
+    patch_count: u32,
+    patches: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
 ) -> HRESULT {
     #[cfg(feature = "diagnostics")]
-    if *STUB_DEVICE_QUERY.get_or_init(|| std::env::var_os("VICTORY_STUB_DEVICE_QUERY").is_some()) {
-        if !out.is_null() {
-            // SAFETY: the title passes a writable out pointer.
-            unsafe { *out = 0 };
-        }
-        return S_OK;
+    if pipeline_probe_enabled() {
+        tracing::debug!(
+            ?base,
+            patch_count,
+            ?patches,
+            "derived console PSO probe requested (patches ignored)"
+        );
+        return pipeline::derive_console_probe(base, iid, out);
     }
-    let _ = out;
+    let _ = (base, patch_count, patches, iid, out);
     E_NOTIMPL
 }
 
-/// Whether `VICTORY_STUB_DEVICE_QUERY` is set (read once).
+/// DeserializeGraphicsPipelineStateX (0x1c8) and DeserializeComputePipelineStateX
+/// (0x218). The probe normally supplies a console-shaped placeholder. Rejecting
+/// one cache kind lets a run observe the title's fallback for that slot.
+extern "system" fn deserialize_pipeline_x_probe<const SLOT: usize>(
+    _this: This,
+    desc: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    if pipeline_probe_enabled() {
+        static REJECT_GRAPHICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static REJECT_COMPUTE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reject_cache = match SLOT {
+            0x1c8 => *REJECT_GRAPHICS
+                .get_or_init(|| crate::switch::on("VICTORY_REJECT_GRAPHICS_PSO_CACHE")),
+            0x218 => *REJECT_COMPUTE
+                .get_or_init(|| crate::switch::on("VICTORY_REJECT_COMPUTE_PSO_CACHE")),
+            _ => unreachable!("unknown pipeline cache slot"),
+        };
+        tracing::debug!(
+            slot = format_args!("{SLOT:#x}"),
+            ?desc,
+            reject_cache,
+            "console PSO probe requested"
+        );
+        if reject_cache {
+            if !out.is_null() {
+                // SAFETY: the caller supplies writable storage for the result.
+                unsafe { out.write(std::ptr::null()) };
+            }
+            // XCL reports unsupported serialized console PSOs this way.
+            return E_NOTIMPL;
+        }
+        return pipeline::create_console_probe(iid, out);
+    }
+    let _ = (desc, iid, out);
+    E_NOTIMPL
+}
+
 #[cfg(feature = "diagnostics")]
-static STUB_DEVICE_QUERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn pipeline_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_STUB_DEVICE_QUERY").is_some())
+}
 
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
@@ -457,9 +492,9 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[55] = query_feature_x as *const (); // 0x1b8 (diagnostics probe, see fn)
-    f[57] = query_feature_x as *const (); // 0x1c8 (diagnostics probe, see fn)
-    f[67] = query_feature_x as *const (); // 0x218 (diagnostics probe, see fn)
+    f[55] = create_derived_pipeline_x_probe as *const ();
+    f[57] = deserialize_pipeline_x_probe::<0x1c8> as *const ();
+    f[67] = deserialize_pipeline_x_probe::<0x218> as *const ();
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[69] = object::ignore as *const (); // 0x228 debug error filter
@@ -492,6 +527,37 @@ mod tests {
         let mut device = std::ptr::null();
         let hr = create(std::ptr::null(), &version, iid, &mut device);
         (hr, device)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn console_pso_cache_rejection_is_independent_for_each_device_slot() {
+        type Deserialize = extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+        let device = device();
+        for (offset, switch) in [
+            (0x1c8, "VICTORY_REJECT_GRAPHICS_PSO_CACHE"),
+            (0x218, "VICTORY_REJECT_COMPUTE_PSO_CACHE"),
+        ] {
+            let deserialize = slot::<Deserialize>(device, offset);
+            let mut result = device;
+            let hr = deserialize(device, std::ptr::null(), &object::IUNKNOWN, &mut result);
+            if !pipeline_probe_enabled() {
+                assert_eq!(hr, E_NOTIMPL);
+            } else if crate::switch::on(switch) {
+                assert_eq!(hr, E_NOTIMPL);
+                assert!(result.is_null());
+                assert_eq!(
+                    deserialize(device, std::ptr::null(), &object::IUNKNOWN, std::ptr::null_mut()),
+                    E_NOTIMPL
+                );
+            } else {
+                assert_eq!(hr, S_OK);
+                assert!(!result.is_null());
+                assert_ne!(result, device);
+                assert_eq!(slot::<Release>(result, 0x10)(result), 0);
+            }
+        }
     }
 
     #[test]
