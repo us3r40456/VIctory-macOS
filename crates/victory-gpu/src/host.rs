@@ -64,12 +64,76 @@ pub(crate) struct Quiet<'a> {
     _held: std::sync::MutexGuard<'a, u64>,
 }
 
+/// Tail copy from the queue probe in VIctory-macOS PR 178.
+#[cfg(feature = "diagnostics")]
+struct Mark {
+    list: ID3D12CommandList,
+    _allocator: ID3D12CommandAllocator,
+    _buffers: [ID3D12Resource; 2],
+    /// The number the list copies (upload memory).
+    number: *mut u64,
+    /// Where it lands (read-back memory).
+    seen: *const u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Mark {
+    fn new(host: &Host) -> windows::core::Result<Mark> {
+        let (number, numbers) = host
+            .mapped_buffer(8, false)
+            .ok_or_else(windows::core::Error::empty)?;
+        let (seen, seen_at) = host
+            .mapped_buffer(8, true)
+            .ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: plain object creation, and a copy between our buffers,
+        // which stay in their states (copy source, copy destination).
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.CopyBufferRegion(&seen, 0, &number, 0, 8);
+            list.Close()?;
+            name(&list, || "submission mark".into());
+            Ok(Mark {
+                list: list.cast()?,
+                _allocator: allocator,
+                _buffers: [number, seen],
+                number: numbers.cast(),
+                seen: seen_at.cast_const().cast(),
+            })
+        }
+    }
+
+    /// Sets the number the next run of the list copies. Under the
+    /// submission lock, once the last submission has finished.
+    fn arm(&self, value: u64) {
+        // SAFETY: our mapped upload buffer, which no submission reads now.
+        unsafe { self.number.write_volatile(value) }
+    }
+
+    /// The last number copied by the queue after its fence completed.
+    fn observed(&self) -> u64 {
+        // SAFETY: our mapped read-back buffer.
+        unsafe { self.seen.read_volatile() }
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    #[cfg(feature = "diagnostics")]
+    mark: OnceLock<Option<Mark>>,
+    #[cfg(feature = "diagnostics")]
+    mark_disabled: std::sync::atomic::AtomicBool,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -274,6 +338,10 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            #[cfg(feature = "diagnostics")]
+            mark: OnceLock::new(),
+            #[cfg(feature = "diagnostics")]
+            mark_disabled: std::sync::atomic::AtomicBool::new(false),
             event,
             rtvs,
             rtv_size,
@@ -1316,12 +1384,32 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        let mark = self.mark.get_or_init(|| {
+            if std::env::var("VICTORY_QUEUE_MARK").as_deref() != Ok("1") {
+                return None;
+            }
+            Mark::new(self)
+                .inspect_err(|error| tracing::warn!(%error, "queue tail probe unavailable"))
+                .ok()
+        });
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            let mark = mark.as_ref().filter(|_| !self.mark_disabled.load(Ordering::Relaxed));
+            #[cfg(feature = "diagnostics")]
+            let marked_group = mark.map(|marker| {
+                marker.arm(*submitted);
+                let mut lists = group.to_vec();
+                lists.push(Some(marker.list.clone()));
+                lists
+            });
+            #[cfg(feature = "diagnostics")]
+            let group = marked_group.as_deref().unwrap_or(group);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1330,8 +1418,24 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => self.wait_for(*submitted),
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Ok(()) => {
+                        self.wait_for(*submitted);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(marker) = mark {
+                            let observed = marker.observed();
+                            let matched = observed == *submitted;
+                            tracing::info!(submission = *submitted, observed, matched, "queue tail probe");
+                        }
+                    }
+                    Err(e) => {
+                        // The upload word may still be in use. Leave it alone for this run.
+                        #[cfg(feature = "diagnostics")]
+                        if mark.is_some() {
+                            self.mark_disabled.store(true, Ordering::Relaxed);
+                            tracing::warn!("queue tail probe disabled after fence failure");
+                        }
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
