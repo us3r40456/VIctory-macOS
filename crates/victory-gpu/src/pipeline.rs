@@ -859,3 +859,32 @@ mod tests {
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
     }
 }
+
+/// Decoded description from the title for slots 0x1b8, 0x1c8, 0x218.
+#[repr(C)]
+pub struct ConsoleDescBlob {
+    pub ptr: *const u8,
+    pub size: usize,
+}
+
+#[repr(C)]
+pub struct ConsolePipelineDesc {
+    /// Always 0x146359e0. Suspected root signature or type marker.
+    pub magic: usize,
+    /// First contiguous blob, typical size 28 (0x1c).
+    pub blob1: ConsoleDescBlob,
+    /// Second contiguous blob, typical size 20 (0x14).
+    pub blob2: ConsoleDescBlob,
+    /// Flags, e.g., 0x000c421e0e000000.
+    pub flags: u64,
+    /// Shader count: 1 for Compute, 2 for Graphics (Vertex + Pixel).
+    pub shader_count: usize,
+    /// Pointer to the shader elements array.
+    pub shaders_ptr: *const u8,
+}
+
+impl ConsolePipelineDesc {
+    pub fn is_valid(&self) -> bool {
+        self.magic == 0x146359e0
+    }
+}
