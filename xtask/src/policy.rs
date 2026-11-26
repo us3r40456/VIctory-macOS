@@ -154,6 +154,10 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let readme_art = path.starts_with("docs/images/")
         && matches!(ext.as_deref(), Some("svg" | "png" | "jpg" | "jpeg" | "gif"));
     let allowed = readme_art
+        || matches!(
+            path,
+            "crates/victory-loader/src/activation.js" | "crates/victory-loader/src/init-gate.js"
+        )
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()

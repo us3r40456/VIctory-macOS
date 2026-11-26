@@ -243,6 +243,11 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
     }
+    #[cfg(feature = "diagnostics")]
+    // SAFETY: this is the mapped main image for the original hash above. No title code has run.
+    unsafe {
+        victory_loader::activation::start(&hash, image.base(), image.info().size_of_image as usize)
+    }?;
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -267,6 +272,8 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    #[cfg(feature = "diagnostics")]
+    victory_loader::activation::on_title_exit();
     println!("title exited with {code}");
     Ok(code)
 }

@@ -16,14 +16,33 @@ WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
     echo "D3DMetal is missing: copy the redist/lib folder of Apple's evaluation environment over $(dirname "$WINE")/../lib" >&2
     exit 1
 }
-if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ]; then
-    cargo build --quiet --release -p victory --features diagnostics --target x86_64-pc-windows-gnullvm
+build_victory() {
+    cargo build --quiet --release -p victory --bin victory --target x86_64-pc-windows-gnullvm \
+        --message-format=json-render-diagnostics "$@"
+}
+if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ] || [ "${VICTORY_TRACE_ACTIVATION:-0}" = 1 ] || [ "${VICTORY_TRACE_INIT:-0}" = 1 ]; then
+    artifacts=$(build_victory --features diagnostics)
 else
-    cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
+    artifacts=$(build_victory)
 fi
+# Cargo may place the executable outside the checkout (e.g. build.target-dir).
+# Read its actual compiler artifact, including when the build was already fresh.
+victory=$(printf '%s\n' "$artifacts" | python3 -c '
+import json, sys
+for message in map(json.loads, sys.stdin):
+    if (message["reason"] == "compiler-artifact" and message["target"]["name"] == "victory"
+            and "bin" in message["target"]["kind"] and message.get("executable")):
+        print(message["executable"])
+        break
+else:
+    sys.exit("Cargo did not report the victory executable")
+')
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix-play}"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d;d3d12,d3d12core,dxgi=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 # Rosetta tells the game about AVX and AVX2, which it may check for.
 export ROSETTA_ADVERTISE_AVX=1
-exec "$WINE" "$ROOT/target/x86_64-pc-windows-gnullvm/release/victory.exe" "$@"
+if [ "${VICTORY_TRACE_ACTIVATION:-0}" = 1 ] || [ "${VICTORY_TRACE_INIT:-0}" = 1 ]; then
+    exec sh "$ROOT/tools/macos/trace-activation.sh" "$WINE" "$victory" "$@"
+fi
+exec "$WINE" "$victory" "$@"

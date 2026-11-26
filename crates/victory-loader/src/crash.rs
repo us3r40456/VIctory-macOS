@@ -662,14 +662,17 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     #[cfg(feature = "diagnostics")]
-    if code == EXCEPTION_BREAKPOINT && DUMP_REGISTRY.get().is_some() {
-        // SAFETY: both records describe the first-chance breakpoint on this thread.
+    if code == EXCEPTION_BREAKPOINT {
+        // SAFETY: the system supplied both records for this faulting thread.
         let (address, context) = unsafe {
             ((*(*info).ExceptionRecord).ExceptionAddress as usize, &*(*info).ContextRecord)
         };
-        init_frame::observe(address, context);
-        // SAFETY: this context belongs to the current exception.
-        unsafe { dump_title_registry(context) };
+        crate::activation::on_breakpoint(address);
+        if DUMP_REGISTRY.get().is_some() {
+            init_frame::observe(address, context);
+            // SAFETY: this context belongs to the current exception.
+            unsafe { dump_title_registry(context) };
+        }
     }
     #[cfg(feature = "diagnostics")]
     if code == EXCEPTION_BREAKPOINT
@@ -975,7 +978,8 @@ fn module_of(address: usize) -> Option<String> {
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{:#x}", address - module as usize))
+    let rva = address.checked_sub(module as usize)?;
+    Some(format!("{name}+{rva:#x}"))
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
@@ -1076,13 +1080,13 @@ unsafe fn dump_title_registry(context: &CONTEXT) {
     let Some(dir) = DUMP_REGISTRY.get() else {
         return;
     };
-    // The first title int3 is the registry assert; later ones add nothing.
-    if DONE.swap(true, Ordering::Relaxed) {
-        return;
-    }
     let Some(base) = crate::threads::title_image_base(context.Rip as usize) else {
         return;
     };
+    // Ignore breakpoints outside title code without consuming the dump.
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
     let _ = std::fs::create_dir_all(dir);
     let mut txt = String::new();
     let mut add = |l: String| {
