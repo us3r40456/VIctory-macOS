@@ -145,6 +145,7 @@ A diagnostics build also logs one bounded line per submission that refreshes tit
 | `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
 | `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
 | `VICTORY_TRACE_ACTIVATION=1` | On Series 1.0.2.1, logs registration of event `0x9a0892b1`, callback subcodes, and the second registry table before and after each `0x20` call. Look for `VIctory: activation` in stderr. The Mac launcher fetches a pinned Frida Gadget archive on first use. Leave `VICTORY_SKIP_TITLE_INT3` unset to capture the natural assert. |
+| `VICTORY_TRACE_INIT=1` | On Series 1.0.2.1, logs initialization checks, the path to state 3, and the optional predicate target and return. Search stderr for `init_gate`. This mode uses the same local Gadget launcher as the activation trace and takes precedence when both are set. |
 | `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
 
 ### Every variable

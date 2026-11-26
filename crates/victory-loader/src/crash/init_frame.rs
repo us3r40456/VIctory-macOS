@@ -90,7 +90,7 @@ fn find_init_frame(
     found
 }
 
-fn field<const N: usize>(base: usize, offset: usize) -> Option<[u8; N]> {
+pub(crate) fn field<const N: usize>(base: usize, offset: usize) -> Option<[u8; N]> {
     let at = base.checked_add(offset)?;
     if base == 0 || !page_readable(at) || !page_readable(at.checked_add(N - 1)?) {
         return None;
@@ -115,7 +115,7 @@ fn hex<T: LowerHex>(value: Option<T>) -> String {
     value.map_or_else(|| "?".into(), |v| format!("{v:#x}"))
 }
 
-fn fields(node: usize, manager: usize) -> String {
+pub(crate) fn fields(node: usize, manager: usize) -> String {
     let link = field(node, 0x80).map(usize::from_le_bytes);
     let same = match link {
         Some(p) if p != 0 && p == manager => "yes",

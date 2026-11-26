@@ -22,6 +22,8 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadI
 
 #[path = "activation/events.rs"]
 mod events;
+#[path = "activation/init_gate.rs"]
+mod init_gate;
 
 const TITLE_HASH: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
 const GADGET_HASH: &str = "2933e407ac763473532c2ca7f3b0ae5f90678bba9392bbd0365ee1c558836a2d";
@@ -34,6 +36,7 @@ struct Trace {
     size: usize,
     output: File,
     events: Mutex<events::Events>,
+    gate: Option<Mutex<init_gate::GateCounts>>,
     incomplete: AtomicBool,
     finished: AtomicBool,
     active: AtomicUsize,
@@ -48,7 +51,8 @@ static ARMED: AtomicI8 = AtomicI8::new(0);
 /// `hash` must identify the original executable for the mapped range. Its code must
 /// remain loaded for the lifetime of the process, with no title thread running yet.
 pub unsafe fn start(hash: &str, image: usize, size: usize) -> Result<()> {
-    if std::env::var("VICTORY_TRACE_ACTIVATION").as_deref() != Ok("1") {
+    let gate = std::env::var("VICTORY_TRACE_INIT").as_deref() == Ok("1");
+    if !gate && std::env::var("VICTORY_TRACE_ACTIVATION").as_deref() != Ok("1") {
         return Ok(());
     }
     ensure!(
@@ -89,11 +93,23 @@ pub unsafe fn start(hash: &str, image: usize, size: usize) -> Result<()> {
         "activation Gadget DLL hash mismatch"
     );
 
+    // Each mode stages a fixed script. Gate mode samples only the init routine.
+    let (script, callback): (&[u8], usize) = if gate {
+        (
+            include_bytes!("init-gate.js"),
+            init_gate::record as *const () as usize,
+        )
+    } else {
+        (
+            include_bytes!("activation.js"),
+            record as *const () as usize,
+        )
+    };
     let config = format!(
         r#"{{"interaction":{{"type":"script","path":"activation.js","parameters":{{"image":"{image:#x}","record":"{:#x}","ready":"{:#x}"}}}},"runtime":"qjs"}}"#,
-        record as *const () as usize, ready as *const () as usize
+        callback, ready as *const () as usize
     );
-    write_new(&dir.join("activation.js"), include_bytes!("activation.js"))?;
+    write_new(&dir.join("activation.js"), script)?;
     write_new(&dir.join("frida-gadget.config"), config.as_bytes())?;
     let output = File::from(io::stderr().as_handle().try_clone_to_owned()?);
     TRACE
@@ -102,6 +118,7 @@ pub unsafe fn start(hash: &str, image: usize, size: usize) -> Result<()> {
             size,
             output,
             events: Mutex::default(),
+            gate: gate.then(Mutex::default),
             incomplete: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             active: AtomicUsize::new(0),
@@ -139,7 +156,7 @@ pub unsafe fn start(hash: &str, image: usize, size: usize) -> Result<()> {
     loop {
         match ARMED.load(Ordering::Acquire) {
             1 => break,
-            -1 => anyhow::bail!("activation script failed to install both listeners"),
+            -1 => anyhow::bail!("diagnostic script failed to install its listeners"),
             _ => ensure!(
                 start.elapsed() < ARM_TIMEOUT,
                 "activation script timed out before arming"
@@ -147,7 +164,11 @@ pub unsafe fn start(hash: &str, image: usize, size: usize) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    log_line(format_args!("armed image={image:#x}"));
+    if gate {
+        log_line(format_args!("init_gate armed image={image:#x}"));
+    } else {
+        log_line(format_args!("armed image={image:#x}"));
+    }
     Ok(())
 }
 
@@ -216,6 +237,15 @@ fn finish(trace: &Trace, reason: &str) {
         }
         let incomplete =
             trace.incomplete.load(Ordering::Relaxed) || trace.active.load(Ordering::SeqCst) != 0;
+        if let Some(counts) = &trace.gate {
+            match counts.try_lock() {
+                Ok(c) => c.summary(reason, incomplete),
+                Err(_) => log_line(format_args!(
+                    "init_gate summary reason={reason} complete=false counts=unavailable"
+                )),
+            }
+            return;
+        }
         match trace.events.try_lock() {
             Ok(events) => events.summary(reason, incomplete),
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().summary(reason, true),
