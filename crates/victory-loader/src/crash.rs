@@ -12,6 +12,9 @@
 //! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
 //! crash log too.
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod init_frame;
+
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
@@ -660,12 +663,15 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     #[cfg(feature = "diagnostics")]
     if code == EXCEPTION_BREAKPOINT {
-        // SAFETY: the exception record and context describe this fault.
-        let address = unsafe { (*(*info).ExceptionRecord).ExceptionAddress };
-        crate::activation::on_breakpoint(address as usize);
+        // SAFETY: the system supplied both records for this faulting thread.
+        let (address, context) = unsafe {
+            ((*(*info).ExceptionRecord).ExceptionAddress as usize, &*(*info).ContextRecord)
+        };
+        crate::activation::on_breakpoint(address);
         if DUMP_REGISTRY.get().is_some() {
-            // SAFETY: the context record is valid for the faulting thread.
-            unsafe { dump_title_registry(&*(*info).ContextRecord) };
+            init_frame::observe(address, context);
+            // SAFETY: this context belongs to the current exception.
+            unsafe { dump_title_registry(context) };
         }
     }
     #[cfg(feature = "diagnostics")]
@@ -865,16 +871,31 @@ pub(crate) struct Aligned16(pub(crate) CONTEXT);
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
 pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+    walk_frames(context, low, high, |_, frame| {
+        frames.push(frame.Rip);
+        frames.len() < MAX_FRAMES
+    });
+}
+
+/// Visits the saved register context of each frame, innermost first.
+fn walk_frames(
+    context: CONTEXT,
+    low: usize,
+    high: usize,
+    mut visit: impl FnMut(usize, &CONTEXT) -> bool,
+) {
     // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
     // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
     // the stack can land 8 bytes off and fault (seen in a debug build).
     let mut aligned = Aligned16(context);
     let context = &mut aligned.0;
-    frames.push(context.Rip);
-    while frames.len() < MAX_FRAMES {
+    for depth in 0..MAX_FRAMES {
+        if !visit(depth, context) || depth + 1 == MAX_FRAMES {
+            break;
+        }
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
+        if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
             break;
         }
         let mut image = 0;
@@ -907,7 +928,6 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         if context.Rip == 0 {
             break;
         }
-        frames.push(context.Rip);
     }
 }
 
