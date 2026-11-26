@@ -346,7 +346,7 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>(
         tracing::warn!(
             object = KINDS[KIND],
             slot = format_args!("{:#x}", SLOT * 8),
-            caller = caller(),
+            caller = caller(2),
             args = %args,
             "method not implemented"
         );
@@ -354,10 +354,9 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>(
     E_NOTIMPL
 }
 
-/// The return address of whoever called our caller, as `+offset` into its
-/// module.
+/// A return address from the current stack as a module-relative offset when available.
 #[inline(never)]
-fn caller() -> String {
+pub(crate) fn caller(_skip: u32) -> String {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
@@ -366,8 +365,8 @@ fn caller() -> String {
             GetModuleHandleExW,
         };
         let mut frame = std::ptr::null_mut();
-        // SAFETY: room for one frame; skips this function and its caller.
-        if unsafe { RtlCaptureStackBackTrace(2, 1, &mut frame, std::ptr::null_mut()) } == 1 {
+        // SAFETY: room for one frame; the caller selects the number of frames to skip.
+        if unsafe { RtlCaptureStackBackTrace(_skip, 1, &mut frame, std::ptr::null_mut()) } == 1 {
             let mut module = std::ptr::null_mut();
             // SAFETY: looks up the module holding the address, no reference.
             let found = unsafe {

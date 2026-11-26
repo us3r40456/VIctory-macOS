@@ -6,6 +6,9 @@
 //! write next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod pso_calls;
+
 use std::ffi::c_void;
 
 use crate::object::{
@@ -245,13 +248,20 @@ extern "system" fn create_derived_pipeline_x_probe(
 ) -> HRESULT {
     #[cfg(feature = "diagnostics")]
     if pipeline_probe_enabled() {
+        #[cfg(windows)]
+        let call = pso_calls::Call::begin(0x1b8, base.cast(), Some((patch_count, patches)), iid, out);
         tracing::debug!(
             ?base,
             patch_count,
             ?patches,
             "derived console PSO probe requested (patches ignored)"
         );
-        return pipeline::derive_console_probe(base, iid, out);
+        let hr = pipeline::derive_console_probe(base, iid, out);
+        #[cfg(windows)]
+        if let Some(call) = call {
+            call.finish(hr);
+        }
+        return hr;
     }
     let _ = (base, patch_count, patches, iid, out);
     E_NOTIMPL
@@ -283,15 +293,23 @@ extern "system" fn deserialize_pipeline_x_probe<const SLOT: usize>(
             reject_cache,
             "console PSO probe requested"
         );
-        if reject_cache {
+        #[cfg(windows)]
+        let call = pso_calls::Call::begin(SLOT, desc, None, iid, out);
+        let hr = if reject_cache {
             if !out.is_null() {
                 // SAFETY: the caller supplies writable storage for the result.
                 unsafe { out.write(std::ptr::null()) };
             }
             // XCL reports unsupported serialized console PSOs this way.
-            return E_NOTIMPL;
+            E_NOTIMPL
+        } else {
+            pipeline::create_console_probe(iid, out)
+        };
+        #[cfg(windows)]
+        if let Some(call) = call {
+            call.finish(hr);
         }
-        return pipeline::create_console_probe(iid, out);
+        return hr;
     }
     let _ = (desc, iid, out);
     E_NOTIMPL
