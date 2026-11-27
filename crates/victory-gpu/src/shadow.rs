@@ -1350,7 +1350,7 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         if crate::memory::profile_on() {
-            note_profiled_copy(from, to - from);
+            note_profiled_copy(self, from, to - from);
         }
         if self.has_widened.load(Ordering::Acquire) {
             self.refresh_widened(from, to);
@@ -1363,12 +1363,21 @@ impl Shadow {
     }
 }
 
-/// The ten largest distinct source runs copied since the last real frame.
-static COPY_SOURCES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CopySource {
+    len: usize,
+    from: usize,
+    shadow_start: u64,
+    shadow_len: u64,
+}
 
-fn note_profiled_copy(from: usize, len: usize) {
+/// The ten largest distinct source runs copied since the last real frame.
+static COPY_SOURCES: Mutex<Vec<CopySource>> = Mutex::new(Vec::new());
+
+fn note_profiled_copy(shadow: &Shadow, from: usize, len: usize) {
     let mut sources = COPY_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
-    let run = (len, from);
+    let (shadow_start, shadow_len) = shadow.range();
+    let run = CopySource { len, from, shadow_start, shadow_len };
     if len == 0 || sources.contains(&run) {
         return;
     }
@@ -1387,11 +1396,15 @@ pub(crate) fn log_copy_sources() {
 
     let mut sources = std::mem::take(&mut *COPY_SOURCES.lock().unwrap_or_else(|e| e.into_inner()));
     sources.sort_unstable_by(|a, b| b.cmp(a));
-    for (len, from) in sources {
+    for CopySource { len, from, shadow_start, shadow_len } in sources {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: a valid out pointer; VirtualQuery does not read the source.
         let found = unsafe { VirtualQuery(from as *const _, &mut info, size_of_val(&info)) } != 0;
         let pages = (from % PAGE + len).div_ceil(PAGE);
+        let (start, end) = (from as u64, (from + len) as u64);
+        let aliases = aliased_between(start, end);
+        let aliased_bytes: u64 = aliases.iter().map(|&(a, b)| b.min(end) - a.max(start)).sum();
+        let aliased_shadow = find_aliased(shadow_start, shadow_start + shadow_len).is_some();
         tracing::info!(
             from = format_args!("{from:#x}"),
             bytes = len,
@@ -1403,6 +1416,11 @@ pub(crate) fn log_copy_sources() {
             protect = format_args!("{:#x}", info.Protect),
             state = format_args!("{:#x}", info.State),
             kind = format_args!("{:#x}", info.Type),
+            shadow = format_args!("{shadow_start:#x}"),
+            shadow_bytes = shadow_len,
+            alias_regions = aliases.len(),
+            aliased_bytes,
+            aliased_shadow,
             "copied title memory source"
         );
     }
