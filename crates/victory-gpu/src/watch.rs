@@ -318,8 +318,18 @@ thread_local! {
     static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Opt-in (`VICTORY_WATCH_SERIAL_PROTECT=1`): serialize `VirtualProtect` calls
+/// in user space to avoid thrashing Wine's internal `ntdll` `virtual_mutex`.
+fn serial_protect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_SERIAL_PROTECT"))
+}
+
+static PROTECT_SERIAL: Mutex<()> = Mutex::new(());
+
 /// A protection call `f`, timed and counted ([`TIMES`]).
 fn timed_protect(f: impl FnOnce() -> bool) -> bool {
+    let _serial = serial_protect().then(|| PROTECT_SERIAL.lock().unwrap_or_else(|e| e.into_inner()));
     let started = std::time::Instant::now();
     let done = f();
     TIMES[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1564,6 +1574,11 @@ fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // Safe copy fault recovery takes priority over guard opening so
+        // `write_mapped` into a read-only block fails cleanly like `ReadProcessMemory`.
+        if crate::host::try_recover_safe_copy(info) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // mac: the sampler leaves a thread alone while it takes exceptions
         // (`crate::profile::excepted`; one load without `VICTORY_PROFILE`).
         crate::profile::excepted();
@@ -1575,6 +1590,23 @@ fn install() {
             || r.ExceptionInformation[0] != WRITE
         {
             fault(3);
+            static LOG_OTHER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOG_OTHER.get_or_init(|| crate::switch::on("VICTORY_WATCH_LOG_EXCEPTIONS")) {
+                static OTHER_N: AtomicU64 = AtomicU64::new(0);
+                let n = OTHER_N.fetch_add(1, Ordering::Relaxed);
+                if matches!(n, 100 | 1000 | 5000 | 10000 | 20000) {
+                    let rw = if r.NumberParameters >= 1 { r.ExceptionInformation[0] } else { 0 };
+                    let addr = if r.NumberParameters >= 2 { r.ExceptionInformation[1] } else { 0 };
+                    tracing::info!(
+                        n,
+                        code = format_args!("{:#x}", r.ExceptionCode as u32),
+                        ip = format_args!("{:p}", r.ExceptionAddress),
+                        rw,
+                        addr = format_args!("{addr:#x}"),
+                        "watch other exception sample"
+                    );
+                }
+            }
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];

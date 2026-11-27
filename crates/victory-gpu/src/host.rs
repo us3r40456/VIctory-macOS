@@ -1924,7 +1924,16 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
+    #[track_caller]
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if submission_profile_on() && runs.len() == 1 {
+            let mut p = runs[0].pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if p.is_empty() {
+                let loc = std::panic::Location::caller();
+                let file = loc.file().rsplit(['/', '\\']).next().unwrap_or(loc.file());
+                p.insert(format!("[execute {file}:{}]", loc.line()));
+            }
+        }
         self.run(runs, None);
     }
 
@@ -4647,10 +4656,170 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
-/// page is not readable or a destination page not writable (the bytes
-/// before that page may have been copied).
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".global victory_safe_copy",
+    ".global victory_safe_copy_start",
+    ".global victory_safe_copy_end",
+    ".global victory_safe_copy_fault",
+    "victory_safe_copy:",
+    "victory_safe_copy_start:",
+    "cmp r8, 64",
+    "jb 2f",
+    "1:",
+    "movups xmm0, [rcx]",
+    "movups xmm1, [rcx + 16]",
+    "movups xmm2, [rcx + 32]",
+    "movups xmm3, [rcx + 48]",
+    "movups [rdx], xmm0",
+    "movups [rdx + 16], xmm1",
+    "movups [rdx + 32], xmm2",
+    "movups [rdx + 48], xmm3",
+    "add rcx, 64",
+    "add rdx, 64",
+    "sub r8, 64",
+    "cmp r8, 64",
+    "jae 1b",
+    "2:",
+    "cmp r8, 16",
+    "jb 3f",
+    "movups xmm0, [rcx]",
+    "movups [rdx], xmm0",
+    "add rcx, 16",
+    "add rdx, 16",
+    "sub r8, 16",
+    "jmp 2b",
+    "3:",
+    "cmp r8, 8",
+    "jb 4f",
+    "mov rax, [rcx]",
+    "mov [rdx], rax",
+    "add rcx, 8",
+    "add rdx, 8",
+    "sub r8, 8",
+    "4:",
+    "cmp r8, 4",
+    "jb 5f",
+    "mov eax, [rcx]",
+    "mov [rdx], eax",
+    "add rcx, 4",
+    "add rdx, 4",
+    "sub r8, 4",
+    "5:",
+    "test r8, r8",
+    "jz 6f",
+    "mov al, [rcx]",
+    "mov [rdx], al",
+    "inc rcx",
+    "inc rdx",
+    "dec r8",
+    "jnz 5b",
+    "6:",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_copy_end:",
+    "victory_safe_copy_fault:",
+    "xor eax, eax",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "win64" {
+    fn victory_safe_copy(src: *const u8, dst: *mut u8, len: usize) -> u8;
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    static victory_safe_copy_start: u8;
+    static victory_safe_copy_end: u8;
+    static victory_safe_copy_fault: u8;
+}
+
+/// If `info` is an access violation inside [`victory_safe_copy`], redirects
+/// execution to `victory_safe_copy_fault` (returning `false`) and returns true.
+/// Also checked first by `watch::on_write` so writes to `PAGE_READONLY`
+/// destinations during `write_mapped` fail cleanly without opening guards.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn try_recover_safe_copy(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> bool {
+    use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+    // SAFETY: `info` is a valid VEH pointer provided by the OS.
+    unsafe {
+        let r = &*(*info).ExceptionRecord;
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION {
+            return false;
+        }
+        let ctx = &mut *(*info).ContextRecord;
+        let rip = ctx.Rip as usize;
+        let start = &raw const victory_safe_copy_start as usize;
+        let end = &raw const victory_safe_copy_end as usize;
+        if (start..end).contains(&rip) {
+            ctx.Rip = (&raw const victory_safe_copy_fault as usize) as u64;
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn try_recover_safe_copy(
+    _info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> bool {
+    false
+}
+
+/// Whether user-space fault-recovered fast copy replaces `ReadProcessMemory`
+/// under Wine (on by default under Wine; `VICTORY_FAST_COPY=0` disables it).
+#[cfg(target_arch = "x86_64")]
+fn fast_copy_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::under_wine() && !crate::switch::off("VICTORY_FAST_COPY");
+        if on {
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION,
+                EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+            };
+            unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+                if try_recover_safe_copy(info) {
+                    EXCEPTION_CONTINUE_EXECUTION
+                } else {
+                    EXCEPTION_CONTINUE_SEARCH
+                }
+            }
+            // SAFETY: pure PC-range check handler installed ahead of crash reporter.
+            unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
+            tracing::info!(
+                "VICTORY_FAST_COPY: user-space SIMD safe copy active (bypassing Wine ReadProcessMemory IPC)"
+            );
+        }
+        on
+    })
+}
+
+/// Copies `len` bytes from `src` to `dst` safely: false if a source page is
+/// not readable or a destination page not writable (the bytes before that page
+/// may have been copied). Under Wine, uses `victory_safe_copy` with VEH fault
+/// recovery instead of `ReadProcessMemory` to avoid wineserver IPC serialization.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if src.is_null() || dst.is_null() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if fast_copy_enabled() {
+        let (s, d) = (src as usize, dst as usize);
+        if s == d {
+            // Still verify readability + writability via a 1-byte roundtrip? Fall back for exact overlap.
+        } else if !(s < d && d < s.saturating_add(len)) {
+            // SAFETY: non-overlapping; any access violation inside `victory_safe_copy`
+            // is recovered by VEH and returns 0.
+            return unsafe { victory_safe_copy(src, dst, len) != 0 };
+        }
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -4851,6 +5020,85 @@ mod title_copies {
         write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
+    }
+
+    #[test]
+    fn fast_copy_matches_read_process_memory_and_benchmarks_speedup() {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let len = 64 << 10;
+        let src = vec![0x5Au8; len];
+        let mut dst = vec![0u8; len];
+
+        // Warmup + correctness on 64 KiB + odd tails.
+        for n in [1usize, 3, 4, 7, 8, 15, 16, 63, 64, 65, 1023, len] {
+            dst[..n].fill(0);
+            assert!(super::read(src.as_ptr(), dst.as_mut_ptr(), n));
+            assert!(dst[..n].iter().all(|&b| b == 0x5A), "mismatch at len={n}");
+        }
+
+        // Benchmark 1: 128 MiB of 64 KiB copies (2048 calls, mirroring 1 GTA VI frame).
+        let t0 = std::time::Instant::now();
+        for _ in 0..2048 {
+            assert!(super::read(src.as_ptr(), dst.as_mut_ptr(), len));
+        }
+        let fast_big = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        let mut done = 0usize;
+        for _ in 0..2048 {
+            // SAFETY: valid buffers.
+            assert_ne!(
+                unsafe {
+                    ReadProcessMemory(
+                        GetCurrentProcess(),
+                        src.as_ptr().cast(),
+                        dst.as_mut_ptr().cast(),
+                        len,
+                        &mut done,
+                    )
+                },
+                0
+            );
+        }
+        let rpm_big = t1.elapsed();
+
+        // Benchmark 2: 20,000 × 4-byte reads (mirroring descriptor/draw slot reads).
+        let mut word = [0u8; 4];
+        let t2 = std::time::Instant::now();
+        for _ in 0..20_000 {
+            assert!(super::read(src.as_ptr(), word.as_mut_ptr(), 4));
+        }
+        let fast_4b = t2.elapsed();
+
+        let t3 = std::time::Instant::now();
+        for _ in 0..20_000 {
+            // SAFETY: valid buffers.
+            assert_ne!(
+                unsafe {
+                    ReadProcessMemory(
+                        GetCurrentProcess(),
+                        src.as_ptr().cast(),
+                        word.as_mut_ptr().cast(),
+                        4,
+                        &mut done,
+                    )
+                },
+                0
+            );
+        }
+        let rpm_4b = t3.elapsed();
+
+        eprintln!(
+            "VICTORY_FAST_COPY bench: 128 MiB (2048x64KiB): fast={:.2} ms vs ReadProcessMemory={:.2} ms ({:.1}x faster) | 20000x4B: fast={:.2} ms vs RPM={:.2} ms ({:.1}x faster)",
+            fast_big.as_secs_f64() * 1e3,
+            rpm_big.as_secs_f64() * 1e3,
+            rpm_big.as_secs_f64() / fast_big.as_secs_f64().max(1e-9),
+            fast_4b.as_secs_f64() * 1e3,
+            rpm_4b.as_secs_f64() * 1e3,
+            rpm_4b.as_secs_f64() / fast_4b.as_secs_f64().max(1e-9),
+        );
     }
 }
 

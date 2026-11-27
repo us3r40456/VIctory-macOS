@@ -147,6 +147,22 @@ pub fn run(
     } else {
         println!("clwb loops     left as they are");
     }
+    // clzero faults under Rosetta (and pre-Zen Intel CPUs), thousands of times
+    // per frame in the title's hot cache-line zeroing loops: patch them to
+    // native SSE2 zeroing trampolines by default under Rosetta.
+    #[cfg(windows)]
+    if match std::env::var("VICTORY_PATCH_CLZERO").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => victory_gpu::rosetta(),
+    } {
+        println!(
+            "clzero loops   {} patched to native zeroing",
+            victory_loader::patch_clzero_loops(image.base() as u64, image.info())
+        );
+    } else {
+        println!("clzero loops   left as they are");
+    }
     // The title's hang watchdog off, for world loads from slow storage.
     #[cfg(windows)]
     if std::env::var_os("VICTORY_NO_HANG_WATCHDOG").is_some_and(|v| v != "0") {

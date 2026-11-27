@@ -640,6 +640,223 @@ pub fn nop_clwb_loops(base: u64, info: &victory_pe::ImageInfo) -> usize {
     patched
 }
 
+/// One `clzero` loop site found in a section's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClzeroLoop {
+    /// 12 bytes at `offset`: `clzero; add rax, 0x40; cmp rax, lim; jb -12`.
+    Form1 { offset: usize, cmp: [u8; 3], limit: u8 },
+    /// 15 bytes at `offset`: `mov rax, a; add a, 0x40; clzero; cmp a, b; jb -15`.
+    Form2 {
+        offset: usize,
+        before: [u8; 7],
+        cmp: [u8; 3],
+        a: u8,
+        b: u8,
+    },
+}
+
+/// Scans `code` for the two compiler-emitted `clzero` cache-line-zeroing loops
+/// that [`clzero`] emulates on non-AMD CPUs (such as Apple Silicon Rosetta 2).
+fn clzero_loop_sites(code: &[u8]) -> Vec<ClzeroLoop> {
+    let mut sites = Vec::new();
+    let mut at = 0;
+    while at + 3 <= code.len() {
+        if code[at..at + 3] != [0x0f, 0x01, 0xfc] {
+            at += 1;
+            continue;
+        }
+        // Form 1: 12 bytes starting at `clzero`.
+        if at + 12 <= code.len()
+            && code[at + 3..at + 7] == [0x48, 0x83, 0xc0, 0x40]
+            && code[at + 10..at + 12] == [0x72, 0xf4]
+        {
+            let cmp = [code[at + 7], code[at + 8], code[at + 9]];
+            if let Some((0, limit)) = compare_registers(&cmp)
+                && limit != 0
+                && limit != 4
+            {
+                sites.push(ClzeroLoop::Form1 { offset: at, cmp, limit });
+                at += 12;
+                continue;
+            }
+        }
+        // Form 2: 7 bytes before `clzero` + 3 bytes `clzero` + 5 bytes after = 15 bytes.
+        if at >= 7 && at + 8 <= code.len() && code[at + 6..at + 8] == [0x72, 0xf1] {
+            let before: [u8; 7] = code[at - 7..at].try_into().unwrap();
+            let cmp = [code[at + 3], code[at + 4], code[at + 5]];
+            if let [rex @ (0x48 | 0x4c), 0x89, load, add_rex @ (0x48 | 0x49), 0x83, add, 0x40] =
+                before
+                && let Some((a, b)) = compare_registers(&cmp)
+                && load & 0xc7 == 0xc0
+                && a == ((load >> 3) & 7 | (rex & 4) << 1)
+                && add & 0xf8 == 0xc0
+                && a == (add & 7 | (add_rex & 1) << 3)
+                && a != 0
+                && b != 0
+                && a != 4
+                && b != 4
+            {
+                sites.push(ClzeroLoop::Form2 {
+                    offset: at - 7,
+                    before,
+                    cmp,
+                    a,
+                    b,
+                });
+                at += 8;
+                continue;
+            }
+        }
+        at += 3;
+    }
+    sites
+}
+
+/// Emits a native SSE2 (128-bit `movdqa`) zeroing trampoline for a `clzero`
+/// loop, preserving every register and all `EFLAGS` bits produced by `cmp`.
+fn clzero_trampoline(site: &ClzeroLoop) -> Vec<u8> {
+    let scratch: u8 = match *site {
+        ClzeroLoop::Form1 { limit, .. } => if limit != 1 { 1 } else { 2 },
+        ClzeroLoop::Form2 { a, b, .. } => [1u8, 2, 3]
+            .into_iter()
+            .find(|&r| r != a && r != b)
+            .unwrap_or(1),
+    };
+    let mut out = Vec::with_capacity(72);
+    // Save scratch GPR + xmm0 on stack.
+    out.push(0x50 + scratch); // push s
+    out.extend_from_slice(&[0x48, 0x83, 0xec, 0x10]); // sub rsp, 16
+    out.extend_from_slice(&[0xf3, 0x0f, 0x7f, 0x04, 0x24]); // movdqu [rsp], xmm0
+    out.extend_from_slice(&[0x66, 0x0f, 0xef, 0xc0]); // pxor xmm0, xmm0
+    let top = out.len();
+    if let ClzeroLoop::Form2 { before, .. } = *site {
+        out.extend_from_slice(&before); // mov rax, a; add a, 0x40
+    }
+    // Zero 64-byte cache line at (rax & !63) using 128-bit SSE2 stores (safe under Rosetta 2).
+    out.extend_from_slice(&[0x48, 0x89, 0xc0 | scratch]); // mov s, rax
+    out.extend_from_slice(&[0x48, 0x83, 0xe0 | scratch, 0xc0]); // and s, -64
+    out.extend_from_slice(&[0x66, 0x0f, 0x7f, scratch]); // movdqa [s], xmm0
+    out.extend_from_slice(&[0x66, 0x0f, 0x7f, 0x40 | scratch, 0x10]); // movdqa [s+16], xmm0
+    out.extend_from_slice(&[0x66, 0x0f, 0x7f, 0x40 | scratch, 0x20]); // movdqa [s+32], xmm0
+    out.extend_from_slice(&[0x66, 0x0f, 0x7f, 0x40 | scratch, 0x30]); // movdqa [s+48], xmm0
+    match *site {
+        ClzeroLoop::Form1 { cmp, .. } => {
+            out.extend_from_slice(&[0x48, 0x83, 0xc0, 0x40]); // add rax, 0x40
+            out.extend_from_slice(&cmp);
+        }
+        ClzeroLoop::Form2 { cmp, .. } => {
+            out.extend_from_slice(&cmp);
+        }
+    }
+    let rel8 = (top as isize - (out.len() as isize + 2)) as i8 as u8;
+    out.extend_from_slice(&[0x72, rel8]); // jb .top
+    // Restore xmm0, rsp, and scratch GPR WITHOUT touching EFLAGS!
+    out.extend_from_slice(&[0xf3, 0x0f, 0x6f, 0x04, 0x24]); // movdqu xmm0, [rsp]
+    out.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x10]); // lea rsp, [rsp+16]
+    out.push(0x58 + scratch); // pop s
+    out.push(0xc3); // ret
+    out
+}
+
+/// Replaces every compiler-emitted `clzero` loop in the executable sections of
+/// the image mapped at `base` with a direct `call rel32` to a native SSE2
+/// zeroing trampoline. Eliminates thousands of `STATUS_ILLEGAL_INSTRUCTION`
+/// traps per frame on Apple Silicon Rosetta 2 (and Intel CPUs without CLZERO).
+pub fn patch_clzero_loops(base: u64, info: &victory_pe::ImageInfo) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+        VirtualAlloc, VirtualProtect,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let mut sites: Vec<(u64, ClzeroLoop)> = Vec::new();
+    for section in &info.sections {
+        if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let len = section.virtual_size.min(section.file_size) as usize;
+        let start = base + u64::from(section.rva);
+        // SAFETY: mapped executable section of the image at `base`.
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+        for site in clzero_loop_sites(code) {
+            sites.push((start, site));
+        }
+    }
+    if sites.is_empty() {
+        return 0;
+    }
+    const POOL_SIZE: usize = 64 << 10;
+    let mut pool = std::ptr::null_mut();
+    for step in 1..2048u64 {
+        let Some(want) = base.checked_sub(step << 20) else {
+            break;
+        };
+        // SAFETY: reserving executable trampoline memory within rel32 reach.
+        pool = unsafe {
+            VirtualAlloc(
+                want as *const _,
+                POOL_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if !pool.is_null() {
+            break;
+        }
+    }
+    if pool.is_null() {
+        tracing::warn!("no memory near image for clzero loop trampolines");
+        return 0;
+    }
+    let mut used = 0usize;
+    let mut patched = 0usize;
+    for (sec_start, site) in &sites {
+        let (offset, loop_len) = match *site {
+            ClzeroLoop::Form1 { offset, .. } => (offset, 12usize),
+            ClzeroLoop::Form2 { offset, .. } => (offset, 15usize),
+        };
+        let tramp = clzero_trampoline(site);
+        if used + tramp.len() > POOL_SIZE {
+            break;
+        }
+        let site_va = sec_start + offset as u64;
+        let tramp_va = pool as u64 + used as u64;
+        let Ok(rel32) = i32::try_from(tramp_va as i128 - (site_va as i128 + 5)) else {
+            continue;
+        };
+        let mut call = [0x90u8; 15];
+        call[0] = 0xe8;
+        call[1..5].copy_from_slice(&rel32.to_le_bytes());
+        let mut old = 0;
+        // SAFETY: writing generated trampoline and patching image code before title runs.
+        unsafe {
+            std::ptr::copy_nonoverlapping(tramp.as_ptr(), tramp_va as *mut u8, tramp.len());
+            if VirtualProtect(
+                site_va as *const _,
+                loop_len,
+                PAGE_EXECUTE_READWRITE,
+                &mut old,
+            ) == 0
+            {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(call.as_ptr(), site_va as *mut u8, loop_len);
+            VirtualProtect(site_va as *const _, loop_len, old, &mut old);
+        }
+        used = (used + tramp.len() + 15) & !15;
+        patched += 1;
+    }
+    let mut old = 0;
+    // SAFETY: mark trampoline pool RX and flush instruction cache.
+    unsafe {
+        VirtualProtect(pool, POOL_SIZE, PAGE_EXECUTE_READ, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0);
+    }
+    patched
+}
+
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
 /// titles clear tens of kilobytes at a time, a line per pass, so the two
 /// loops compilers build around the instruction are done whole in one
@@ -2177,6 +2394,101 @@ mod tests {
             let end = page.add(0x1000 - 3);
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clzero_loop_patch_zeroes_memory_and_preserves_state_without_exceptions() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        #[repr(align(64))]
+        struct Buf([u8; 320]);
+
+        // Exact Form 1 from GTA VI (+0x4e8aa70): clzero; add rax, 0x40; cmp rax, r10; jb -12
+        let form1: [u8; 12] = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ];
+        // Exact Form 2 from GTA VI (+0x4e8ab4c): mov rax, r10; add r10, 0x40; clzero; cmp r10, r11; jb -15
+        let form2: [u8; 15] = [
+            0x4c, 0x89, 0xd0, 0x49, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4d, 0x39, 0xda, 0x72,
+            0xf1,
+        ];
+        // Verify scanner finds both forms and rejects false-positive call bytes.
+        let mut scan = vec![0xe8, 0x46, 0x0f, 0x01, 0xfc, 0x90];
+        let off1 = scan.len();
+        scan.extend_from_slice(&form1);
+        scan.push(0x90);
+        let off2 = scan.len();
+        scan.extend_from_slice(&form2);
+        let found = clzero_loop_sites(&scan);
+        assert_eq!(found.len(), 2);
+        assert!(matches!(found[0], ClzeroLoop::Form1 { offset, limit: 10, .. } if offset == off1));
+        assert!(matches!(found[1], ClzeroLoop::Form2 { offset, a: 10, b: 11, .. } if offset == off2));
+
+        // Execute both generated trampolines natively on this CPU (NO exception handler!).
+        // SAFETY: fresh RWX buffer containing valid generated x86_64 code.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+
+            // Test Form 1: wrapper sets rax=rcx, r10=rdx, calls trampoline, returns rax.
+            let t1 = clzero_trampoline(&found[0]);
+            page.copy_from_nonoverlapping(t1.as_ptr(), t1.len());
+            let w1_off = 0x100usize;
+            let rel1 = (0isize - (w1_off as isize + 6 + 5)) as i32;
+            let mut w1 = vec![
+                0x48, 0x89, 0xc8, // mov rax, rcx
+                0x49, 0x89, 0xd2, // mov r10, rdx
+                0xe8,
+            ];
+            w1.extend_from_slice(&rel1.to_le_bytes());
+            w1.push(0xc3); // ret
+            page.add(w1_off).copy_from_nonoverlapping(w1.as_ptr(), w1.len());
+            let run1: extern "win64" fn(u64, u64) -> u64 =
+                std::mem::transmute(page.add(w1_off));
+
+            let mut buf = Buf([0xAA; 320]);
+            let base = buf.0.as_mut_ptr() as u64;
+            // Include unaligned +17 low bits to verify `(rax & !63)` alignment!
+            let end_rax = run1(base + 64 + 17, base + 256);
+            assert_eq!(end_rax, base + 256 + 17);
+            assert!(buf.0[0..64].iter().all(|&b| b == 0xAA));
+            assert!(buf.0[64..256].iter().all(|&b| b == 0));
+            assert!(buf.0[256..320].iter().all(|&b| b == 0xAA));
+
+            // Test Form 2: wrapper sets r10=rcx, r11=rdx, calls trampoline, returns r10.
+            let t2_off = 0x200usize;
+            let t2 = clzero_trampoline(&found[1]);
+            page.add(t2_off).copy_from_nonoverlapping(t2.as_ptr(), t2.len());
+            let w2_off = 0x300usize;
+            let rel2 = (t2_off as isize - (w2_off as isize + 6 + 5)) as i32;
+            let mut w2 = vec![
+                0x49, 0x89, 0xca, // mov r10, rcx
+                0x49, 0x89, 0xd3, // mov r11, rdx
+                0xe8,
+            ];
+            w2.extend_from_slice(&rel2.to_le_bytes());
+            w2.extend_from_slice(&[0x4c, 0x89, 0xd0, 0xc3]); // mov rax, r10; ret
+            page.add(w2_off).copy_from_nonoverlapping(w2.as_ptr(), w2.len());
+            let run2: extern "win64" fn(u64, u64) -> u64 =
+                std::mem::transmute(page.add(w2_off));
+
+            let mut buf2 = Buf([0xBB; 320]);
+            let base2 = buf2.0.as_mut_ptr() as u64;
+            let end_r10 = run2(base2 + 64, base2 + 256);
+            assert_eq!(end_r10, base2 + 256);
+            assert!(buf2.0[0..64].iter().all(|&b| b == 0xBB));
+            assert!(buf2.0[64..256].iter().all(|&b| b == 0));
+            assert!(buf2.0[256..320].iter().all(|&b| b == 0xBB));
+
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }
