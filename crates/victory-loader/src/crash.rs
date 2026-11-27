@@ -833,6 +833,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the exception and context records are valid for the faulting thread.
         let address = unsafe { (*(*info).ExceptionRecord).ExceptionAddress as usize };
         crate::init_gate::on_breakpoint(address);
+        crate::verify_trace::on_breakpoint(address);
         if DUMP_REGISTRY.get().is_some() {
             // SAFETY: the context record is valid for the faulting thread.
             unsafe { dump_title_registry(&*(*info).ContextRecord) };
@@ -1279,6 +1280,7 @@ unsafe fn dump_title_registry(context: &CONTEXT) {
         add("second table [G+0x2a8] is null".into());
     }
     let _ = std::fs::write(dir.join("registry.txt"), &txt);
+    crate::verify_trace::dump_detail(base, dir);
 }
 
 #[cfg(test)]

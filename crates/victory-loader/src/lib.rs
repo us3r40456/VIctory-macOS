@@ -25,6 +25,8 @@
 mod crash;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod init_gate;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod verify_trace;
 pub mod masked;
 pub mod wide;
 #[cfg(windows)]

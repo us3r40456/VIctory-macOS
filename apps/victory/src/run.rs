@@ -282,6 +282,11 @@ pub fn run(
             image.base(),
             image.info().size_of_image as usize,
         )?;
+        victory_loader::verify_trace::start(
+            &hash,
+            image.base(),
+            image.info().size_of_image as usize,
+        )?;
     }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -302,7 +307,10 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     #[cfg(feature = "diagnostics")]
-    victory_loader::init_gate::on_title_exit();
+    {
+        victory_loader::init_gate::on_title_exit();
+        victory_loader::verify_trace::on_title_exit();
+    }
     println!("title exited with {code}");
     Ok(code)
 }
