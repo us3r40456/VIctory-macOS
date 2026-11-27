@@ -1859,19 +1859,77 @@ fn ram_over() -> u64 {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return 0;
     }
-    ram_excess(m.ullAvailPhys, m.ullTotalPhys)
+    ram_excess(m.ullAvailPhys, m.ullTotalPhys, ram_marks())
 }
 
 /// With `available` of `total` bytes free: what to give up so that
-/// [`RAM_FREE`] is, once less than [`RAM_LOW`] is.
+/// `marks.free` of the memory is, once less than `marks.low` is.
 #[cfg(windows)]
-fn ram_excess(available: u64, total: u64) -> u64 {
+fn ram_excess(available: u64, total: u64, marks: RamMarks) -> u64 {
     let total = total as f64;
-    if (available as f64) < RAM_LOW * total {
-        (RAM_FREE * total) as u64 - available
+    if (available as f64) < marks.low * total {
+        ((marks.free * total) as u64).saturating_sub(available)
     } else {
         0
     }
+}
+
+/// The shares of the computer's memory that [`ram_excess`] works to:
+/// below `low` free it gives up, until `free` would be.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RamMarks {
+    low: f64,
+    free: f64,
+}
+
+/// The largest share `VICTORY_RAM_LOW` or `VICTORY_RAM_FREE` may name:
+/// above it there would be no room for the title itself.
+#[cfg(windows)]
+const RAM_MARK_MOST: f64 = 0.5;
+
+/// [`RAM_LOW`] and [`RAM_FREE`], or what `VICTORY_RAM_LOW` and
+/// `VICTORY_RAM_FREE` put in their place, read once and logged when they
+/// differ. A tenth is late on a Mac whose memory the title fills: with
+/// 24 GB, macOS was compressing and decompressing about 800 MB a second
+/// in the world while 14 % still counted as free, so nothing was given up
+/// (#454).
+#[cfg(windows)]
+fn ram_marks() -> RamMarks {
+    static MARKS: std::sync::OnceLock<RamMarks> = std::sync::OnceLock::new();
+    *MARKS.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        let marks = ram_marks_from(
+            var("VICTORY_RAM_LOW").as_deref(),
+            var("VICTORY_RAM_FREE").as_deref(),
+        );
+        if marks != ram_marks_from(None, None) {
+            tracing::info!(
+                low = marks.low,
+                free = marks.free,
+                "host textures are given up below `low` of the computer's memory free, until `free` is"
+            );
+        }
+        marks
+    })
+}
+
+/// The marks for the values of `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE`,
+/// each a share of the computer's memory from 0 to [`RAM_MARK_MOST`]. A
+/// value that is not one is left out. `free` without a value of its own
+/// keeps its default distance above `low`, and is never under `low`.
+#[cfg(windows)]
+fn ram_marks_from(low: Option<&str>, free: Option<&str>) -> RamMarks {
+    let share = |value: Option<&str>| {
+        value
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| (0.0..=RAM_MARK_MOST).contains(v))
+    };
+    let low = share(low).unwrap_or(RAM_LOW);
+    let free = share(free)
+        .unwrap_or((low + (RAM_FREE - RAM_LOW)).min(RAM_MARK_MOST))
+        .max(low);
+    RamMarks { low, free }
 }
 
 /// Whether the host card's memory is the computer's own, logged once: its
@@ -2869,17 +2927,91 @@ mod tests {
     #[test]
     fn free_memory_below_its_share_gives_up_up_to_the_higher_share() {
         let gb = 1u64 << 30;
-        assert_eq!(ram_excess(4 * gb, 16 * gb), 0);
+        let marks = ram_marks_from(None, None);
+        assert_eq!(ram_excess(4 * gb, 16 * gb, marks), 0);
         assert_eq!(
-            ram_excess(16 * gb / 10 + 1, 16 * gb),
+            ram_excess(16 * gb / 10 + 1, 16 * gb, marks),
             0,
             "just above the line"
         );
         assert_eq!(
-            ram_excess(gb, 16 * gb),
+            ram_excess(gb, 16 * gb, marks),
             (0.15 * (16 * gb) as f64) as u64 - gb
         );
-        assert_eq!(ram_excess(0, 8 * gb), (0.15 * (8 * gb) as f64) as u64);
+        assert_eq!(
+            ram_excess(0, 8 * gb, marks),
+            (0.15 * (8 * gb) as f64) as u64
+        );
+    }
+
+    /// `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE` move the two shares, and
+    /// with them where giving up starts and how far it goes.
+    #[cfg(windows)]
+    #[test]
+    fn the_memory_marks_can_be_set() {
+        let gb = 1u64 << 30;
+        let marks = ram_marks_from(Some("0.20"), Some("0.26"));
+        assert_eq!(
+            marks,
+            RamMarks {
+                low: 0.20,
+                free: 0.26
+            }
+        );
+        assert_eq!(
+            ram_excess(5 * gb, 24 * gb, marks),
+            0,
+            "above a fifth of 24 GB"
+        );
+        assert_eq!(
+            ram_excess(4 * gb, 24 * gb, marks),
+            (0.26 * (24 * gb) as f64) as u64 - 4 * gb
+        );
+        assert_eq!(
+            ram_excess(4 * gb, 24 * gb, ram_marks_from(None, None)),
+            0,
+            "the default marks give nothing up there"
+        );
+    }
+
+    /// Unset, the marks are the constants. `free` follows a `low` set
+    /// alone and is never under it, and a value that is no share of the
+    /// memory changes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_memory_marks_keep_their_order_and_ignore_bad_values() {
+        let default = RamMarks {
+            low: RAM_LOW,
+            free: RAM_FREE,
+        };
+        assert_eq!(ram_marks_from(None, None), default);
+        let alone = ram_marks_from(Some(" 0.2 "), None);
+        assert_eq!(alone.low, 0.2);
+        assert!((alone.free - 0.25).abs() < 1e-9, "{alone:?}");
+        assert_eq!(
+            ram_marks_from(Some("0.3"), Some("0.2")),
+            RamMarks {
+                low: 0.3,
+                free: 0.3
+            },
+            "free is never under low"
+        );
+        assert_eq!(
+            ram_marks_from(Some("0.5"), None),
+            RamMarks {
+                low: 0.5,
+                free: 0.5
+            },
+            "free stays within the largest share"
+        );
+        for bad in ["", "20", "-0.1", "0.51", "nan", "inf", "a fifth"] {
+            assert_eq!(ram_marks_from(Some(bad), Some(bad)), default, "{bad:?}");
+        }
+        assert_eq!(
+            ram_excess(0, 16 * (1u64 << 30), ram_marks_from(Some("0"), Some("0"))),
+            0,
+            "zero turns giving up for free memory off"
+        );
     }
 
     /// Textures idle for the idle time and frames are given up; past the
