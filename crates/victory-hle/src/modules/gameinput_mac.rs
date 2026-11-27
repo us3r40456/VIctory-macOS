@@ -33,6 +33,25 @@
 
 use super::{FALLBACK, PADS, PadState};
 
+/// Whether the process is running under Wine (checked once via `ntdll!wine_get_version`).
+fn under_wine() -> bool {
+    #[cfg(windows)]
+    {
+        static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *WINE.get_or_init(|| {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            // SAFETY: NUL-terminated ASCII module/export names.
+            unsafe {
+                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+                !ntdll.is_null()
+                    && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// Devices with a latch: the host pads and the keyboard's stand-in pad.
 const LATCHED: usize = FALLBACK + 1;
 const _: () = assert!(FALLBACK == PADS);
@@ -41,7 +60,8 @@ const _: () = assert!(FALLBACK == PADS);
 const LATCH_HOLD: u64 = 15_000;
 /// With no reading handed out for this long (µs) the latch lets go, so that a
 /// title that stops asking for a pad never finds a button stuck down.
-const LATCH_MAX: u64 = 2_000_000;
+/// Five seconds covers heavy pipeline-compile stalls without dropping presses.
+const LATCH_MAX: u64 = 5_000_000;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Latch {
@@ -127,8 +147,10 @@ impl Refocus {
     /// `focused`, none without it) the keys held across a focus change.
     pub(super) fn filter(&mut self, focused: bool, held: &mut Vec<u8>) {
         let on = *self.on.get_or_insert_with(|| {
-            let on = std::env::var("VICTORY_INPUT_REFOCUS")
-                .is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off"));
+            let on = match std::env::var("VICTORY_INPUT_REFOCUS") {
+                Ok(v) => !matches!(v.trim(), "" | "0" | "off"),
+                Err(_) => under_wine(),
+            };
             if on {
                 tracing::info!(
                     "input refocus: keys down when the focus comes back wait for their release (VICTORY_INPUT_REFOCUS)"
@@ -290,11 +312,15 @@ fn dead_zone(x: f32, y: f32, zone: f32) -> (f32, f32) {
 
 impl Mac {
     /// The switches from the environment, one log line for each one on.
+    /// Under Wine/macOS, `VICTORY_INPUT_LATCH` defaults to on (set `=0` to
+    /// disable) so taps between slow frames or compile stalls are never dropped.
     pub(super) fn from_env() -> Mac {
-        let on =
-            |name: &str| std::env::var(name).is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off"));
+        let latch_on = match std::env::var("VICTORY_INPUT_LATCH") {
+            Ok(v) => !matches!(v.trim(), "" | "0" | "off"),
+            Err(_) => under_wine(),
+        };
         let mut mac = Mac::default();
-        if on("VICTORY_INPUT_LATCH") {
+        if latch_on {
             tracing::info!(
                 hold_ms = LATCH_HOLD / 1000,
                 "input latch: presses and releases between two readings show in the next (VICTORY_INPUT_LATCH)"

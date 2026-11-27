@@ -115,10 +115,13 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
-    #[cfg(any(test, feature = "diagnostics"))]
+    /// Scripted keys (`VICTORY_KEYS`), independent of focus.
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
+    }
+    /// Scheduled gamepad state (`VICTORY_INPUT_SCHEDULE`), independent of focus.
+    fn scheduled_pad(&mut self) -> Option<PadState> {
+        None
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
@@ -146,8 +149,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
+/// Combines `extra` (from `VICTORY_KEYS` / `VICTORY_INPUT_SCHEDULE`) onto `base`.
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -160,17 +162,108 @@ fn merge_pad(base: PadState, extra: PadState) -> PadState {
     }
 }
 
-/// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
-/// works even when an XInput or virtual controller disables `FALLBACK`.
-#[cfg(any(test, feature = "diagnostics"))]
-fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
-    if scripted.is_empty() {
+/// Applies `scripted` keys and `scheduled` pad buttons to the first connected
+/// host pad, so unattended schedules work even with a physical controller attached.
+fn merge_scripted(
+    pads: &mut [Option<PadState>; PADS],
+    scripted: &[KeyState],
+    scheduled: Option<PadState>,
+) {
+    let mut extra = if scripted.is_empty() {
+        PadState::default()
+    } else {
+        fallback(scripted)
+    };
+    if let Some(sched) = scheduled {
+        extra = merge_pad(extra, sched);
+    }
+    if extra == PadState::default() {
         return;
     }
-    let extra = fallback(scripted);
     if let Some(pad) = pads.iter_mut().flatten().next() {
         *pad = merge_pad(*pad, extra);
     }
+}
+
+/// One parsed entry of `VICTORY_INPUT_SCHEDULE="<sec>:<input>[:<hold_s>],..."`.
+#[derive(Clone, Debug, PartialEq)]
+struct ScheduledInput {
+    at: Duration,
+    held: Duration,
+    pad: PadState,
+    label: String,
+}
+
+/// Parses `VICTORY_INPUT_SCHEDULE` entries accepting Xbox gamepad button names
+/// (`A`, `B`, `X`, `Y`, `Start`/`Menu`, `View`/`Select`, `Up`/`Down`/`Left`/`Right`,
+/// `LB`/`L1`, `RB`/`R1`, `LS`/`L3`, `RS`/`R3`, `LT`/`L2`, `RT`/`R2`,
+/// `LUp`/`LDown`/`LLeft`/`LRight`, `RUp`/`RDown`/`RLeft`/`RRight`) as well as
+/// `Enter`, `Esc`, `Tab`, `Back`. Default hold is 0.5 s so slow frames never miss it.
+fn parse_schedule(spec: &str) -> Vec<ScheduledInput> {
+    spec.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (at, rest) = entry.split_once(':')?;
+            let (token, held) = match rest.split_once(':') {
+                Some((t, h)) => (
+                    t.trim(),
+                    Duration::try_from_secs_f64(h.trim().parse().ok()?).ok()?,
+                ),
+                None => (rest.trim(), Duration::from_millis(500)),
+            };
+            let at = Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?;
+            let mut pad = PadState::default();
+            match token.to_ascii_lowercase().as_str() {
+                "a" | "enter" => pad.buttons = A,
+                "b" | "back" => pad.buttons = B,
+                "x" => pad.buttons = X,
+                "y" => pad.buttons = Y,
+                "menu" | "start" | "esc" => pad.buttons = MENU,
+                "view" | "select" | "tab" => pad.buttons = VIEW,
+                "up" => pad.buttons = UP,
+                "down" => pad.buttons = DOWN,
+                "left" => pad.buttons = LEFT,
+                "right" => pad.buttons = RIGHT,
+                "lb" | "l1" => pad.buttons = LEFT_SHOULDER,
+                "rb" | "r1" => pad.buttons = RIGHT_SHOULDER,
+                "ls" | "l3" => pad.buttons = LEFT_STICK,
+                "rs" | "r3" => pad.buttons = RIGHT_STICK,
+                "lt" | "l2" => pad.left_trigger = 1.0,
+                "rt" | "r2" => pad.right_trigger = 1.0,
+                "lup" => pad.left_y = 1.0,
+                "ldown" => pad.left_y = -1.0,
+                "lleft" => pad.left_x = -1.0,
+                "lright" => pad.left_x = 1.0,
+                "rup" => pad.right_y = 1.0,
+                "rdown" => pad.right_y = -1.0,
+                "rleft" => pad.right_x = -1.0,
+                "rright" => pad.right_x = 1.0,
+                _ => return None,
+            }
+            Some(ScheduledInput {
+                at,
+                held,
+                pad,
+                label: format!("{:.1}s:{token}", at.as_secs_f64()),
+            })
+        })
+        .collect()
+}
+
+/// Evaluates active scheduled inputs at elapsed time `elapsed`.
+fn eval_schedule(items: &[ScheduledInput], elapsed: Duration) -> Option<PadState> {
+    let mut combined = PadState::default();
+    let mut any = false;
+    for item in items {
+        if elapsed >= item.at && elapsed < item.at + item.held {
+            combined = merge_pad(combined, item.pad);
+            any = true;
+        }
+    }
+    any.then_some(combined)
 }
 
 #[repr(C)]
@@ -440,16 +533,16 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, scripted) = {
+        let (pads, keys, scripted, scheduled) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            #[cfg(any(test, feature = "diagnostics"))]
             let scripted = source.scripted_keys();
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let scripted: [KeyState; 0] = [];
-            (pads, source.keys(), scripted)
+            let scheduled = source.scheduled_pad();
+            (pads, source.keys(), scripted, scheduled)
         };
-        let events = self.state().poll(&self.devices, pads, keys, &scripted);
+        let events = self
+            .state()
+            .poll(&self.devices, pads, keys, &scripted, scheduled);
         self.deliver(events);
     }
 
@@ -495,6 +588,7 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: &[KeyState],
+        scheduled: Option<PadState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -511,20 +605,19 @@ impl State {
             self.seen_input[slot].then_some(pad)
         });
         self.mac.dead_zones(&mut pads);
-        #[cfg(any(test, feature = "diagnostics"))]
-        merge_scripted(&mut pads, scripted);
-        #[cfg(not(any(test, feature = "diagnostics")))]
-        let _ = (&mut pads, scripted);
+        merge_scripted(&mut pads, scripted, scheduled);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             let pad = self.mac.latch(slot, pad, now);
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
-            let base = fallback(&keys);
-            #[cfg(any(test, feature = "diagnostics"))]
+            let mut base = fallback(&keys);
             if !scripted.is_empty() {
-                return merge_pad(base, fallback(scripted));
+                base = merge_pad(base, fallback(scripted));
+            }
+            if let Some(sched) = scheduled {
+                base = merge_pad(base, sched);
             }
             base
         });
@@ -1246,6 +1339,22 @@ mod host {
         }
     }
 
+    /// Active keyboard virtual-key codes polled by the input thread (66 real
+    /// keys instead of scanning all 244 VKs 0x08..=0xFE, cutting Wine RPC
+    /// overhead by ~3.7x while preserving every game/navigation/modifier key).
+    const POLLED_VKS: &[u8] = &[
+        0x08, 0x09, 0x0D, 0x1B, 0x20, // Back, Tab, Enter, Esc, Space
+        0x21, 0x22, 0x23, 0x24, // PgUp, PgDn, End, Home
+        0x25, 0x26, 0x27, 0x28, // Left, Up, Right, Down
+        0x2D, 0x2E, // Insert, Delete
+        b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9',
+        b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H', b'I', b'J', b'K', b'L', b'M',
+        b'N', b'O', b'P', b'Q', b'R', b'S', b'T', b'U', b'V', b'W', b'X', b'Y', b'Z',
+        0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, // F1-F12
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, // L/R Shift, Ctrl, Alt
+        0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE, // OEM punctuation
+    ];
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
@@ -1267,16 +1376,14 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            // macOS port: scripted keys also in the normal build, so a test
-            // run needs nobody at the keyboard (empty unless VICTORY_KEYS is set).
             let mut down = scripted();
             let focused = focused();
             let mut held = Vec::new();
             if focused {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                held = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                held = POLLED_VKS
+                    .iter()
+                    .copied()
+                    .filter(|vk| !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
@@ -1287,16 +1394,12 @@ mod host {
             down.into_iter().map(key_state).collect()
         }
 
-        #[cfg(any(test, feature = "diagnostics"))]
         fn scripted_keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
+            scripted().into_iter().map(key_state).collect()
+        }
+
+        fn scheduled_pad(&mut self) -> Option<PadState> {
+            scheduled()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1307,6 +1410,41 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// Evaluates `VICTORY_INPUT_SCHEDULE="<sec>:<button>[:<hold_s>],..."`
+    /// independent of window focus and across all build profiles.
+    fn scheduled() -> Option<PadState> {
+        static SCHEDULE: LazyLock<(Instant, Vec<ScheduledInput>, Mutex<Vec<bool>>)> =
+            LazyLock::new(|| {
+                let raw = std::env::var("VICTORY_INPUT_SCHEDULE").unwrap_or_default();
+                let items = parse_schedule(&raw);
+                if !items.is_empty() {
+                    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+                    tracing::info!(
+                        entries = ?labels,
+                        "input schedule active (VICTORY_INPUT_SCHEDULE)"
+                    );
+                }
+                let fired = vec![false; items.len()];
+                (Instant::now(), items, Mutex::new(fired))
+            });
+        let (start, items, fired) = &*SCHEDULE;
+        if items.is_empty() {
+            return None;
+        }
+        let elapsed = start.elapsed();
+        let active = eval_schedule(items, elapsed);
+        if active.is_some() {
+            let mut seen = lock(fired);
+            for (idx, item) in items.iter().enumerate() {
+                if !seen[idx] && elapsed >= item.at && elapsed < item.at + item.held {
+                    seen[idx] = true;
+                    tracing::info!(event = %item.label, "input schedule firing");
+                }
+            }
+        }
+        active
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
@@ -1405,6 +1543,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
+        scheduled: Option<PadState>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1419,6 +1558,9 @@ mod tests {
         }
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
+        }
+        fn scheduled_pad(&mut self) -> Option<PadState> {
+            self.0.lock().unwrap().scheduled
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1993,5 +2135,65 @@ mod tests {
         let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(back).buttons, A);
         release(back);
+    }
+
+    #[test]
+    fn input_schedule_parses_gamepad_buttons_and_latches_for_slow_frames() {
+        let items = parse_schedule("10:A, 15:Y:1.2, 20:Start, 25:RT, 30:LUp");
+        assert_eq!(items.len(), 5);
+        assert_eq!(eval_schedule(&items, Duration::from_secs(9)), None);
+        assert_eq!(
+            eval_schedule(&items, Duration::from_millis(10_200))
+                .unwrap()
+                .buttons,
+            A
+        );
+        assert_eq!(
+            eval_schedule(&items, Duration::from_millis(16_000))
+                .unwrap()
+                .buttons,
+            Y
+        );
+        assert_eq!(
+            eval_schedule(&items, Duration::from_millis(20_100))
+                .unwrap()
+                .buttons,
+            MENU
+        );
+        assert_eq!(
+            eval_schedule(&items, Duration::from_millis(25_100))
+                .unwrap()
+                .right_trigger,
+            1.0
+        );
+        assert_eq!(
+            eval_schedule(&items, Duration::from_millis(30_100))
+                .unwrap()
+                .left_y,
+            1.0
+        );
+
+        let (hub, host) = fake();
+        hub.state().mac = mac::latch_for_tests(0);
+        hub.poll();
+        let initial = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(initial).buttons, 0);
+        release(initial);
+
+        host.lock().unwrap().scheduled = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        host.lock().unwrap().scheduled = None;
+        hub.poll();
+
+        let next = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(next).buttons,
+            A,
+            "latched scheduled button must reach slow frame"
+        );
+        release(next);
     }
 }
