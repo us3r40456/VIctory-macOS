@@ -35,8 +35,8 @@ use crate::crash::locate;
 const TITLE_HASH: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
 const ASSERT_RVA: usize = 0x1dac734;
 const SINGLETON_RVA: usize = 0x7f00510;
-const POOL_SIZE: usize = 0x1000;
-const TRAMP_STRIDE: usize = 256;
+const POOL_SIZE: usize = 0x2000;
+const TRAMP_STRIDE: usize = 384;
 const MAX_SUB_ITEMS: usize = 64;
 const MAX_TABLE_GROUPS: usize = 4096;
 
@@ -1067,6 +1067,12 @@ mod tests {
                 capture as *const () as usize,
             )
             .unwrap();
+            assert!(
+                tramp.len() <= TRAMP_STRIDE && SITES.len() * TRAMP_STRIDE <= POOL_SIZE,
+                "tramp len {} > stride {}",
+                tramp.len(),
+                TRAMP_STRIDE
+            );
             std::ptr::copy_nonoverlapping(tramp.as_ptr(), tramp_addr as *mut u8, tramp.len());
             let jmp = emit_jump(site_addr, SITES[ITEM_FOUND].original.len(), tramp_addr).unwrap();
             std::ptr::copy_nonoverlapping(jmp.as_ptr(), site_addr as *mut u8, jmp.len());
