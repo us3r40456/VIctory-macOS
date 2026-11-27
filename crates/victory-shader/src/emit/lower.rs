@@ -445,6 +445,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The program tests rays against tree nodes (`image_bvh*`): its loops
+    /// are cut at [`super::trace_loop_limit`] when that is set.
+    traces: bool,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -990,6 +993,11 @@ impl<'a> Lower<'a> {
             memory_null: None,
             counters: HashMap::new(),
             abort: None,
+            traces: p.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| i.name().starts_with("image_bvh"))
+            }),
             round16: round16(p),
             mode16: Some(0),
         }
@@ -1123,6 +1131,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.wide_raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -4650,6 +4664,74 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether multi-dword console buffer/scalar loads are lowered as one
+    /// 4-dword `rawBufferLoad` call per group (`VICTORY_SHADER_OPT` bit 64).
+    fn wide_loads() -> bool {
+        super::shader_opt() & super::bitcode::opt::WIDE != 0
+    }
+
+    /// Reads `count` dwords starting at byte `addr` from raw view `h` in
+    /// groups of up to four dwords per call (falling back to 1-dword calls on
+    /// straddling tails when `bitcode::opt::CHECKED` is set).
+    fn wide_raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let wide = self.raw_calls(h, addr, count, 4);
+        if super::shader_opt() & super::bitcode::opt::CHECKED == 0 {
+            return wide;
+        }
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let u = self.s.m.undef(i32t);
+        let c = self.cur;
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, u]);
+        let size = self.s.m.extract(c, d, 0);
+        let mut out = Vec::with_capacity(wide.len());
+        for (g, group) in wide.chunks(4).enumerate() {
+            let c = self.cur;
+            let first = 4 * g as u32;
+            let n = group.len() as u32;
+            let start = match first {
+                0 => addr,
+                _ => {
+                    let off = self.s.m.i32(4 * first);
+                    self.s.m.bin(c, Bin::Add, addr, off)
+                }
+            };
+            let bytes = self.s.m.i32(4 * n);
+            let end = self.s.m.bin(c, Bin::Add, start, bytes);
+            let starts_in = self.s.m.cmp(c, pred::IULT, start, size);
+            let ends_out = self.s.m.cmp(c, pred::IUGT, end, size);
+            let straddles = self.s.m.bin(c, Bin::And, starts_in, ends_out);
+            let at = self.begin_guarded(Some(straddles));
+            let one_by_one = self.raw_calls(h, start, n, 1);
+            let pairs: Vec<(V, V)> = one_by_one.into_iter().zip(group.iter().copied()).collect();
+            out.extend(self.end_guarded(at, &pairs));
+        }
+        out
+    }
+
+    fn raw_calls(&mut self, h: V, addr: V, count: u32, per: u32) -> Vec<V> {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut out = Vec::with_capacity(count as usize);
+        for first in (0..count).step_by(per as usize) {
+            let n = (count - first).min(per);
+            let a = match first {
+                0 => addr,
+                _ => {
+                    let off = self.s.m.i32(4 * first);
+                    self.s.m.bin(c, Bin::Add, addr, off)
+                }
+            };
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.raw_buffer_load(c, &[h, a, u, mask, al]);
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, k);
+                out.push(self.as_int(x));
+            }
+        }
+        out
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -4729,6 +4811,12 @@ impl<'a> Lower<'a> {
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            if count > 1 && Self::wide_loads() {
+                for (k, x) in self.wide_raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -11385,7 +11473,11 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = match super::trace_loop_limit() {
+            n if n > 0 && self.traces => n.min(super::loop_limit()),
+            _ => super::loop_limit(),
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")

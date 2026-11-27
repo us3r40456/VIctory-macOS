@@ -355,6 +355,53 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Optional lower loop limit for BVH ray-trace shaders (`image_bvh*`):
+/// `VICTORY_SHADER_TRACE_LIMIT` (decimal or `0x` hex); unset or 0 disables.
+pub fn trace_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_trace_limit(std::env::var("VICTORY_SHADER_TRACE_LIMIT").ok().as_deref())
+    })
+}
+
+fn parse_trace_limit(value: Option<&str>) -> u32 {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .unwrap_or(0)
+}
+
+/// Bitmask of shader clean-up passes and lowering optimizations (`VICTORY_SHADER_OPT`):
+/// unset defaults to `bitcode::opt::DEFAULT` (64 = four-dword scalar/buffer loads);
+/// 1=DEAD, 2=FOLD, 4=REUSE, 8=FACTS, 16=LOADS, 64=WIDE, 128=CHECKED.
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+}
+
+/// Translation settings baked into the shader cache key: `loop_limit`,
+/// `shader_opt`, and `trace_loop_limit`.
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.extend_from_slice(&trace_loop_limit().to_le_bytes());
+    out
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
