@@ -4942,6 +4942,8 @@ struct Presenter {
     compositor: Option<std::result::Result<crate::composite::Compositor, ()>>,
     /// The texture the blend pass writes.
     blended: Option<ID3D12Resource>,
+    /// Native Apple MetalFX Frame Interpolator + optional CAMetalLayer presenter.
+    metal: Option<crate::metal::present::MetalPresenter>,
 }
 
 #[derive(Clone, Copy)]
@@ -5003,11 +5005,11 @@ impl Meter {
         }
     }
 
-    /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    /// Counts a presented frame (plus any extra MetalFX interpolated frames).
+    fn frame(&mut self, hwnd: HWND, extra_frames: u64) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
-        self.frames += 1;
+        self.frames += 1 + extra_frames;
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
@@ -5034,6 +5036,7 @@ impl Meter {
             // With `VICTORY_ALIAS_BUFFERS` only (else empty): the same frames'
             // zero-copy and copy paths.
             let zero_copy = crate::alias::frame_line(report_frames);
+            let metal_fg = crate::metal::present::frame_line(report_frames);
             // mac: the guard lock's waits and the protection calls, always.
             let guards = crate::watch::frame_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
@@ -5060,7 +5063,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}",
+                 batched){zero_copy}{metal_fg}{guards}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);
@@ -5331,6 +5334,25 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        let mut extra_frames = 0u64;
+        if let Some(metal) = p.metal.as_mut() {
+            let ui_arg = overlay.map(|(o, s, f)| (o, D3D12_RESOURCE_STATES(s as i32), f));
+            let outcome = metal.run(
+                self,
+                &p.copy,
+                &p.swap_chain,
+                (texture, state, picture_format),
+                ui_arg,
+                width,
+                height,
+                format,
+            );
+            extra_frames = outcome.extra_frames;
+            if outcome.handled_present {
+                p.meter.frame(p.hwnd, extra_frames);
+                return Some(false);
+            }
+        }
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -5394,7 +5416,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, extra_frames);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -5471,6 +5493,7 @@ impl Host {
                 meter: Meter::new(),
                 compositor: None,
                 blended: None,
+                metal: crate::metal::present::MetalPresenter::from_env(),
             })
         }
     }

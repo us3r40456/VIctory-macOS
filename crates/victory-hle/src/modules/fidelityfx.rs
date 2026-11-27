@@ -41,11 +41,18 @@ const PARAMETER: u32 = 6;
 // Description types.
 const CREATE_UPSCALE: u64 = 0x1_0000;
 const DISPATCH_UPSCALE: u64 = 0x1_0001;
+const QUERY_PHASE_COUNT: u64 = 0x1_0004;
+const QUERY_JITTER_OFFSET: u64 = 0x1_0005;
+const QUERY_MEMORY_USAGE: u64 = 0x1_0008;
 const CONSOLE_BACKEND: u64 = 0x100_0002;
 const HOST_BACKEND: u64 = 2;
 const GET_VERSIONS: u64 = 4;
 const GET_PROVIDER_VERSION: u64 = 6;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
+
+// CreateUpscale flags (FidelityFX SDK).
+const FLAG_DEPTH_INVERTED: u32 = 1 << 3;
+const FLAG_AUTO_EXPOSURE: u32 = 1 << 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -118,6 +125,29 @@ struct ProviderVersion {
     name: *const c_char,
 }
 
+#[repr(C)]
+struct PhaseCount {
+    header: Header,
+    render_width: u32,
+    output_width: u32,
+    count: *mut i32,
+}
+
+#[repr(C)]
+struct JitterOffset {
+    header: Header,
+    index: i32,
+    phases: i32,
+    x: *mut f32,
+    y: *mut f32,
+}
+
+#[repr(C)]
+struct MemoryUsage {
+    header: Header,
+    usage: *mut [u64; 2],
+}
+
 type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
 type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 /// Configure, query and dispatch.
@@ -152,9 +182,15 @@ macro_rules! once {
 /// used: it holds this module only when serving.
 pub fn use_host_dir(dir: Option<&Path>) {
     let Some(dir) = dir else {
-        tracing::info!(
-            "no FidelityFX folder (VICTORY_FIDELITYFX_DIR): a title's own FidelityFX DLLs run"
-        );
+        if metalfx_active() {
+            tracing::info!(
+                "FidelityFX: Apple MetalFX Temporal Scaler serves the title's upscaler (VICTORY_UPSCALER=metalfx)"
+            );
+        } else {
+            tracing::info!(
+                "no FidelityFX folder (VICTORY_FIDELITYFX_DIR): a title's own FidelityFX DLLs run"
+            );
+        }
         return;
     };
     match load(dir) {
@@ -169,9 +205,17 @@ pub fn use_host_dir(dir: Option<&Path>) {
     }
 }
 
-/// Whether the host's FidelityFX serves the title's.
+/// Whether native Apple `MTLFXTemporalScaler` serves the title's FidelityFX
+/// upscaler (`VICTORY_UPSCALER=metalfx` or `VICTORY_METAL_FX=1`).
+fn metalfx_active() -> bool {
+    HOST.get().is_none()
+        && victory_gpu::metal::metalfx_upscaler_enabled()
+        && victory_gpu::metal::bridge::global().is_some_and(|b| b.info().metalfx)
+}
+
+/// Whether the host's FidelityFX (or native Apple MetalFX) serves the title's.
 pub(crate) fn serving() -> bool {
-    HOST.get().is_some()
+    HOST.get().is_some() || metalfx_active()
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
@@ -291,9 +335,6 @@ extern "C" fn ffxCreateContext(
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if context.is_null() || desc.is_null() {
         return PARAMETER;
     }
@@ -309,6 +350,31 @@ extern "C" fn ffxCreateContext(
     }
     // SAFETY: an upscaler description, by its type.
     let mut upscale = unsafe { desc.cast::<CreateUpscale>().read() };
+    if metalfx_active() {
+        let auto_exposure = upscale.flags & FLAG_AUTO_EXPOSURE != 0;
+        let depth_reversed = upscale.flags & FLAG_DEPTH_INVERTED != 0;
+        let Some(fx) = victory_gpu::metal::fx::MetalFxUpscaler::new(
+            upscale.max_render,
+            upscale.max_output,
+            auto_exposure,
+            depth_reversed,
+        ) else {
+            return NO_PROVIDER;
+        };
+        tracing::info!(
+            provider = "MetalFX Temporal Scaler",
+            render = ?upscale.max_render,
+            output = ?upscale.max_output,
+            flags = format_args!("{:#x}", upscale.flags),
+            "FidelityFX: upscaler context on Apple MetalFX (VICTORY_UPSCALER=metalfx)"
+        );
+        // SAFETY: title provided writable `context` pointer; released in `ffxDestroyContext`.
+        unsafe { context.write(Box::into_raw(Box::new(fx)).cast()) };
+        return OK;
+    }
+    let Some(host) = HOST.get() else {
+        return NO_PROVIDER;
+    };
     let mut backend = Backend {
         header: Header {
             kind: HOST_BACKEND,
@@ -348,6 +414,21 @@ extern "C" fn ffxCreateContext(
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if metalfx_active() {
+        if context.is_null() {
+            return PARAMETER;
+        }
+        // SAFETY: context was created by `ffxCreateContext` with `Box::into_raw`.
+        let ptr = unsafe { *context };
+        if !ptr.is_null() {
+            // SAFETY: reclaiming the boxed `MetalFxUpscaler`.
+            unsafe {
+                drop(Box::from_raw(ptr.cast::<victory_gpu::metal::fx::MetalFxUpscaler>()));
+                *context = null_mut();
+            }
+        }
+        return OK;
+    }
     // SAFETY: the title passes its context.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
@@ -355,20 +436,88 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if metalfx_active() {
+        return OK;
+    }
     // SAFETY: the title passes its context and descriptions.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if desc.is_null() {
         return PARAMETER;
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
+    if metalfx_active() {
+        return match kind {
+            GET_PROVIDER_VERSION => {
+                // SAFETY: caller supplied a `ProviderVersion` struct.
+                let out = unsafe { &mut *desc.cast::<ProviderVersion>() };
+                out.id = 0x4D46_5831; // "MFX1"
+                out.name = c"MetalFX Temporal Scaler".as_ptr();
+                OK
+            }
+            QUERY_PHASE_COUNT => {
+                // SAFETY: caller supplied a `PhaseCount` struct.
+                let q = unsafe { &*desc.cast::<PhaseCount>() };
+                if q.count.is_null() {
+                    return PARAMETER;
+                }
+                // SAFETY: valid writable count pointer.
+                unsafe {
+                    q.count.write(victory_gpu::metal::fx::jitter_phase_count(
+                        q.render_width,
+                        q.output_width,
+                    ));
+                }
+                OK
+            }
+            QUERY_JITTER_OFFSET => {
+                // SAFETY: caller supplied a `JitterOffset` struct.
+                let q = unsafe { &*desc.cast::<JitterOffset>() };
+                if q.x.is_null() || q.y.is_null() {
+                    return PARAMETER;
+                }
+                let (jx, jy) = victory_gpu::metal::fx::jitter_offset(q.index, q.phases);
+                // SAFETY: valid writable float pointers.
+                unsafe {
+                    q.x.write(jx);
+                    q.y.write(jy);
+                }
+                OK
+            }
+            QUERY_MEMORY_USAGE => {
+                // SAFETY: caller supplied a `MemoryUsage` struct.
+                let q = unsafe { &*desc.cast::<MemoryUsage>() };
+                if q.usage.is_null() {
+                    return PARAMETER;
+                }
+                let bytes = if !context.is_null() {
+                    // SAFETY: valid `MetalFxUpscaler` context pointer.
+                    let ptr = unsafe { *context };
+                    if !ptr.is_null() {
+                        // SAFETY: valid live `MetalFxUpscaler`.
+                        unsafe { &*ptr.cast::<victory_gpu::metal::fx::MetalFxUpscaler>() }
+                            .estimated_gpu_bytes()
+                    } else {
+                        [64 << 20, 32 << 20]
+                    }
+                } else {
+                    [64 << 20, 32 << 20]
+                };
+                // SAFETY: valid writable `[u64; 2]` pointer.
+                unsafe { q.usage.write(bytes) };
+                OK
+            }
+            GET_VERSIONS | MEMORY_USAGE_WITH_DEVICE => PARAMETER,
+            _ => UNKNOWN_TYPE,
+        };
+    }
+    let Some(host) = HOST.get() else {
+        return NO_PROVIDER;
+    };
     // These carry the console device.
     if kind == GET_VERSIONS || kind == MEMORY_USAGE_WITH_DEVICE {
         once!(
@@ -383,9 +532,6 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if desc.is_null() {
         return PARAMETER;
     }
@@ -402,6 +548,73 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
+    if metalfx_active() {
+        if context.is_null() {
+            return PARAMETER;
+        }
+        // SAFETY: `context` holds a `MetalFxUpscaler` created by `ffxCreateContext`.
+        let ptr = unsafe { *context };
+        if ptr.is_null() {
+            return PARAMETER;
+        }
+        // SAFETY: live `MetalFxUpscaler`.
+        let fx = unsafe { &*ptr.cast::<victory_gpu::metal::fx::MetalFxUpscaler>() };
+        // Execute prior commands recorded into `list` so MetalFX reads rendered color/depth/MV.
+        if !victory_gpu::external::flush_and_reopen(list) {
+            return PARAMETER;
+        }
+        let get = |idx: usize| -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+            let r = dispatch.resources[idx];
+            if r.resource.is_null() {
+                return None;
+            }
+            victory_gpu::external::current_texture(r.resource.cast::<Object>())
+        };
+        let (Some(color), Some(depth), Some(motion), Some(output)) = (get(0), get(1), get(2), get(6))
+        else {
+            return PARAMETER;
+        };
+        let reactive = get(4);
+        let rest = &dispatch.rest;
+        let inputs = victory_gpu::metal::fx::UpscaleInputs {
+            color: (&color.0, color.1),
+            depth: (&depth.0, depth.1),
+            motion: (&motion.0, motion.1),
+            reactive: reactive.as_ref().map(|(t, s)| (t, *s)),
+            output: (&output.0, output.1),
+            render_size: [rest[4], rest[5]],
+            output_size: [rest[6], rest[7]],
+            jitter: [f32::from_bits(rest[0]), f32::from_bits(rest[1])],
+            motion_scale: [f32::from_bits(rest[2]), f32::from_bits(rest[3])],
+            frame_ms: f32::from_bits(rest[10]),
+            pre_exposure: f32::from_bits(rest[11]),
+            reset: rest[12] != 0,
+            near_plane: f32::from_bits(rest[13]),
+            far_plane: f32::from_bits(rest[14]),
+            fov_radians: f32::from_bits(rest[15]),
+        };
+        let Some((gpu_ns, wall_ns)) = fx.dispatch(&inputs) else {
+            return PARAMETER;
+        };
+        once!(
+            info,
+            gpu_ms = gpu_ns as f64 / 1e6,
+            wall_ms = wall_ns as f64 / 1e6,
+            render = ?inputs.render_size,
+            output = ?inputs.output_size,
+            "FidelityFX: first MetalFX Temporal Scaler upscale completed"
+        );
+        // Leave all resources in the title's requested post-dispatch states on `list`.
+        for r in dispatch.resources.iter().filter(|r| !r.resource.is_null()) {
+            if let Some(w) = host_state(r.state) {
+                let _ = victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w);
+            }
+        }
+        return OK;
+    }
+    let Some(host) = HOST.get() else {
+        return NO_PROVIDER;
+    };
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     for r in dispatch

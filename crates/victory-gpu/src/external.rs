@@ -46,3 +46,35 @@ pub fn record<R>(
     });
     out
 }
+
+/// Executes all commands recorded so far in `list`'s current host segment and
+/// reopens it so an out-of-band MetalFX pass (`MTLFXTemporalScaler`) observes
+/// prior rendering and writes its upscaled output before subsequent commands.
+pub fn flush_and_reopen(list: *const Object) -> bool {
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let mut ran = false;
+    crate::list::with_state(list, |host_list, state| {
+        host_list.close();
+        host.execute(&[host_list]);
+        host_list.reset();
+        state.host_state_lost();
+        ran = true;
+    });
+    ran
+}
+
+/// Returns a title texture's host `ID3D12Resource` and its current global host
+/// resource state (after a segment flush).
+pub fn current_texture(resource: *const Object) -> Option<(ID3D12Resource, u32)> {
+    let texture = crate::resource::host_resource(resource)?.clone();
+    let state = crate::resource::host_transition(resource, 0)
+        .map(|(_, before)| {
+            crate::resource::host_transition(resource, before);
+            before
+        })
+        .unwrap_or(0);
+    let legal = crate::host::legal_state(&texture, state);
+    Some((texture, legal))
+}
