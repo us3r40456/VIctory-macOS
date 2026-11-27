@@ -111,6 +111,9 @@ pub(crate) struct Shadow {
     /// True when the title's virtual range `[start, start + len)` is
     /// `mach_vm_remap`-aliased onto `buffer`'s physical pages (zero-copy).
     aliased: bool,
+    /// The last presented frame a view or a list asked for it
+    /// ([`Shadow::touch`]), for [`release_idle`].
+    used: AtomicU64,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -485,8 +488,18 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.touch();
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// A view or a list asks for the copy in this frame. The refresh of
+    /// every copy a page table names does not count: it would keep them all.
+    fn touch(&self) {
+        let frame = crate::queue::presented();
+        if self.used.load(Ordering::Relaxed) != frame {
+            self.used.store(frame, Ordering::Relaxed);
+        }
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
@@ -514,6 +527,7 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
             aliased: false,
+            used: AtomicU64::new(crate::queue::presented()),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -547,6 +561,7 @@ impl Shadow {
             base: 0,
             slice: None,
             aliased: true,
+            used: AtomicU64::new(crate::queue::presented()),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -2116,7 +2131,9 @@ pub(crate) fn log_held() {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     if !lookup_cache_enabled() {
-        return find_uncached(address, end);
+        let shadow = find_uncached(address, end)?;
+        shadow.touch();
+        return Some(shadow);
     }
     let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
     let hit = LOOKUP_CACHE.with(|cell| {
@@ -2126,11 +2143,13 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = hit {
         #[cfg(feature = "diagnostics")]
         LOOKUP_STATS[0].fetch_add(1, Ordering::Relaxed);
+        shadow.touch();
         return Some(shadow);
     }
     #[cfg(feature = "diagnostics")]
     LOOKUP_STATS[1].fetch_add(1, Ordering::Relaxed);
     let shadow = find_uncached(address, end)?;
+    shadow.touch();
     LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
         let cache = guard.get_or_insert_with(|| LookupCache::new(epoch));
@@ -2182,6 +2201,7 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
             );
         }
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        released().remade(key.0);
         changed();
     }
     entry.shadow.clone()
@@ -2253,6 +2273,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    released().remade(start);
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
@@ -2441,6 +2462,121 @@ impl Arena {
 }
 
 /// Every host copy of title memory made so far (buffers, aliases, and windows).
+/// Presented frames a copy goes unasked for before [`release_idle`] may
+/// give it up.
+const IDLE_FRAMES: u64 = 60;
+
+/// Title addresses of copies [`release_idle`] gave up, to count those made
+/// again (bounded: cleared when it grows past [`Released::CAP`]).
+#[derive(Default)]
+struct Released {
+    starts: std::collections::HashSet<u64>,
+    remade: u64,
+}
+
+impl Released {
+    const CAP: usize = 1 << 16;
+
+    fn remade(&mut self, start: u64) {
+        if self.starts.remove(&start) {
+            self.remade += 1;
+        }
+    }
+}
+
+static RELEASED: std::sync::LazyLock<Mutex<Released>> = std::sync::LazyLock::new(Mutex::default);
+
+fn released() -> std::sync::MutexGuard<'static, Released> {
+    RELEASED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether [`release_idle`] runs: `VICTORY_RELEASE_COPIES=0` turns it off.
+fn release_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Whether `copy`, one of the copies of `[start, start + len)`, can go:
+/// nothing but the table that found it and the page tables' own layouts
+/// (`tables` of them) holds it, no submission's writes to it are still to
+/// go back, and no view or list asked for it in [`IDLE_FRAMES`] frames.
+/// A list that holds it, a heap slot made from it, a widened view of it or
+/// a list still reading an older layout all hold it too, so it stays.
+fn idle(copy: &Arc<Shadow>, tables: usize, frame: u64) -> bool {
+    !copy.aliased
+        && Arc::strong_count(copy) <= 1 + tables
+        && frame.saturating_sub(copy.used.load(Ordering::Relaxed)) >= IDLE_FRAMES
+        && copy.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// While the computer's memory runs low: gives up copies of title memory
+/// no view or list asked for lately, the longest unasked first, until about
+/// `want` bytes went (all such copies if fewer). A copy is made again, from
+/// title memory, the next time a view or a list asks for it; until then
+/// page tables stop naming it (the generation changes), and its memory goes
+/// once the last layout naming it is rewritten. Host copies of title memory
+/// grew to 7.6 GB in 20 minutes of the world on a 16 GB Mac, and none ever
+/// went while the title kept its buffers. Returns the copies and bytes.
+pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
+    if want == 0 || !release_enabled() {
+        return (0, 0);
+    }
+    let tables = crate::memory::tables();
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let mut map = buffers();
+        let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        /// Where a candidate is kept: a title buffer's entry or a loose window.
+        enum Held {
+            Buffer((u64, usize)),
+            Loose((u64, u64)),
+        }
+        let mut candidates: Vec<(u64, u64, Held)> = map
+            .iter()
+            .filter_map(|(&key, e)| e.shadow.as_ref().map(|c| (Held::Buffer(key), c)))
+            .chain(loose.iter().map(|(&key, c)| (Held::Loose(key), c)))
+            .filter(|(_, c)| idle(c, tables, frame))
+            .map(|(held, c)| (c.used.load(Ordering::Relaxed), c.len, held))
+            .collect();
+        candidates.sort_unstable_by_key(|&(used, ..)| used);
+        let mut taken = 0;
+        for (_, len, held) in candidates {
+            if taken >= want {
+                break;
+            }
+            let copy = match held {
+                Held::Loose(key) => loose.remove(&key),
+                Held::Buffer(key) => map.get_mut(&key).and_then(|e| e.shadow.take()),
+            };
+            if let Some(copy) = copy {
+                taken += len;
+                gone.push(copy);
+            }
+        }
+        if !gone.is_empty() {
+            changed();
+        }
+    }
+    let (count, bytes) = (gone.len(), gone.iter().map(|c| c.len).sum::<u64>());
+    if !gone.is_empty() {
+        let mut r = released();
+        if r.starts.len() > Released::CAP {
+            r.starts.clear();
+        }
+        r.starts.extend(gone.iter().map(|c| c.start));
+        tracing::info!(
+            copies = gone.len(),
+            mb = bytes / (1 << 20),
+            made_again = r.remade,
+            "host copies of title memory given up while memory is low"
+        );
+    }
+    // The copies' buffers go with the last layout naming them, on the
+    // thread that rewrites it; these references go now.
+    drop(gone);
+    (count, bytes)
+}
+
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = ALIASED
         .read()
@@ -2569,6 +2705,34 @@ pub(crate) mod tests {
             assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
+        unregister(p, p as u64);
+    }
+
+    /// A copy may go only when nothing else holds it, no submission's writes
+    /// to it wait to go back, and no view or list asked for it lately. (The
+    /// local reference here stands in for one page table's layout.)
+    #[test]
+    fn only_an_unheld_settled_unasked_copy_is_idle() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let asked = copy.used.load(Ordering::Relaxed);
+        let later = asked + IDLE_FRAMES;
+        assert!(!idle(&copy, 1, later - 1), "asked for lately");
+        assert!(idle(&copy, 1, later), "unasked, unheld and settled");
+        assert!(!idle(&copy, 0, later), "held by more than the tables");
+        let held = copy.clone();
+        assert!(!idle(&copy, 1, later), "a list holds it");
+        drop(held);
+        copy.writing(p, PAGE, false);
+        assert!(!idle(&copy, 1, later), "a submission's writes are still to go back");
+        copy.copy_back(p, PAGE);
+        assert!(idle(&copy, 1, later), "settled again");
+        copy.used.store(later, Ordering::Relaxed);
+        assert!(!idle(&copy, 1, later), "asked for again");
         unregister(p, p as u64);
     }
 

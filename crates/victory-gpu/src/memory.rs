@@ -220,6 +220,12 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How many page tables there are: each one's layout holds every copy it
+/// names ([`crate::shadow::release_idle`] counts on it).
+pub(crate) fn tables() -> usize {
+    shared().len()
+}
+
 /// View heap `key` was released: its page table goes with it (lists that
 /// name it hold the table), and a heap made later at its address starts
 /// with none of its state.

@@ -1823,7 +1823,11 @@ pub(crate) fn evict_unused() {
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
-    evict(frame, now_ms(), over.max(ram_over()));
+    let ram = ram_over();
+    evict(frame, now_ms(), over.max(ram));
+    // Host copies of title memory take the same memory and textures give
+    // back only part of it: the idle ones go too.
+    crate::shadow::release_idle(frame, ram);
 }
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
