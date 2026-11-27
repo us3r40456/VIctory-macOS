@@ -1056,12 +1056,14 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
             let _ = SPILL_DIR.set(spill);
         }
     }
+    crate::metal::encoder::open_global_archive(&dir);
     library::use_pipeline_cache(dir);
 }
 
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
+    crate::metal::encoder::save_global_archive();
     library::save(true);
 }
 

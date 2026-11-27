@@ -14,14 +14,17 @@ use super::registry::{
     BackingKey, CanonicalBuffer, CanonicalRegistry, RegisterAction, ResolvedBuffer,
 };
 use super::{
-    BenchArgs, ConvertDxilArgs, CreateTextureArgs, DestroyHandleArgs, FlushResidencyArgs,
-    InterpCreateArgs, InterpEncodeArgs, OP_BENCH_ZERO_COPY, OP_CONVERT_DXIL, OP_CREATE_TEXTURE,
+    ArchiveOpenArgs, ArchiveSaveArgs, BenchArgs, ConvertDxilArgs, CreateTextureArgs,
+    DestroyHandleArgs, FlushResidencyArgs, InterpCreateArgs, InterpEncodeArgs, OP_ARCHIVE_CLOSE,
+    OP_ARCHIVE_OPEN, OP_ARCHIVE_SAVE, OP_BENCH_ZERO_COPY, OP_CONVERT_DXIL, OP_CREATE_TEXTURE,
     OP_DESTROY_TEXTURE, OP_FLUSH_RESIDENCY, OP_INTERP_CREATE, OP_INTERP_DESTROY, OP_INTERP_ENCODE,
-    OP_PING, OP_READBACK_TEXTURE, OP_REGISTER_BUFFER, OP_SCALER_CREATE, OP_SCALER_DESTROY,
-    OP_SCALER_ENCODE, OP_STATS, OP_SURFACE_ATTACH, OP_SURFACE_DESTROY, OP_SURFACE_PRESENT,
-    OP_UNREGISTER_BUFFER, OP_UPLOAD_TEXTURE, PingArgs, PingInfo, RegisterBufferArgs,
-    ScalerCreateArgs, ScalerEncodeArgs, Stats, SurfaceAttachArgs, SurfacePresentArgs,
-    TextureIoArgs, UnregisterBufferArgs,
+    OP_PING, OP_PIPELINE_CREATE_COMPUTE, OP_PIPELINE_CREATE_RENDER, OP_PIPELINE_DESTROY,
+    OP_READBACK_TEXTURE, OP_REGISTER_BUFFER, OP_SCALER_CREATE, OP_SCALER_DESTROY,
+    OP_SCALER_ENCODE, OP_STATS, OP_SUBMIT_COMMANDS, OP_SURFACE_ATTACH, OP_SURFACE_DESTROY,
+    OP_SURFACE_PRESENT, OP_UNREGISTER_BUFFER, OP_UPLOAD_TEXTURE, OP_WAIT_FENCE, PingArgs, PingInfo,
+    PipelineComputeArgs, PipelineRenderArgs, RegisterBufferArgs, ScalerCreateArgs,
+    ScalerEncodeArgs, Stats, SubmitCommandsArgs, SurfaceAttachArgs, SurfacePresentArgs,
+    TextureIoArgs, UnregisterBufferArgs, WaitFenceArgs,
 };
 
 type FnAvailable = unsafe extern "system" fn() -> i32;
@@ -112,6 +115,34 @@ pub struct FrameInterpolatorResult {
     pub interpolated: bool,
     pub gpu_ns: u64,
     pub wall_ns: u64,
+}
+
+/// Shader input format accepted by `create_compute_pipeline` / `create_render_pipeline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ShaderSourceKind {
+    Dxil = 0,
+    MetalLib = 1,
+    Msl = 2,
+}
+
+/// Compiled native Metal compute pipeline metadata.
+#[derive(Debug, Clone, Copy)]
+pub struct ComputePipelineInfo {
+    pub handle: u64,
+    pub max_threads_per_tg: u32,
+    pub simd_width: u32,
+}
+
+/// Timing and stats returned by `submit_commands`.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmitResult {
+    pub fence_value: u64,
+    pub encode_ns: u64,
+    pub gpu_ns: u64,
+    pub wall_ns: u64,
+    pub draws_encoded: u32,
+    pub dispatches_encoded: u32,
 }
 
 /// Loaded `victory_metal.dll` entry points + global canonical buffer registry.
@@ -713,6 +744,195 @@ impl MetalBridge {
         // SAFETY: valid C-layout struct for `OP_SURFACE_DESTROY`.
         unsafe { (self.call)(OP_SURFACE_DESTROY, (&raw mut args).cast()) };
     }
+
+    // -----------------------------------------------------------------------
+    // Step 2B-3: MTLBinaryArchive, Native PSOs, Batched Command Submission
+    // -----------------------------------------------------------------------
+
+    /// Opens or creates a persistent Apple `MTLBinaryArchive` at POSIX `path`
+    /// (or in-memory if `None`). Returns `(handle, loaded_existing)`.
+    pub fn open_archive(&self, posix_path: Option<&str>) -> Result<(u64, bool), i32> {
+        let cpath = match posix_path {
+            Some(p) if !p.is_empty() => Some(std::ffi::CString::new(p).map_err(|_| -10)?),
+            _ => None,
+        };
+        let mut args = ArchiveOpenArgs {
+            path_ptr: cpath.as_ref().map_or(0, |s| s.as_ptr() as u64),
+            handle: 0,
+            loaded_existing: 0,
+            status: 0,
+        };
+        // SAFETY: `cpath` stays alive through the synchronous unixlib call.
+        let nt = unsafe { (self.call)(OP_ARCHIVE_OPEN, (&raw mut args).cast()) };
+        if nt == 0 && args.status == 0 && args.handle != 0 {
+            Ok((args.handle, args.loaded_existing != 0))
+        } else {
+            Err(if args.status != 0 { args.status } else { -1 })
+        }
+    }
+
+    /// Serializes an `MTLBinaryArchive` to disk at `posix_path` (or its open path).
+    pub fn save_archive(&self, handle: u64, posix_path: Option<&str>) -> Result<(), i32> {
+        let cpath = match posix_path {
+            Some(p) if !p.is_empty() => Some(std::ffi::CString::new(p).map_err(|_| -10)?),
+            _ => None,
+        };
+        let mut args = ArchiveSaveArgs {
+            handle,
+            path_ptr: cpath.as_ref().map_or(0, |s| s.as_ptr() as u64),
+            status: 0,
+            reserved: 0,
+        };
+        // SAFETY: valid C-layout struct for `OP_ARCHIVE_SAVE`.
+        let nt = unsafe { (self.call)(OP_ARCHIVE_SAVE, (&raw mut args).cast()) };
+        if nt == 0 && args.status == 0 {
+            Ok(())
+        } else {
+            Err(if args.status != 0 { args.status } else { -1 })
+        }
+    }
+
+    pub fn close_archive(&self, handle: u64) {
+        if handle == 0 {
+            return;
+        }
+        let mut args = DestroyHandleArgs { handle };
+        // SAFETY: valid C-layout struct for `OP_ARCHIVE_CLOSE`.
+        unsafe { (self.call)(OP_ARCHIVE_CLOSE, (&raw mut args).cast()) };
+    }
+
+    /// Creates a native `MTLComputePipelineState` from DXIL, `.metallib`, or MSL,
+    /// backed by optional `archive_handle` (`MTLBinaryArchive`).
+    pub fn create_compute_pipeline(
+        &self,
+        bytes: &[u8],
+        entry: &str,
+        kind: ShaderSourceKind,
+        archive_handle: u64,
+    ) -> Result<ComputePipelineInfo, i32> {
+        let entry_c = std::ffi::CString::new(entry).map_err(|_| -10)?;
+        let mut args = PipelineComputeArgs {
+            bytes_ptr: bytes.as_ptr() as u64,
+            bytes_len: bytes.len() as u64,
+            entry_ptr: entry_c.as_ptr() as u64,
+            archive_handle,
+            source_kind: kind as u32,
+            status: 0,
+            handle: 0,
+            max_threads_per_tg: 0,
+            simd_width: 0,
+        };
+        // SAFETY: `bytes` and `entry_c` outlive the synchronous call.
+        let nt = unsafe { (self.call)(OP_PIPELINE_CREATE_COMPUTE, (&raw mut args).cast()) };
+        if nt == 0 && args.status == 0 && args.handle != 0 {
+            Ok(ComputePipelineInfo {
+                handle: args.handle,
+                max_threads_per_tg: args.max_threads_per_tg,
+                simd_width: args.simd_width,
+            })
+        } else {
+            Err(if args.status != 0 { args.status } else { -1 })
+        }
+    }
+
+    /// Creates a native `MTLRenderPipelineState` from DXIL, `.metallib`, or MSL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_render_pipeline(
+        &self,
+        vs_bytes: &[u8],
+        vs_entry: &str,
+        fs_bytes: Option<&[u8]>,
+        fs_entry: &str,
+        kind: ShaderSourceKind,
+        color_format: u32,
+        depth_format: u32,
+        alpha_blend: bool,
+        archive_handle: u64,
+    ) -> Result<u64, i32> {
+        let vs_c = std::ffi::CString::new(vs_entry).map_err(|_| -10)?;
+        let fs_c = std::ffi::CString::new(fs_entry).map_err(|_| -10)?;
+        let (fs_ptr, fs_len) = match fs_bytes {
+            Some(b) => (b.as_ptr() as u64, b.len() as u64),
+            None => (0, 0),
+        };
+        let mut args = PipelineRenderArgs {
+            vs_ptr: vs_bytes.as_ptr() as u64,
+            vs_len: vs_bytes.len() as u64,
+            vs_entry_ptr: vs_c.as_ptr() as u64,
+            fs_ptr,
+            fs_len,
+            fs_entry_ptr: fs_c.as_ptr() as u64,
+            archive_handle,
+            source_kind: kind as u32,
+            color_format,
+            depth_format,
+            flags: u32::from(alpha_blend),
+            handle: 0,
+            status: 0,
+            reserved: 0,
+        };
+        // SAFETY: byte slices and C strings outlive the synchronous call.
+        let nt = unsafe { (self.call)(OP_PIPELINE_CREATE_RENDER, (&raw mut args).cast()) };
+        if nt == 0 && args.status == 0 && args.handle != 0 {
+            Ok(args.handle)
+        } else {
+            Err(if args.status != 0 { args.status } else { -1 })
+        }
+    }
+
+    pub fn destroy_pipeline(&self, handle: u64) {
+        if handle == 0 {
+            return;
+        }
+        let mut args = DestroyHandleArgs { handle };
+        // SAFETY: valid C-layout struct for `OP_PIPELINE_DESTROY`.
+        unsafe { (self.call)(OP_PIPELINE_DESTROY, (&raw mut args).cast()) };
+    }
+
+    /// Encodes and submits a packed binary command stream directly into one
+    /// native `MTLCommandBuffer` over the global zero-copy `MTLResidencySet`.
+    pub fn submit_commands(&self, words: &[u32], wait_completed: bool) -> Result<SubmitResult, i32> {
+        let mut args = SubmitCommandsArgs {
+            stream_ptr: words.as_ptr() as u64,
+            word_count: words.len() as u32,
+            flags: u32::from(wait_completed),
+            fence_value: 0,
+            encode_ns: 0,
+            gpu_ns: 0,
+            wall_ns: 0,
+            draws_encoded: 0,
+            dispatches_encoded: 0,
+            status: 0,
+            reserved: 0,
+        };
+        // SAFETY: `words` remains valid for the synchronous encoding/submission.
+        let nt = unsafe { (self.call)(OP_SUBMIT_COMMANDS, (&raw mut args).cast()) };
+        if nt == 0 && args.status == 0 {
+            Ok(SubmitResult {
+                fence_value: args.fence_value,
+                encode_ns: args.encode_ns,
+                gpu_ns: args.gpu_ns,
+                wall_ns: args.wall_ns,
+                draws_encoded: args.draws_encoded,
+                dispatches_encoded: args.dispatches_encoded,
+            })
+        } else {
+            Err(if args.status != 0 { args.status } else { -1 })
+        }
+    }
+
+    /// Waits on an asynchronous `MTLSharedEvent` timeline fence value.
+    pub fn wait_fence(&self, fence_value: u64, timeout_ns: u64) -> bool {
+        let mut args = WaitFenceArgs {
+            fence_value,
+            timeout_ns,
+            signaled: 0,
+            status: 0,
+        };
+        // SAFETY: valid C-layout struct for `OP_WAIT_FENCE`.
+        let nt = unsafe { (self.call)(OP_WAIT_FENCE, (&raw mut args).cast()) };
+        nt == 0 && args.status == 0 && args.signaled != 0
+    }
 }
 
 /// Process-wide singleton Metal unixlib bridge (`None` if unavailable).
@@ -764,7 +984,7 @@ mod tests {
             return;
         };
         let info = bridge.info();
-        assert_eq!(info.abi_version, 2);
+        assert_eq!(info.abi_version, 3);
         assert!(!info.device_name.is_empty());
         assert!(info.unified_memory, "Apple Silicon must report unified memory");
         assert!(info.residency_set, "macOS 15+ must support MTLResidencySet");

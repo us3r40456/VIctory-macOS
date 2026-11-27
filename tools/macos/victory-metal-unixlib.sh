@@ -124,7 +124,7 @@ typedef NTSTATUS (*unixlib_entry_t)(void *args);
 static constexpr NTSTATUS VM_STATUS_SUCCESS = 0;
 static constexpr NTSTATUS VM_STATUS_INVALID_PARAM = (NTSTATUS)0xC000000Du;
 static constexpr NTSTATUS VM_STATUS_UNSUCCESSFUL = (NTSTATUS)0xC0000001u;
-static constexpr uint32_t VM_ABI_VERSION = 2;
+static constexpr uint32_t VM_ABI_VERSION = 3;
 
 // Must match crates/victory-gpu/src/metal/mod.rs
 struct vm_ping_args {
@@ -312,6 +312,96 @@ struct vm_surface_present_args {
     uint64_t wall_ns;
 };
 
+// Step 2B-3: MTLBinaryArchive, native compute/render PSOs, and batched
+// MTLCommandBuffer command stream submission.
+struct vm_archive_open_args {
+    uint64_t path_ptr; // UTF-8 POSIX path (0 => in-memory archive)
+    uint64_t handle;
+    uint32_t loaded_existing;
+    int32_t status;
+};
+
+struct vm_archive_save_args {
+    uint64_t handle;
+    uint64_t path_ptr;
+    int32_t status;
+    uint32_t reserved;
+};
+
+struct vm_pipeline_compute_args {
+    uint64_t bytes_ptr;
+    uint64_t bytes_len;
+    uint64_t entry_ptr;      // UTF-8 function name (0 => "main")
+    uint64_t archive_handle; // optional MTLBinaryArchive (0 => none)
+    uint32_t source_kind;    // 0 = DXIL, 1 = MetalLib (MTLB), 2 = MSL source
+    int32_t status;
+    uint64_t handle;
+    uint32_t max_threads_per_tg;
+    uint32_t simd_width;
+};
+
+struct vm_pipeline_render_args {
+    uint64_t vs_ptr;
+    uint64_t vs_len;
+    uint64_t vs_entry_ptr;
+    uint64_t fs_ptr;
+    uint64_t fs_len;
+    uint64_t fs_entry_ptr;
+    uint64_t archive_handle;
+    uint32_t source_kind;  // 0 = DXIL, 1 = MetalLib, 2 = MSL source
+    uint32_t color_format; // MTLPixelFormat (0 => RGBA8Unorm)
+    uint32_t depth_format; // MTLPixelFormat (0 => none)
+    uint32_t flags;        // bit 0: alpha_blend
+    uint64_t handle;
+    int32_t status;
+    uint32_t reserved;
+};
+
+struct vm_submit_commands_args {
+    uint64_t stream_ptr; // pointer to packed uint32_t command words
+    uint32_t word_count;
+    uint32_t flags; // bit 0: wait_completed
+    uint64_t fence_value;
+    uint64_t encode_ns;
+    uint64_t gpu_ns;
+    uint64_t wall_ns;
+    uint32_t draws_encoded;
+    uint32_t dispatches_encoded;
+    int32_t status;
+    uint32_t reserved;
+};
+
+struct vm_wait_fence_args {
+    uint64_t fence_value;
+    uint64_t timeout_ns;
+    uint32_t signaled;
+    int32_t status;
+};
+
+// Packed uint32_t command stream opcodes for OP_SUBMIT_COMMANDS.
+static constexpr uint32_t CMD_COMPUTE_BEGIN = 1;
+static constexpr uint32_t CMD_COMPUTE_END = 2;
+static constexpr uint32_t CMD_SET_COMPUTE_PSO = 3;
+static constexpr uint32_t CMD_SET_COMPUTE_BUFFER = 4;
+static constexpr uint32_t CMD_SET_COMPUTE_BYTES = 5;
+static constexpr uint32_t CMD_SET_COMPUTE_TEXTURE = 6;
+static constexpr uint32_t CMD_DISPATCH_TG = 7;
+static constexpr uint32_t CMD_DISPATCH_INDIRECT = 8;
+static constexpr uint32_t CMD_BLIT_COPY_BUFFER = 9;
+static constexpr uint32_t CMD_BLIT_FILL_BUFFER = 10;
+static constexpr uint32_t CMD_RENDER_BEGIN = 11;
+static constexpr uint32_t CMD_RENDER_END = 12;
+static constexpr uint32_t CMD_SET_RENDER_PSO = 13;
+static constexpr uint32_t CMD_SET_VIEWPORT = 14;
+static constexpr uint32_t CMD_SET_VERTEX_BUFFER = 15;
+static constexpr uint32_t CMD_SET_VERTEX_BYTES = 16;
+static constexpr uint32_t CMD_SET_FRAGMENT_BUFFER = 17;
+static constexpr uint32_t CMD_SET_FRAGMENT_BYTES = 18;
+static constexpr uint32_t CMD_SET_FRAGMENT_TEXTURE = 19;
+static constexpr uint32_t CMD_DRAW_PRIMITIVES = 20;
+static constexpr uint32_t CMD_DRAW_INDEXED = 21;
+static constexpr uint32_t CMD_MEMORY_BARRIER = 22;
+
 // Transparent-to-input CAMetalLayer overlay view attached to Wine's NSWindow
 // so keyboard, mouse, and controller focus stay 100% untouched.
 @interface VictoryMetalOverlayView : NSView
@@ -474,6 +564,22 @@ struct SurfaceEntry {
     uint32_t height = 0;
     VictoryMetalOverlayView *view = nil;
     CAMetalLayer *layer = nil;
+};
+
+struct ArchiveEntry {
+    uint64_t handle = 0;
+    id<MTLBinaryArchive> archive = nil;
+    std::string path;
+};
+
+struct ComputePsoEntry {
+    uint64_t handle = 0;
+    id<MTLComputePipelineState> pso = nil;
+};
+
+struct RenderPsoEntry {
+    uint64_t handle = 0;
+    id<MTLRenderPipelineState> pso = nil;
 };
 
 static uint64_t now_ns() {
@@ -686,6 +792,11 @@ struct MetalState {
     std::unordered_map<uint64_t, ScalerEntry> scalers;
     std::unordered_map<uint64_t, InterpEntry> interps;
     std::unordered_map<uint64_t, SurfaceEntry> surfaces;
+    std::unordered_map<uint64_t, ArchiveEntry> archives;
+    std::unordered_map<uint64_t, ComputePsoEntry> compute_psos;
+    std::unordered_map<uint64_t, RenderPsoEntry> render_psos;
+    id<MTLSharedEvent> timeline_event = nil;
+    uint64_t timeline_value = 0;
 
     uint64_t active_bytes = 0;
     uint64_t total_registered = 0;
@@ -700,6 +811,7 @@ struct MetalState {
             if (!device) return false;
             queue = [device newCommandQueue];
             if (!queue) return false;
+            timeline_event = [device newSharedEvent];
 
             if (@available(macOS 15.0, *)) {
                 MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
@@ -1835,29 +1947,759 @@ static NTSTATUS op_surface_destroy(void *raw) {
     return VM_STATUS_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// Step 2B-3: MTLBinaryArchive, Direct Compute/Render Pipelines, and
+// Batched MTLCommandBuffer Submission
+// ---------------------------------------------------------------------------
+
+static bool dxil_to_metallib_vec(
+    const uint8_t *dxil_bytes,
+    size_t dxil_len,
+    const char *entry,
+    std::vector<uint8_t> &out
+) {
+    auto &api = ir::api();
+    if (!api.loaded() || !dxil_bytes || dxil_len == 0) return false;
+    ir::Compiler *comp = api.compiler_create();
+    if (!comp) return false;
+    if (api.compiler_set_target) api.compiler_set_target(comp, 0, "15.0");
+    if (api.compiler_set_entry) api.compiler_set_entry(comp, entry ? entry : "main");
+    ir::Object *dxil = api.object_from_dxil(dxil_bytes, dxil_len, 0);
+    if (!dxil) {
+        api.compiler_destroy(comp);
+        return false;
+    }
+    ir::Error *err = nullptr;
+    ir::Object *out_ir = api.compiler_compile(comp, entry ? entry : "main", dxil, &err);
+    if (!out_ir) {
+        if (err && api.error_destroy) api.error_destroy(err);
+        api.object_destroy(dxil);
+        api.compiler_destroy(comp);
+        return false;
+    }
+    uint32_t stage = api.object_get_stage(out_ir);
+    ir::MetalLibBinary *mlib = api.metallib_create();
+    bool ok = mlib && api.object_get_metallib(out_ir, stage, mlib);
+    if (ok) {
+        size_t sz = api.metallib_size(mlib);
+        out.resize(sz);
+        api.metallib_bytes(mlib, out.data());
+        state().dxil_converted.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (mlib) api.metallib_destroy(mlib);
+    api.object_destroy(out_ir);
+    api.object_destroy(dxil);
+    api.compiler_destroy(comp);
+    return ok;
+}
+
+static id<MTLLibrary> compile_library(
+    id<MTLDevice> device,
+    const uint8_t *bytes,
+    size_t len,
+    const char *entry,
+    uint32_t source_kind
+) {
+    if (!bytes || len == 0) return nil;
+    NSError *err = nil;
+    if (source_kind == 2) {
+        NSString *src = [[NSString alloc] initWithBytes:bytes
+                                                 length:len
+                                               encoding:NSUTF8StringEncoding];
+        if (!src) return nil;
+        return [device newLibraryWithSource:src options:nil error:&err];
+    }
+    std::vector<uint8_t> mlib_storage;
+    const uint8_t *mlib_ptr = bytes;
+    size_t mlib_len = len;
+    if (source_kind == 0) {
+        if (!dxil_to_metallib_vec(bytes, len, entry, mlib_storage)) return nil;
+        mlib_ptr = mlib_storage.data();
+        mlib_len = mlib_storage.size();
+    }
+    dispatch_data_t data = dispatch_data_create(
+        mlib_ptr,
+        mlib_len,
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0),
+        DISPATCH_DATA_DESTRUCTOR_DEFAULT
+    );
+    return [device newLibraryWithData:data error:&err];
+}
+
+static NTSTATUS op_archive_open(void *raw) {
+    auto *a = static_cast<vm_archive_open_args *>(raw);
+    if (!a) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!s.init_locked()) {
+        a->status = -1;
+        return VM_STATUS_UNSUCCESSFUL;
+    }
+    @autoreleasepool {
+        MTLBinaryArchiveDescriptor *desc = [[MTLBinaryArchiveDescriptor alloc] init];
+        bool loaded = false;
+        std::string path_str;
+        if (a->path_ptr != 0) {
+            const char *cpath = reinterpret_cast<const char *>(a->path_ptr);
+            if (cpath && *cpath) {
+                path_str = cpath;
+                NSString *ns = [NSString stringWithUTF8String:cpath];
+                if ([[NSFileManager defaultManager] fileExistsAtPath:ns]) {
+                    desc.url = [NSURL fileURLWithPath:ns];
+                    loaded = true;
+                }
+            }
+        }
+        NSError *err = nil;
+        id<MTLBinaryArchive> arch = [s.device newBinaryArchiveWithDescriptor:desc error:&err];
+        if (!arch && loaded) {
+            // Corrupt or incompatible archive on disk: start fresh cleanly.
+            desc.url = nil;
+            loaded = false;
+            err = nil;
+            arch = [s.device newBinaryArchiveWithDescriptor:desc error:&err];
+        }
+        if (!arch) {
+            a->handle = 0;
+            a->loaded_existing = 0;
+            a->status = -2;
+            return VM_STATUS_SUCCESS;
+        }
+        uint64_t h = s.next_handle++;
+        ArchiveEntry e;
+        e.handle = h;
+        e.archive = arch;
+        e.path = path_str;
+        s.archives.emplace(h, e);
+        a->handle = h;
+        a->loaded_existing = loaded ? 1u : 0u;
+        a->status = 0;
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static NTSTATUS op_archive_save(void *raw) {
+    auto *a = static_cast<vm_archive_save_args *>(raw);
+    if (!a || a->handle == 0) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.archives.find(a->handle);
+    if (it == s.archives.end() || !it->second.archive) {
+        a->status = -2;
+        return VM_STATUS_SUCCESS;
+    }
+    @autoreleasepool {
+        std::string target = it->second.path;
+        if (a->path_ptr != 0) {
+            const char *cp = reinterpret_cast<const char *>(a->path_ptr);
+            if (cp && *cp) target = cp;
+        }
+        if (target.empty()) {
+            a->status = -3;
+            return VM_STATUS_SUCCESS;
+        }
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:target.c_str()]];
+        NSError *err = nil;
+        BOOL ok = [it->second.archive serializeToURL:url error:&err];
+        a->status = ok ? 0 : -4;
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static NTSTATUS op_archive_close(void *raw) {
+    auto *a = static_cast<vm_destroy_handle_args *>(raw);
+    if (!a || a->handle == 0) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    @autoreleasepool {
+        s.archives.erase(a->handle);
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static NTSTATUS op_pipeline_create_compute(void *raw) {
+    auto *a = static_cast<vm_pipeline_compute_args *>(raw);
+    if (!a || a->bytes_ptr == 0 || a->bytes_len == 0) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!s.init_locked()) {
+        a->status = -1;
+        return VM_STATUS_UNSUCCESSFUL;
+    }
+    @autoreleasepool {
+        const char *entry = a->entry_ptr ? reinterpret_cast<const char *>(a->entry_ptr) : "main";
+        id<MTLLibrary> lib = compile_library(
+            s.device,
+            reinterpret_cast<const uint8_t *>(a->bytes_ptr),
+            (size_t)a->bytes_len,
+            entry,
+            a->source_kind
+        );
+        if (!lib) {
+            a->status = -2;
+            return VM_STATUS_SUCCESS;
+        }
+        NSString *fn_name = [NSString stringWithUTF8String:entry];
+        id<MTLFunction> fn = [lib newFunctionWithName:fn_name];
+        if (!fn && lib.functionNames.count > 0) {
+            fn = [lib newFunctionWithName:lib.functionNames[0]];
+        }
+        if (!fn) {
+            a->status = -3;
+            return VM_STATUS_SUCCESS;
+        }
+        MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+        desc.computeFunction = fn;
+        id<MTLBinaryArchive> arch = nil;
+        if (a->archive_handle != 0) {
+            auto ait = s.archives.find(a->archive_handle);
+            if (ait != s.archives.end()) {
+                arch = ait->second.archive;
+                desc.binaryArchives = @[arch];
+            }
+        }
+        NSError *err = nil;
+        id<MTLComputePipelineState> pso =
+            [s.device newComputePipelineStateWithDescriptor:desc
+                                                    options:MTLPipelineOptionNone
+                                                 reflection:nil
+                                                      error:&err];
+        if (!pso) {
+            a->status = -4;
+            return VM_STATUS_SUCCESS;
+        }
+        if (arch) {
+            NSError *aerr = nil;
+            [arch addComputePipelineFunctionsWithDescriptor:desc error:&aerr];
+        }
+        uint64_t h = s.next_handle++;
+        ComputePsoEntry e;
+        e.handle = h;
+        e.pso = pso;
+        s.compute_psos.emplace(h, e);
+        a->handle = h;
+        a->max_threads_per_tg = (uint32_t)pso.maxTotalThreadsPerThreadgroup;
+        a->simd_width = (uint32_t)pso.threadExecutionWidth;
+        a->status = 0;
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static NTSTATUS op_pipeline_create_render(void *raw) {
+    auto *a = static_cast<vm_pipeline_render_args *>(raw);
+    if (!a || a->vs_ptr == 0 || a->vs_len == 0) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!s.init_locked()) {
+        a->status = -1;
+        return VM_STATUS_UNSUCCESSFUL;
+    }
+    @autoreleasepool {
+        const char *vs_entry = a->vs_entry_ptr ? reinterpret_cast<const char *>(a->vs_entry_ptr) : "vs_main";
+        const char *fs_entry = a->fs_entry_ptr ? reinterpret_cast<const char *>(a->fs_entry_ptr) : "fs_main";
+        id<MTLLibrary> vs_lib = compile_library(
+            s.device,
+            reinterpret_cast<const uint8_t *>(a->vs_ptr),
+            (size_t)a->vs_len,
+            vs_entry,
+            a->source_kind
+        );
+        if (!vs_lib) {
+            a->status = -2;
+            return VM_STATUS_SUCCESS;
+        }
+        id<MTLFunction> vs_fn = [vs_lib newFunctionWithName:[NSString stringWithUTF8String:vs_entry]];
+        if (!vs_fn) {
+            a->status = -3;
+            return VM_STATUS_SUCCESS;
+        }
+        id<MTLFunction> fs_fn = nil;
+        if (a->fs_ptr != 0 && a->fs_len != 0) {
+            id<MTLLibrary> fs_lib = (a->fs_ptr == a->vs_ptr && a->fs_len == a->vs_len)
+                ? vs_lib
+                : compile_library(
+                    s.device,
+                    reinterpret_cast<const uint8_t *>(a->fs_ptr),
+                    (size_t)a->fs_len,
+                    fs_entry,
+                    a->source_kind
+                  );
+            if (!fs_lib) {
+                a->status = -4;
+                return VM_STATUS_SUCCESS;
+            }
+            fs_fn = [fs_lib newFunctionWithName:[NSString stringWithUTF8String:fs_entry]];
+            if (!fs_fn) {
+                a->status = -5;
+                return VM_STATUS_SUCCESS;
+            }
+        }
+        MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+        desc.vertexFunction = vs_fn;
+        desc.fragmentFunction = fs_fn;
+        MTLPixelFormat cf = (MTLPixelFormat)(a->color_format ? a->color_format : MTLPixelFormatRGBA8Unorm);
+        desc.colorAttachments[0].pixelFormat = cf;
+        if ((a->flags & 1u) != 0) {
+            desc.colorAttachments[0].blendingEnabled = YES;
+            desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+            desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        }
+        if (a->depth_format != 0) {
+            desc.depthAttachmentPixelFormat = (MTLPixelFormat)a->depth_format;
+        }
+        id<MTLBinaryArchive> arch = nil;
+        if (a->archive_handle != 0) {
+            auto ait = s.archives.find(a->archive_handle);
+            if (ait != s.archives.end()) {
+                arch = ait->second.archive;
+                desc.binaryArchives = @[arch];
+            }
+        }
+        NSError *err = nil;
+        id<MTLRenderPipelineState> pso = [s.device newRenderPipelineStateWithDescriptor:desc error:&err];
+        if (!pso) {
+            a->status = -6;
+            return VM_STATUS_SUCCESS;
+        }
+        if (arch) {
+            NSError *aerr = nil;
+            [arch addRenderPipelineFunctionsWithDescriptor:desc error:&aerr];
+        }
+        uint64_t h = s.next_handle++;
+        RenderPsoEntry e;
+        e.handle = h;
+        e.pso = pso;
+        s.render_psos.emplace(h, e);
+        a->handle = h;
+        a->status = 0;
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static NTSTATUS op_pipeline_destroy(void *raw) {
+    auto *a = static_cast<vm_destroy_handle_args *>(raw);
+    if (!a || a->handle == 0) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    @autoreleasepool {
+        s.compute_psos.erase(a->handle);
+        s.render_psos.erase(a->handle);
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static inline uint64_t read_u64_words(const uint32_t *w, size_t &i) {
+    uint64_t lo = w[i++];
+    uint64_t hi = w[i++];
+    return lo | (hi << 32);
+}
+
+static inline float read_f32_word(const uint32_t *w, size_t &i) {
+    uint32_t bits = w[i++];
+    float f = 0.0f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static NTSTATUS op_submit_commands(void *raw) {
+    auto *a = static_cast<vm_submit_commands_args *>(raw);
+    if (!a || (a->word_count > 0 && a->stream_ptr == 0)) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (!s.init_locked()) {
+        a->status = -1;
+        return VM_STATUS_UNSUCCESSFUL;
+    }
+    s.commit_residency_locked();
+
+    const uint32_t *words = reinterpret_cast<const uint32_t *>(a->stream_ptr);
+    const size_t n = a->word_count;
+
+    auto get_buf = [&](uint64_t h) -> id<MTLBuffer> {
+        auto it = s.by_handle.find(h);
+        return (it != s.by_handle.end()) ? it->second.buffer : nil;
+    };
+    auto get_tex = [&](uint64_t h) -> id<MTLTexture> {
+        auto it = s.textures.find(h);
+        return (it != s.textures.end()) ? it->second.texture : nil;
+    };
+
+    uint32_t draws = 0;
+    uint32_t dispatches = 0;
+    int32_t err_code = 0;
+
+    @autoreleasepool {
+        uint64_t t_wall0 = now_ns();
+        id<MTLCommandBuffer> cb = [s.queue commandBuffer];
+        id<MTLComputeCommandEncoder> cenc = nil;
+        id<MTLRenderCommandEncoder> renc = nil;
+
+        auto end_active = [&]() {
+            if (cenc) {
+                [cenc endEncoding];
+                cenc = nil;
+            }
+            if (renc) {
+                [renc endEncoding];
+                renc = nil;
+            }
+        };
+
+        size_t i = 0;
+        while (i < n && err_code == 0) {
+            uint32_t op = words[i++];
+            switch (op) {
+                case CMD_COMPUTE_BEGIN: {
+                    end_active();
+                    cenc = [cb computeCommandEncoder];
+                    break;
+                }
+                case CMD_COMPUTE_END: {
+                    if (cenc) {
+                        [cenc endEncoding];
+                        cenc = nil;
+                    }
+                    break;
+                }
+                case CMD_SET_COMPUTE_PSO: {
+                    if (i + 2 > n) { err_code = -10; break; }
+                    uint64_t h = read_u64_words(words, i);
+                    auto it = s.compute_psos.find(h);
+                    if (it == s.compute_psos.end() || !cenc) { err_code = -11; break; }
+                    [cenc setComputePipelineState:it->second.pso];
+                    break;
+                }
+                case CMD_SET_COMPUTE_BUFFER: {
+                    if (i + 5 > n) { err_code = -10; break; }
+                    uint32_t slot = words[i++];
+                    uint64_t bh = read_u64_words(words, i);
+                    uint64_t off = read_u64_words(words, i);
+                    id<MTLBuffer> buf = get_buf(bh);
+                    if (!buf || !cenc) { err_code = -12; break; }
+                    [cenc setBuffer:buf offset:(NSUInteger)off atIndex:slot];
+                    break;
+                }
+                case CMD_SET_COMPUTE_BYTES: {
+                    if (i + 2 > n) { err_code = -10; break; }
+                    uint32_t slot = words[i++];
+                    uint32_t byte_len = words[i++];
+                    size_t wlen = (byte_len + 3) / 4;
+                    if (i + wlen > n || !cenc) { err_code = -13; break; }
+                    [cenc setBytes:&words[i] length:byte_len atIndex:slot];
+                    i += wlen;
+                    break;
+                }
+                case CMD_SET_COMPUTE_TEXTURE: {
+                    if (i + 3 > n) { err_code = -10; break; }
+                    uint32_t slot = words[i++];
+                    uint64_t th = read_u64_words(words, i);
+                    id<MTLTexture> tex = get_tex(th);
+                    if (!tex || !cenc) { err_code = -14; break; }
+                    [cenc setTexture:tex atIndex:slot];
+                    break;
+                }
+                case CMD_DISPATCH_TG: {
+                    if (i + 6 > n || !cenc) { err_code = -15; break; }
+                    uint32_t gx = words[i++], gy = words[i++], gz = words[i++];
+                    uint32_t tx = words[i++], ty = words[i++], tz = words[i++];
+                    [cenc dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
+                         threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+                    dispatches++;
+                    break;
+                }
+                case CMD_DISPATCH_INDIRECT: {
+                    if (i + 7 > n || !cenc) { err_code = -16; break; }
+                    uint64_t bh = read_u64_words(words, i);
+                    uint64_t off = read_u64_words(words, i);
+                    uint32_t tx = words[i++], ty = words[i++], tz = words[i++];
+                    id<MTLBuffer> buf = get_buf(bh);
+                    if (!buf) { err_code = -16; break; }
+                    [cenc dispatchThreadgroupsWithIndirectBuffer:buf
+                                            indirectBufferOffset:(NSUInteger)off
+                                           threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+                    dispatches++;
+                    break;
+                }
+                case CMD_BLIT_COPY_BUFFER: {
+                    if (i + 10 > n) { err_code = -17; break; }
+                    uint64_t src_h = read_u64_words(words, i);
+                    uint64_t src_off = read_u64_words(words, i);
+                    uint64_t dst_h = read_u64_words(words, i);
+                    uint64_t dst_off = read_u64_words(words, i);
+                    uint64_t len = read_u64_words(words, i);
+                    id<MTLBuffer> src = get_buf(src_h);
+                    id<MTLBuffer> dst = get_buf(dst_h);
+                    if (!src || !dst) { err_code = -17; break; }
+                    end_active();
+                    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                    [blit copyFromBuffer:src sourceOffset:(NSUInteger)src_off
+                                toBuffer:dst destinationOffset:(NSUInteger)dst_off
+                                    size:(NSUInteger)len];
+                    [blit endEncoding];
+                    break;
+                }
+                case CMD_BLIT_FILL_BUFFER: {
+                    if (i + 7 > n) { err_code = -18; break; }
+                    uint64_t dst_h = read_u64_words(words, i);
+                    uint64_t off = read_u64_words(words, i);
+                    uint64_t len = read_u64_words(words, i);
+                    uint8_t val = (uint8_t)(words[i++] & 0xFFu);
+                    id<MTLBuffer> dst = get_buf(dst_h);
+                    if (!dst) { err_code = -18; break; }
+                    end_active();
+                    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                    [blit fillBuffer:dst range:NSMakeRange((NSUInteger)off, (NSUInteger)len) value:val];
+                    [blit endEncoding];
+                    break;
+                }
+                case CMD_RENDER_BEGIN: {
+                    if (i + 11 > n) { err_code = -19; break; }
+                    uint64_t color_h = read_u64_words(words, i);
+                    uint32_t load_act = words[i++];
+                    float cr = read_f32_word(words, i);
+                    float cg = read_f32_word(words, i);
+                    float cb_v = read_f32_word(words, i);
+                    float ca = read_f32_word(words, i);
+                    uint64_t depth_h = read_u64_words(words, i);
+                    uint32_t depth_load = words[i++];
+                    float clear_d = read_f32_word(words, i);
+                    id<MTLTexture> ctex = get_tex(color_h);
+                    if (!ctex) { err_code = -20; break; }
+                    end_active();
+                    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rpd.colorAttachments[0].texture = ctex;
+                    rpd.colorAttachments[0].loadAction =
+                        (load_act == 2) ? MTLLoadActionClear
+                                        : ((load_act == 1) ? MTLLoadActionLoad : MTLLoadActionDontCare);
+                    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    rpd.colorAttachments[0].clearColor = MTLClearColorMake(cr, cg, cb_v, ca);
+                    if (depth_h != 0) {
+                        id<MTLTexture> dtex = get_tex(depth_h);
+                        if (dtex) {
+                            rpd.depthAttachment.texture = dtex;
+                            rpd.depthAttachment.loadAction =
+                                (depth_load == 2) ? MTLLoadActionClear
+                                                  : ((depth_load == 1) ? MTLLoadActionLoad : MTLLoadActionDontCare);
+                            rpd.depthAttachment.storeAction = MTLStoreActionStore;
+                            rpd.depthAttachment.clearDepth = clear_d;
+                        }
+                    }
+                    renc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    break;
+                }
+                case CMD_RENDER_END: {
+                    if (renc) {
+                        [renc endEncoding];
+                        renc = nil;
+                    }
+                    break;
+                }
+                case CMD_SET_RENDER_PSO: {
+                    if (i + 2 > n) { err_code = -21; break; }
+                    uint64_t h = read_u64_words(words, i);
+                    auto it = s.render_psos.find(h);
+                    if (it == s.render_psos.end() || !renc) { err_code = -21; break; }
+                    [renc setRenderPipelineState:it->second.pso];
+                    break;
+                }
+                case CMD_SET_VIEWPORT: {
+                    if (i + 6 > n || !renc) { err_code = -22; break; }
+                    float x = read_f32_word(words, i);
+                    float y = read_f32_word(words, i);
+                    float w = read_f32_word(words, i);
+                    float h = read_f32_word(words, i);
+                    float zmin = read_f32_word(words, i);
+                    float zmax = read_f32_word(words, i);
+                    MTLViewport vp = {x, y, w, h, zmin, zmax};
+                    [renc setViewport:vp];
+                    break;
+                }
+                case CMD_SET_VERTEX_BUFFER: {
+                    if (i + 5 > n || !renc) { err_code = -23; break; }
+                    uint32_t slot = words[i++];
+                    uint64_t bh = read_u64_words(words, i);
+                    uint64_t off = read_u64_words(words, i);
+                    id<MTLBuffer> buf = get_buf(bh);
+                    if (!buf) { err_code = -23; break; }
+                    [renc setVertexBuffer:buf offset:(NSUInteger)off atIndex:slot];
+                    break;
+                }
+                case CMD_SET_VERTEX_BYTES: {
+                    if (i + 2 > n || !renc) { err_code = -24; break; }
+                    uint32_t slot = words[i++];
+                    uint32_t byte_len = words[i++];
+                    size_t wlen = (byte_len + 3) / 4;
+                    if (i + wlen > n) { err_code = -24; break; }
+                    [renc setVertexBytes:&words[i] length:byte_len atIndex:slot];
+                    i += wlen;
+                    break;
+                }
+                case CMD_SET_FRAGMENT_BUFFER: {
+                    if (i + 5 > n || !renc) { err_code = -25; break; }
+                    uint32_t slot = words[i++];
+                    uint64_t bh = read_u64_words(words, i);
+                    uint64_t off = read_u64_words(words, i);
+                    id<MTLBuffer> buf = get_buf(bh);
+                    if (!buf) { err_code = -25; break; }
+                    [renc setFragmentBuffer:buf offset:(NSUInteger)off atIndex:slot];
+                    break;
+                }
+                case CMD_SET_FRAGMENT_BYTES: {
+                    if (i + 2 > n || !renc) { err_code = -26; break; }
+                    uint32_t slot = words[i++];
+                    uint32_t byte_len = words[i++];
+                    size_t wlen = (byte_len + 3) / 4;
+                    if (i + wlen > n) { err_code = -26; break; }
+                    [renc setFragmentBytes:&words[i] length:byte_len atIndex:slot];
+                    i += wlen;
+                    break;
+                }
+                case CMD_SET_FRAGMENT_TEXTURE: {
+                    if (i + 3 > n || !renc) { err_code = -27; break; }
+                    uint32_t slot = words[i++];
+                    uint64_t th = read_u64_words(words, i);
+                    id<MTLTexture> tex = get_tex(th);
+                    if (!tex) { err_code = -27; break; }
+                    [renc setFragmentTexture:tex atIndex:slot];
+                    break;
+                }
+                case CMD_DRAW_PRIMITIVES: {
+                    if (i + 4 > n || !renc) { err_code = -28; break; }
+                    uint32_t prim = words[i++];
+                    uint32_t vstart = words[i++];
+                    uint32_t vcount = words[i++];
+                    uint32_t icount = words[i++];
+                    [renc drawPrimitives:(MTLPrimitiveType)prim
+                             vertexStart:vstart
+                             vertexCount:vcount
+                           instanceCount:icount ? icount : 1];
+                    draws++;
+                    break;
+                }
+                case CMD_DRAW_INDEXED: {
+                    if (i + 8 > n || !renc) { err_code = -29; break; }
+                    uint32_t prim = words[i++];
+                    uint32_t idx_count = words[i++];
+                    uint32_t idx_type = words[i++];
+                    uint64_t ib_h = read_u64_words(words, i);
+                    uint64_t ib_off = read_u64_words(words, i);
+                    uint32_t icount = words[i++];
+                    id<MTLBuffer> ib = get_buf(ib_h);
+                    if (!ib) { err_code = -29; break; }
+                    [renc drawIndexedPrimitives:(MTLPrimitiveType)prim
+                                     indexCount:idx_count
+                                      indexType:(MTLIndexType)idx_type
+                                    indexBuffer:ib
+                              indexBufferOffset:(NSUInteger)ib_off
+                                  instanceCount:icount ? icount : 1];
+                    draws++;
+                    break;
+                }
+                case CMD_MEMORY_BARRIER: {
+                    if (i + 1 > n) { err_code = -30; break; }
+                    uint32_t scope = words[i++];
+                    if (cenc) {
+                        [cenc memoryBarrierWithScope:(MTLBarrierScope)(scope ? scope : MTLBarrierScopeBuffers)];
+                    } else if (renc) {
+                        [renc memoryBarrierWithScope:(MTLBarrierScope)(scope ? scope : MTLBarrierScopeBuffers)
+                                         afterStages:MTLRenderStageFragment
+                                        beforeStages:MTLRenderStageVertex];
+                    }
+                    break;
+                }
+                default:
+                    err_code = -99;
+                    break;
+            }
+        }
+        end_active();
+        uint64_t t_enc1 = now_ns();
+        a->encode_ns = t_enc1 - t_wall0;
+        a->draws_encoded = draws;
+        a->dispatches_encoded = dispatches;
+
+        if (err_code != 0) {
+            a->status = err_code;
+            return VM_STATUS_SUCCESS;
+        }
+
+        uint64_t next_val = ++s.timeline_value;
+        if (s.timeline_event) {
+            [cb encodeSignalEvent:s.timeline_event value:next_val];
+        }
+        [cb commit];
+        a->fence_value = next_val;
+
+        if ((a->flags & 1u) != 0) {
+            [cb waitUntilCompleted];
+            uint64_t t_wall1 = now_ns();
+            a->wall_ns = t_wall1 - t_wall0;
+            double gpu_s = cb.GPUEndTime - cb.GPUStartTime;
+            a->gpu_ns = (gpu_s > 0.0) ? (uint64_t)(gpu_s * 1e9) : a->wall_ns;
+            a->status = (cb.status == MTLCommandBufferStatusCompleted) ? 0 : -40;
+        } else {
+            a->wall_ns = now_ns() - t_wall0;
+            a->gpu_ns = 0;
+            a->status = 0;
+        }
+    }
+    return VM_STATUS_SUCCESS;
+}
+
+static NTSTATUS op_wait_fence(void *raw) {
+    auto *a = static_cast<vm_wait_fence_args *>(raw);
+    if (!a) return VM_STATUS_INVALID_PARAM;
+    auto &s = state();
+    id<MTLSharedEvent> ev = nil;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        ev = s.timeline_event;
+    }
+    if (!ev) {
+        a->signaled = 1;
+        a->status = 0;
+        return VM_STATUS_SUCCESS;
+    }
+    uint64_t timeout_ms = a->timeout_ns ? std::max<uint64_t>(1, a->timeout_ns / 1000000ULL) : 10000ULL;
+    BOOL ok = [ev waitUntilSignaledValue:a->fence_value timeoutMS:timeout_ms];
+    a->signaled = ok ? 1u : 0u;
+    a->status = 0;
+    return VM_STATUS_SUCCESS;
+}
+
 extern "C" {
 __attribute__((visibility("default"))) extern const unixlib_entry_t __wine_unix_call_funcs[];
 __attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {
-    op_ping,              // 0
-    op_register_buffer,   // 1
-    op_unregister_buffer, // 2
-    op_flush_residency,   // 3
-    op_bench_zero_copy,   // 4
-    op_convert_dxil,      // 5
-    op_stats,             // 6
-    op_create_texture,    // 7
-    op_destroy_texture,   // 8
-    op_upload_texture,    // 9
-    op_readback_texture,  // 10
-    op_scaler_create,     // 11
-    op_scaler_encode,     // 12
-    op_scaler_destroy,    // 13
-    op_interp_create,     // 14
-    op_interp_encode,     // 15
-    op_interp_destroy,    // 16
-    op_surface_attach,    // 17
-    op_surface_present,   // 18
-    op_surface_destroy,   // 19
+    op_ping,                    // 0
+    op_register_buffer,         // 1
+    op_unregister_buffer,       // 2
+    op_flush_residency,         // 3
+    op_bench_zero_copy,         // 4
+    op_convert_dxil,            // 5
+    op_stats,                   // 6
+    op_create_texture,          // 7
+    op_destroy_texture,         // 8
+    op_upload_texture,          // 9
+    op_readback_texture,        // 10
+    op_scaler_create,           // 11
+    op_scaler_encode,           // 12
+    op_scaler_destroy,          // 13
+    op_interp_create,           // 14
+    op_interp_encode,           // 15
+    op_interp_destroy,          // 16
+    op_surface_attach,          // 17
+    op_surface_present,         // 18
+    op_surface_destroy,         // 19
+    op_archive_open,            // 20
+    op_archive_save,            // 21
+    op_archive_close,           // 22
+    op_pipeline_create_compute, // 23
+    op_pipeline_create_render,  // 24
+    op_pipeline_destroy,        // 25
+    op_submit_commands,         // 26
+    op_wait_fence,              // 27
 };
 
 __attribute__((visibility("default"))) extern const unixlib_entry_t __wine_unix_call_wow64_funcs[];

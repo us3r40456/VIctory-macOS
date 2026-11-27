@@ -727,6 +727,9 @@ impl HostPipeline {
                     return None;
                 }
             };
+            if crate::metal::metal_archive_enabled() {
+                let _ = crate::metal::encoder::warm_dxil_compute(&code_bytes(&code(0)), "main");
+            }
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {

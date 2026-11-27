@@ -10,6 +10,7 @@
 
 #[cfg(windows)]
 pub mod bridge;
+pub mod encoder;
 #[cfg(windows)]
 pub mod fx;
 #[cfg(windows)]
@@ -19,7 +20,7 @@ pub mod registry;
 use std::sync::OnceLock;
 
 /// ABI version shared with `tools/macos/victory-metal-unixlib.sh`.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 pub(crate) const OP_PING: u32 = 0;
 pub(crate) const OP_REGISTER_BUFFER: u32 = 1;
@@ -41,6 +42,14 @@ pub(crate) const OP_INTERP_DESTROY: u32 = 16;
 pub(crate) const OP_SURFACE_ATTACH: u32 = 17;
 pub(crate) const OP_SURFACE_PRESENT: u32 = 18;
 pub(crate) const OP_SURFACE_DESTROY: u32 = 19;
+pub(crate) const OP_ARCHIVE_OPEN: u32 = 20;
+pub(crate) const OP_ARCHIVE_SAVE: u32 = 21;
+pub(crate) const OP_ARCHIVE_CLOSE: u32 = 22;
+pub(crate) const OP_PIPELINE_CREATE_COMPUTE: u32 = 23;
+pub(crate) const OP_PIPELINE_CREATE_RENDER: u32 = 24;
+pub(crate) const OP_PIPELINE_DESTROY: u32 = 25;
+pub(crate) const OP_SUBMIT_COMMANDS: u32 = 26;
+pub(crate) const OP_WAIT_FENCE: u32 = 27;
 
 /// Common Apple Metal `MTLPixelFormat` numeric values.
 pub mod pixel_format {
@@ -361,11 +370,102 @@ pub(crate) struct SurfacePresentArgs {
     pub wall_ns: u64,
 }
 
-/// Whether `VICTORY_METAL_BRIDGE=1` asks to register title allocations into
-/// the zero-copy Metal `MTLResidencySet`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ArchiveOpenArgs {
+    pub path_ptr: u64,
+    pub handle: u64,
+    pub loaded_existing: u32,
+    pub status: i32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ArchiveSaveArgs {
+    pub handle: u64,
+    pub path_ptr: u64,
+    pub status: i32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PipelineComputeArgs {
+    pub bytes_ptr: u64,
+    pub bytes_len: u64,
+    pub entry_ptr: u64,
+    pub archive_handle: u64,
+    pub source_kind: u32,
+    pub status: i32,
+    pub handle: u64,
+    pub max_threads_per_tg: u32,
+    pub simd_width: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PipelineRenderArgs {
+    pub vs_ptr: u64,
+    pub vs_len: u64,
+    pub vs_entry_ptr: u64,
+    pub fs_ptr: u64,
+    pub fs_len: u64,
+    pub fs_entry_ptr: u64,
+    pub archive_handle: u64,
+    pub source_kind: u32,
+    pub color_format: u32,
+    pub depth_format: u32,
+    pub flags: u32,
+    pub handle: u64,
+    pub status: i32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct SubmitCommandsArgs {
+    pub stream_ptr: u64,
+    pub word_count: u32,
+    pub flags: u32,
+    pub fence_value: u64,
+    pub encode_ns: u64,
+    pub gpu_ns: u64,
+    pub wall_ns: u64,
+    pub draws_encoded: u32,
+    pub dispatches_encoded: u32,
+    pub status: i32,
+    pub reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WaitFenceArgs {
+    pub fence_value: u64,
+    pub timeout_ns: u64,
+    pub signaled: u32,
+    pub status: i32,
+}
+
+/// Whether `VICTORY_METAL_ARCHIVE=1` (or `VICTORY_BACKEND=metal`) asks to
+/// maintain a persistent Apple `MTLBinaryArchive` alongside the pipeline cache.
+pub fn metal_archive_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::switch::on("VICTORY_METAL_ARCHIVE")
+            || std::env::var("VICTORY_BACKEND")
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("metal"))
+    })
+}
+
+/// Whether zero-copy `MTLResidencySet` registration of large title heaps is
+/// active. Defaults to on when `VICTORY_METAL_DLL` is provided by `victory.sh`
+/// (set `VICTORY_METAL_BRIDGE=0` to disable).
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_METAL_BRIDGE"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_METAL_BRIDGE") {
+        Ok(v) => !matches!(v.trim(), "" | "0" | "off"),
+        Err(_) => std::env::var_os("VICTORY_METAL_DLL").is_some(),
+    })
 }
 
 /// Whether `VICTORY_METAL_FRAMEGEN=1` activates live Apple `MTLFXFrameInterpolator`
@@ -396,20 +496,21 @@ pub fn metalfx_upscaler_enabled() -> bool {
 #[cfg(windows)]
 fn min_bytes() -> Option<usize> {
     static MIN: OnceLock<Option<usize>> = OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("VICTORY_METAL_MIN_MB")
-            .ok()
-            .and_then(|s| crate::alias_plan::parse_mib(&s))
+    *MIN.get_or_init(|| match std::env::var("VICTORY_METAL_MIN_MB") {
+        Ok(s) => crate::alias_plan::parse_mib(&s),
+        // Default 32 MiB floor: targets large hot heaps (174 MiB constants heap)
+        // without wiring tiny scratch allocations on 24 GB unified memory Macs.
+        Err(_) => Some(32 << 20),
     })
 }
 
 #[cfg(windows)]
 fn budget_bytes() -> Option<usize> {
     static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("VICTORY_METAL_BUDGET_MB")
-            .ok()
-            .and_then(|s| crate::alias_plan::parse_mib(&s))
+    *BUDGET.get_or_init(|| match std::env::var("VICTORY_METAL_BUDGET_MB") {
+        Ok(s) => crate::alias_plan::parse_mib(&s),
+        // Default 1 GiB wired residency cap for safe 24 GB operation.
+        Err(_) => Some(1024 << 20),
     })
 }
 

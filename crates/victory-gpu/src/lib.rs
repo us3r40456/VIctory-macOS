@@ -31,6 +31,7 @@ mod alias;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod alias_plan;
+pub mod backend;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod batch;
