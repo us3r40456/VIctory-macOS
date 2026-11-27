@@ -206,6 +206,11 @@ static LOST: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Peak recorded command notes in a single closed `HostList` since the last
+/// diagnostics report (checks whether lists exceed `STAMPS - 1`).
+#[cfg(feature = "diagnostics")]
+static MAX_NOTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Lanes that gave up waiting for a 64-bit atomic's lock, over the run
 /// (`crate::shadow::take_gave_up`).
 static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2967,14 +2972,17 @@ impl HostList {
         self.clamp_done();
         self.textures_back();
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
-            let count =
-                (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list
-                    .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+        {
+            let note_len = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            MAX_NOTES.fetch_max(note_len as u64, Ordering::Relaxed);
+            if let Some((heap, back)) = self.stamps() {
+                let count = (note_len as u32).min(STAMPS - 1);
+                // SAFETY: an open list, our heap and read-back buffer.
+                unsafe {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                    self.list
+                        .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                }
             }
         }
         self.widen_close();
@@ -5375,7 +5383,9 @@ pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+/// Triple-buffered flip-discard swap chain so the compositor can hold a
+/// presented drawable without stalling the submitting thread on the next copy.
+const BUFFERS: u32 = 3;
 
 #[derive(Default)]
 struct Presentation {
@@ -5536,6 +5546,8 @@ impl Meter {
             let [for_dispatches, dispatches_hoisted, dispatches_batched] =
                 crate::indirect::take_for_dispatches().map(|n| n as f64 / report_frames);
             let dispatch_hoists = crate::list::take_dispatch_hoists() as f64 / report_frames;
+            let submissions_lost = LOST[0].load(Ordering::Relaxed);
+            let queues_replaced = LOST[1].load(Ordering::Relaxed);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5547,7 +5559,8 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{metal_fg}{guards}",
+                 batched){zero_copy}{metal_fg}{guards}; submissions lost {submissions_lost}, \
+                 queues replaced {queues_replaced}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);
@@ -5621,6 +5634,13 @@ impl Meter {
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_lookups(report_frames);
+                let max_notes = MAX_NOTES.swap(0, Ordering::Relaxed);
+                if max_notes > 0 {
+                    tracing::info!(
+                        "max list notes: {max_notes} (STAMPS={STAMPS}, truncated={})",
+                        max_notes >= STAMPS as u64
+                    );
+                }
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(

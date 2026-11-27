@@ -2101,7 +2101,7 @@ pub(crate) fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
 }
 
 /// Number of sets in the per-thread 2-way lookup cache (power of two).
-const LOOKUP_SETS: usize = 2048;
+const LOOKUP_SETS: usize = 16384;
 
 #[derive(Default)]
 struct LookupSlot {
