@@ -5584,7 +5584,9 @@ impl Meter {
             let metal_fg = crate::metal::present::frame_line(report_frames);
             // mac: the guard lock's waits and the protection calls, always.
             let guards = crate::watch::frame_line(report_frames);
-            let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            let (failed, held) = crate::draw::take_dropped();
+            let dropped = (failed + held) as f64 / report_frames;
+            let held_bvh = held as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
@@ -5603,7 +5605,7 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 dropped {dropped:.0} direct commands (including {held_bvh:.1} held BVH dispatches, {making} pipelines being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count), {clamps:.0} clamp \
                  dispatches/frame ({hoisted:.0} clamps in the list before their draw's, \
@@ -5712,7 +5714,7 @@ impl Meter {
                 }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        "dropped {:.1}/frame: {why}",
                         *n as f64 / report_frames
                     );
                 }
@@ -5913,6 +5915,8 @@ impl Host {
                 width,
                 height,
                 format,
+                #[cfg(feature = "diagnostics")]
+                frame,
             );
             extra_frames = outcome.extra_frames;
             if outcome.handled_present {

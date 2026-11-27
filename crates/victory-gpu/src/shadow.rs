@@ -1841,11 +1841,16 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         // runs at a time).
         let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
         // Marks of offsets past the bitmap land in its last bit, no copy's.
-        bits[words - 1] = 0;
+        if bits[words - 1] != 0 {
+            bits[words - 1] = 0;
+        }
         let used = (scan_bits as usize).div_ceil(32).min(words);
+        let into = if memory && memory_withheld { &mut held } else { &mut marked };
         for (w, word) in bits[..used].iter_mut().enumerate() {
+            if *word == 0 {
+                continue;
+            }
             let mut x = std::mem::take(word);
-            let into = if memory && memory_withheld { &mut held } else { &mut marked };
             while x != 0 {
                 into.push((w * 32) as u32 + x.trailing_zeros());
                 x &= x - 1;

@@ -221,6 +221,7 @@ impl MetalPresenter {
         out_width: u32,
         out_height: u32,
         swap_format: DXGI_FORMAT,
+        #[cfg(feature = "diagnostics")] frame: u64,
     ) -> PresentOutcome {
         let none = PresentOutcome {
             handled_present: false,
@@ -367,6 +368,12 @@ impl MetalPresenter {
         let Some(rb_c) = &self.rb_color else {
             return none;
         };
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::wanted(frame) {
+            // SAFETY: execute waited for the copy into this mapped readback buffer.
+            let rows = unsafe { std::slice::from_raw_parts(rb_c.ptr, c_bytes) };
+            crate::capture::save_metal_input(frame, cw, ch, color.2, c_pitch as usize, rows);
+        }
         if !b.upload_texture_from_ptr(c_handle, rb_c.ptr, c_pitch, cw, ch) {
             return none;
         }

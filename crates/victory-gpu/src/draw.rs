@@ -177,12 +177,12 @@ pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
-pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+/// Direct commands that failed and direct BVH builder dispatches held by policy.
+pub(crate) fn take_dropped() -> (u64, u64) {
+    (DROPPED.swap(0, Ordering::Relaxed), BVH_HELD.swap(0, Ordering::Relaxed))
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static BVH_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
@@ -1293,7 +1293,8 @@ impl State {
         // (`pipeline::builder`).
         if crate::pipeline::held_back(self.pipeline as This) {
             once!("a dispatch of the BVH builder held back");
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            BVH_HELD.fetch_add(1, Ordering::Relaxed);
+            not_run("BVH builder held back");
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;

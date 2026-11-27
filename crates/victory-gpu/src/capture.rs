@@ -195,6 +195,25 @@ pub(crate) fn read_back(
     }
 }
 
+fn bgra_order(format: DXGI_FORMAT) -> Option<bool> {
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some(false),
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(true),
+        _ => None,
+    }
+}
+
+/// Saves the real scene plane before MetalFX interpolation and UI composition.
+pub(crate) fn save_metal_input(
+    frame: u64, width: u32, height: u32, format: DXGI_FORMAT, pitch: usize, rows: &[u8],
+) {
+    if let Some(bgra) = bgra_order(format) {
+        save_as(&format!("frame-{frame}-metal-input"), width, height, pitch, bgra, rows);
+    } else {
+        tracing::warn!(format = format.0, "Metal input not saved: not 8-bit color");
+    }
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
 pub(crate) fn save_read_back(
     frame: u64,
@@ -202,13 +221,9 @@ pub(crate) fn save_read_back(
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
     let f = footprint.Footprint;
-    let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
-        other => {
-            tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
-            return;
-        }
+    let Some(bgra) = bgra_order(f.Format) else {
+        tracing::warn!(format = f.Format.0, "frame not saved: not 8-bit color");
+        return;
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the

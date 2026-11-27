@@ -961,7 +961,8 @@ fn list_calls() {
 
     let ran = crate::draw::drawn() - drawn;
     let ran_dispatches = crate::draw::dispatched() - dispatched;
-    let dropped = crate::draw::take_dropped();
+    let (failed, held) = crate::draw::take_dropped();
+    let dropped = failed + held;
     let mut all = Times::default();
     for (t, _, _) in &results {
         all.add(t);

@@ -509,12 +509,15 @@ fn ignore_unmapped_null_page() -> bool {
 /// Logs what title memory did since the last call, if anything: a line per
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
-    FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let retake_started = profile_on().then(std::time::Instant::now);
     retake_dropped();
     if let Some(started) = retake_started {
         tracing::info!(us = started.elapsed().as_micros() as u64, "end-of-frame title memory retake");
         crate::shadow::log_copy_sources();
+        if frame.is_multiple_of(32) {
+            log_large_shadow_owners();
+        }
     }
     let s = stats(std::mem::take);
     if s.uses.is_empty()
@@ -875,6 +878,60 @@ fn layout(key: usize) -> Arc<Layout> {
         .unwrap_or_default()
 }
 
+/// Named entries for the 64 KiB pages touched by a nonempty title range.
+fn owners_in<'a>(
+    start: u64,
+    len: u64,
+    directory: &'a [u32],
+    owners: &'a [Option<usize>],
+) -> impl Iterator<Item = usize> + 'a {
+    let first = start >> 16;
+    let end = start.saturating_add(len).div_ceil(1 << 16).min(1 << 24);
+    (first..end).filter_map(move |page| {
+        let block = directory[(page as usize) / BLOCK] as usize;
+        owners[block * BLOCK + page as usize % BLOCK]
+    })
+}
+
+/// Samples the final table entries for large copies, where refreshing an entire
+/// shadow may bring up to date pages actually served by other resources.
+fn log_large_shadow_owners() {
+    let mut rows = Vec::new();
+    for (heap, table) in shared().iter() {
+        let layout = &table.layout;
+        for (copy, _) in &layout.tracked {
+            let (start, len) = copy.range();
+            if len < 4 << 20 {
+                continue;
+            }
+            let mut owned_pages = 0usize;
+            let mut alias_pages = 0usize;
+            let mut other_copy_pages = 0usize;
+            for index in owners_in(start, len, &table.l1_table[..], &layout.owner) {
+                let owner = &layout.copies[index];
+                if Arc::ptr_eq(owner, copy) {
+                    owned_pages += 1;
+                } else if owner.is_aliased() {
+                    alias_pages += 1;
+                } else {
+                    other_copy_pages += 1;
+                }
+            }
+            rows.push((*heap, start, len, owned_pages, alias_pages, other_copy_pages));
+        }
+    }
+    for (heap, start, len, owned_pages, alias_pages, other_copy_pages) in rows {
+        tracing::info!(
+            heap = format_args!("{heap:#x}"),
+            shadow = format_args!("{start:#x}"),
+            shadow_bytes = len,
+            pages_64k = ((start & 0xffff) + len).div_ceil(1 << 16),
+            owned_pages, alias_pages, other_copy_pages,
+            "large shadow page ownership"
+        );
+    }
+}
+
 /// Calls `add` for every copy in `l` that may need a CPU→GPU refresh:
 /// non-aliased copies whose dirty bit is not clean, plus only the active
 /// aliased widened 3-channel RGB32 views (normal aliased copies are zero-copy).
@@ -1070,6 +1127,25 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 mod tests {
     use super::*;
     use victory_formats::pagetable::table;
+
+    #[test]
+    fn ownership_sample_uses_final_entries_across_block_boundaries() {
+        // A seven-page copy crosses a 256 MiB boundary. Two smaller copies
+        // replace three of its pages in the final table.
+        let page = 1u64 << 16;
+        let boundary = 1u64 << 28;
+        let ranges = [(boundary - 3 * page, 7 * page), (boundary - page, page), (boundary, 2 * page)];
+        let mut scratch = pagetable::Scratch::default();
+        let mut out = pagetable::Outputs::default();
+        let built = scratch.build(&ranges, &[2, 4, 6], 0, &mut out);
+        let owners = |start, len| {
+            owners_in(start, len, &built.dwords[..LEVEL1], built.owners).collect::<Vec<_>>()
+        };
+        assert_eq!(owners(boundary - 3 * page - 1, 7 * page + 2), [0, 0, 1, 2, 2, 0, 0]);
+        assert_eq!(owners(boundary - 1, 2), [1, 2]);
+        assert!(owners(3 * boundary, page).is_empty());
+        assert!(owners(1 << 40, page).is_empty());
+    }
 
     #[test]
     fn memory_stats_follow_the_frame_report_filter() {
