@@ -1,19 +1,31 @@
-//! Draws a presented overlay plane over the picture plane (#15).
+//! Draws a presented overlay plane over the picture plane (#15, #21).
 //!
-//! The title can present a scene and a UI plane at different resolutions.
-//! VIctory blends the other plane over the selected picture when
-//! `VICTORY_PRESENT_COMPOSITE=1`. The overlay uses straight alpha and
-//! nearest-texel sampling in picture coordinates. `VICTORY_PRESENT_MAX`
-//! fits the final picture into the requested size, with or without an overlay.
+//! On the Series S profile the title presents two planes: plane 0, the
+//! 1920x1080 scene, and plane 1, a 3840x2160 interface layer that is
+//! transparent where the scene shows. The console's display hardware
+//! blends the upper plane over the lower one. Here a compute pass does it
+//! into a texture of the picture's size, which is then copied to the swap
+//! chain: `picture * (1 - alpha) + overlay * alpha`, the overlay scaled to
+//! the picture by its nearest texel (`VICTORY_PRESENT_MAX` fits the final
+//! picture into the requested size).
+//!
+//! The pass runs whenever two planes are presented (`queue::pick_planes`);
+//! `VICTORY_PRESENT_COMPOSITE=0` turns it off and `=1` forces compositing
+//! even when `VICTORY_PRESENT_PLANE=1`.
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{Result, s};
 
-/// Whether `VICTORY_PRESENT_COMPOSITE=1` asks for the pass.
-pub(crate) fn wanted() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PRESENT_COMPOSITE").is_ok_and(|v| v == "1"))
+/// `VICTORY_PRESENT_COMPOSITE`: `Some(true)` for `1`, `Some(false)` for
+/// `0`, `None` (the default choice) when unset or anything else.
+pub(crate) fn forced() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_PRESENT_COMPOSITE").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
 }
 
 /// Fit the final presentation texture inside a requested host size, keeping

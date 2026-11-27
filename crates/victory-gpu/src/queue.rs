@@ -581,8 +581,8 @@ fn plane_resources(planes: u32, plane: *const Plane) -> Vec<Vec<This>> {
 }
 
 /// Logs what the title presents whenever it changes: each plane's
-/// resources as (width, height, host format) (#15: the first plane held a
-/// black 1920x1080 texture while a larger render target held the picture).
+/// resources as (width, height, host format) (#15, #21: on Series S the
+/// first plane is the 1920x1080 scene, the second the larger interface).
 #[cfg(windows)]
 fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
     use std::sync::Mutex;
@@ -620,49 +620,51 @@ fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
     }
 }
 
-/// The plane whose first resource is shown: `VICTORY_PRESENT_PLANE=<n>`
-/// (counted from 0) when that plane was found, else the plane whose first
-/// resource has the most pixels (#15: on Series S plane 0 is a 1920x1080
-/// overlay and plane 1 the 3840x2160 picture). Ties keep the earlier plane.
+/// What a present shows: the plane whose first resource is the picture,
+/// and the plane, if any, whose first resource is blended over it.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shown {
+    plane: usize,
+    overlay: Option<usize>,
+}
+
+/// What this present shows, from the planes found and the overrides
+/// `VICTORY_PRESENT_PLANE=<n>` and `VICTORY_PRESENT_COMPOSITE=0|1`.
 #[cfg(windows)]
-fn shown_plane(found: &[Vec<This>]) -> usize {
+fn shown_planes(found: &[Vec<This>]) -> Shown {
     static PLANE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let want = *PLANE.get_or_init(|| {
         std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok())
     });
-    let areas: Vec<u64> = found
-        .iter()
-        .map(|plane| {
-            plane.first().and_then(|&r| crate::resource::host_resource(r)).map_or(0, |t| {
-                // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                d.Width * u64::from(d.Height)
-            })
-        })
-        .collect();
-    pick_plane(want, &areas)
+    pick_planes(want, crate::composite::forced(), found.len())
 }
 
-/// The plane to show given an override and each plane's first resource
-/// area (0 when unknown): the override when in range, else the largest.
+/// What to show of `planes` planes. The title lists its planes from the
+/// bottom up: plane 0 is the picture and a second plane is an overlay
+/// drawn over it, at whatever size it has (#21: on Series S plane 0 is the
+/// 1920x1080 scene and plane 1 the 3840x2160 interface, mostly
+/// transparent). So plane 0 is shown, with plane 1 blended over it when
+/// there are exactly two; one plane (Series X) is shown as it is.
+///
+/// `want` (`VICTORY_PRESENT_PLANE`) shows another plane when in range.
+/// `composite` (`VICTORY_PRESENT_COMPOSITE`) forces the blend on (the
+/// other of two planes over the shown one) or off; left unset, only plane
+/// 0 of two gets plane 1 over it.
 #[cfg(any(windows, test))]
-fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
-    if let Some(w) = want
-        && w < areas.len()
-    {
-        return w;
-    }
-    let mut best = 0;
-    for (i, &a) in areas.iter().enumerate() {
-        if a > areas.get(best).copied().unwrap_or(0) {
-            best = i;
-        }
-    }
-    best
+fn pick_planes(want: Option<usize>, composite: Option<bool>, planes: usize) -> Shown {
+    let plane = want.filter(|&w| w < planes).unwrap_or(0);
+    let two = planes == 2;
+    let overlay = match composite {
+        Some(false) => None,
+        Some(true) => two.then_some(1 - plane),
+        None => (two && plane == 0).then_some(1),
+    };
+    Shown { plane, overlay }
 }
 
-/// Shows the first resource of one plane in our window (the largest
-/// plane unless `VICTORY_PRESENT_PLANE` picks another).
+/// Shows the first resource of one plane in our window, with another
+/// plane's blended over it when the title presents two (`pick_planes`).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -729,7 +731,10 @@ extern "system" fn present(
     #[cfg(windows)]
     let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
-    let shown = shown_plane(&found);
+    let Shown {
+        plane: shown,
+        overlay: overlay_plane,
+    } = shown_planes(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -746,12 +751,10 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        // The other plane's first resource, blended over the picture when
-        // `VICTORY_PRESENT_COMPOSITE=1` (#15: a 1080p overlay on Series S).
-        let other = (found.len() == 2)
-            .then(|| found[1 - shown].first().copied())
-            .flatten()
-            .filter(|&o| o != resource && crate::composite::wanted())
+        // The overlay plane's first resource, blended over the picture.
+        let other = overlay_plane
+            .and_then(|o| found.get(o)?.first().copied())
+            .filter(|&o| o != resource)
             .and_then(|o| Some((o, crate::resource::host_resource(o)?)));
         let overlay_state = other.as_ref().map(|(o, _)| {
             crate::resource::host_transition(*o, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
@@ -977,23 +980,31 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
-    /// Which plane gets shown: the one `VICTORY_PRESENT_PLANE` names when
-    /// it names one, else the plane whose first resource has the most
-    /// pixels. It only weighs the areas it is handed, so it runs on every
-    /// host.
+    /// What gets shown. It only weighs the plane count and the overrides,
+    /// so it runs on every host.
     #[test]
-    fn the_largest_plane_is_shown_unless_one_is_named() {
-        // Series S: a 1080p overlay, then the 4K picture.
-        let series_s = [1920 * 1080, 3840 * 2160];
-        assert_eq!(pick_plane(None, &series_s), 1);
-        assert_eq!(pick_plane(Some(0), &series_s), 0);
-        // An override past the planes found falls back to the largest.
-        assert_eq!(pick_plane(Some(5), &series_s), 1);
-        // Series X: one plane. Ties and unknown sizes keep the first.
-        assert_eq!(pick_plane(None, &[3840 * 2160]), 0);
-        assert_eq!(pick_plane(None, &[0, 0]), 0);
-        assert_eq!(pick_plane(None, &[100, 100]), 0);
-        assert_eq!(pick_plane(None, &[]), 0);
+    fn plane_zero_is_shown_with_a_second_plane_over_it() {
+        let shown = |plane, overlay| Shown { plane, overlay };
+        // Series X: one plane, shown alone whatever is asked.
+        for composite in [None, Some(false), Some(true)] {
+            assert_eq!(pick_planes(None, composite, 1), shown(0, None));
+            assert_eq!(pick_planes(Some(1), composite, 1), shown(0, None));
+        }
+        // Series S: the scene, then the interface over it.
+        assert_eq!(pick_planes(None, None, 2), shown(0, Some(1)));
+        assert_eq!(pick_planes(Some(0), None, 2), shown(0, Some(1)));
+        assert_eq!(pick_planes(None, Some(false), 2), shown(0, None));
+        assert_eq!(pick_planes(None, Some(true), 2), shown(0, Some(1)));
+        // Another plane named: alone unless the blend is asked for.
+        assert_eq!(pick_planes(Some(1), None, 2), shown(1, None));
+        assert_eq!(pick_planes(Some(1), Some(true), 2), shown(1, Some(0)));
+        assert_eq!(pick_planes(Some(1), Some(false), 2), shown(1, None));
+        // A plane past those found falls back to plane 0.
+        assert_eq!(pick_planes(Some(5), None, 2), shown(0, Some(1)));
+        // Other counts: plane 0 alone (one overlay at most is blended).
+        assert_eq!(pick_planes(None, None, 3), shown(0, None));
+        assert_eq!(pick_planes(None, Some(true), 3), shown(0, None));
+        assert_eq!(pick_planes(None, None, 0), shown(0, None));
     }
 
     /// Two planes 64 bytes apart (as a longer plane description would
