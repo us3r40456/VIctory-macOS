@@ -180,14 +180,29 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null() && aliasing {
+    if !at.is_null() {
         let eligible = kind & MEM_COMMIT != 0
             && kind & MEM_RESERVE_PLACEHOLDER == 0
             && protect == PAGE_READWRITE
             && (at as usize).is_multiple_of(PAGE)
             && size >= PAGE
             && size.is_multiple_of(PAGE);
-        victory_gpu::alias_committed(at as usize, size, base.is_null(), eligible, before.as_deref());
+        if aliasing {
+            victory_gpu::alias_committed(
+                at as usize,
+                size,
+                base.is_null(),
+                eligible,
+                before.as_deref(),
+            );
+        }
+        if eligible && victory_gpu::metal::enabled() {
+            victory_gpu::metal::note_committed(
+                at as usize,
+                size,
+                victory_gpu::metal::registry::BackingKey::VirtualAlloc(at as usize as u64),
+            );
+        }
     }
     if base.is_null() {
         tracing::debug!(
@@ -415,7 +430,20 @@ impl Section {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let at = *self.whole.get_or_init(|| {
             // SAFETY: our section; the view is ours until the section drops.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.size) }.Value as usize
+            let mapped =
+                unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.size) }.Value
+                    as usize;
+            if mapped != 0 && victory_gpu::metal::enabled() {
+                victory_gpu::metal::note_committed(
+                    mapped,
+                    self.size,
+                    victory_gpu::metal::registry::BackingKey::PhysicalSection {
+                        section_id: self.handle as usize as u64,
+                        offset: 0,
+                    },
+                );
+            }
+            mapped
         });
         (at != 0).then_some(at)
     }
@@ -427,6 +455,7 @@ impl Drop for Section {
         if let Some(&at) = self.whole.get()
             && at != 0
         {
+            victory_gpu::metal::note_released(at);
             // SAFETY: our view of the section; nothing borrows it any more
             // (views of it hold the section).
             unsafe {

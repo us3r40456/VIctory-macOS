@@ -36,6 +36,24 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # A new prefix would wait on hidden Mono and Gecko install prompts, and the
 # tests need neither. Wine's crash dialog is turned off for the same reason.
 export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+wine_root="$(cd "$(dirname "$WINE")/.." && pwd)"
+metal_dir="$ROOT/target/victory-metal-unixlib"
+if [ -f "$wine_root/include/wine/unixlib.h" ] && [ -x "$wine_root/bin/winegcc" ]; then
+    if [ ! -f "$metal_dir/x86_64-windows/victory_metal.dll" ] \
+        || [ ! -f "$metal_dir/x86_64-unix/victory_metal.so" ] \
+        || [ tools/macos/victory-metal-unixlib.sh -nt "$metal_dir/x86_64-unix/victory_metal.so" ]; then
+        sh tools/macos/victory-metal-unixlib.sh "$metal_dir" "$wine_root" >/dev/null || true
+    fi
+    if [ -f "$metal_dir/x86_64-windows/victory_metal.dll" ]; then
+        export WINEDLLPATH="$metal_dir${WINEDLLPATH:+:$WINEDLLPATH}"
+        VICTORY_METAL_DLL="Z:$(printf '%s' "$metal_dir" | tr / '\\')\\x86_64-windows\\victory_metal.dll"
+        export VICTORY_METAL_DLL
+    fi
+fi
+metal_ir="$wine_root/lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib"
+if [ -z "${VICTORY_METAL_IR_LIB:-}" ] && [ -f "$metal_ir" ]; then
+    export VICTORY_METAL_IR_LIB="$metal_ir"
+fi
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
 cargo build --quiet --manifest-path tests/fixtures/hle-probe/Cargo.toml \
     --target-dir target/fixtures --target "$TARGET"

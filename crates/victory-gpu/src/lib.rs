@@ -75,6 +75,7 @@ pub mod list;
 mod list_bench;
 #[cfg(windows)]
 mod memory;
+pub mod metal;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

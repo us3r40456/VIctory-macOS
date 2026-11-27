@@ -39,6 +39,26 @@ if [ -z "${VICTORY_HELPER_DXC:-}" ] && [ -f "$DXC_LIB" ]; then
         export DXC_LIB VICTORY_HELPER_DXC="$helper"
     fi
 fi
+# Build the Route A.5 Metal unixlib bridge when Wine headers are present so
+# WINEDLLPATH exposes victory_metal.dll + victory_metal.so with no Wine rebuild.
+wine_root="$(cd "$(dirname "$WINE")/.." && pwd)"
+metal_dir="$ROOT/target/victory-metal-unixlib"
+if [ -f "$wine_root/include/wine/unixlib.h" ] && [ -x "$wine_root/bin/winegcc" ]; then
+    if [ ! -f "$metal_dir/x86_64-windows/victory_metal.dll" ] \
+        || [ ! -f "$metal_dir/x86_64-unix/victory_metal.so" ] \
+        || [ tools/macos/victory-metal-unixlib.sh -nt "$metal_dir/x86_64-unix/victory_metal.so" ]; then
+        sh tools/macos/victory-metal-unixlib.sh "$metal_dir" "$wine_root" >/dev/null || true
+    fi
+    if [ -f "$metal_dir/x86_64-windows/victory_metal.dll" ]; then
+        export WINEDLLPATH="$metal_dir${WINEDLLPATH:+:$WINEDLLPATH}"
+        VICTORY_METAL_DLL="Z:$(printf '%s' "$metal_dir" | tr / '\\')\\x86_64-windows\\victory_metal.dll"
+        export VICTORY_METAL_DLL
+    fi
+fi
+metal_ir="$wine_root/lib/external/D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib"
+if [ -z "${VICTORY_METAL_IR_LIB:-}" ] && [ -f "$metal_ir" ]; then
+    export VICTORY_METAL_IR_LIB="$metal_ir"
+fi
 if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ]; then
     cargo build --quiet --release -p victory --features diagnostics --target "$TARGET"
 else
