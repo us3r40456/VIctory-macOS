@@ -5103,6 +5103,15 @@ impl Meter {
                     );
                 }
                 crate::shadow::log_held();
+                let [entries, free, bytes, constants, placed, shapes, named_constants, named_placed] =
+                    crate::descriptor::views_kept();
+                tracing::info!(
+                    "views table: {entries} entries ({free} free), {:.0} MB with its index and shapes; \
+                     entries that are constant buffer views {constants}, views of placed memory {placed}; \
+                     shapes of placed views {shapes}; named whole in their records since the start \
+                     (VICTORY_VIEW_INLINE): constant buffer views {named_constants}, views of placed memory {named_placed}",
+                    bytes as f64 / 1e6,
+                );
                 let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));
                 tracing::info!(
                     "host texture MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
@@ -5192,7 +5201,7 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on), with `overlay` (a
     /// texture and its host state, which it keeps) blended over it when
-    /// `VICTORY_PRESENT_COMPOSITE=1`. `None` if nothing was shown; else, in
+    /// given. `None` if nothing was shown; else, in
     /// diagnostics builds, whether the frame was black.
     pub(crate) fn present(
         &self,
@@ -5208,7 +5217,7 @@ impl Host {
             return None;
         };
         // The overlay with its view format, when it is to be blended in.
-        let overlay = overlay.filter(|_| crate::composite::wanted()).and_then(|(o, s)| {
+        let overlay = overlay.and_then(|(o, s)| {
             // SAFETY: a live resource.
             let f = swap_format(unsafe { o.GetDesc() }.Format)?;
             Some((o, s, f))

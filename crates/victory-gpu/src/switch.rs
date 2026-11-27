@@ -15,6 +15,11 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether the environment variable `name` explicitly switches something off (`=0`).
+pub(crate) fn off(name: &str) -> bool {
+    std::env::var_os(name).as_deref() == Some(OsStr::new("0"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::value_is_on;
