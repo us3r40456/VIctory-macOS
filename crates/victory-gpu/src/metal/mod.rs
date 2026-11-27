@@ -446,15 +446,13 @@ pub(crate) struct WaitFenceArgs {
     pub status: i32,
 }
 
-/// Whether `VICTORY_METAL_ARCHIVE=1` (or `VICTORY_BACKEND=metal`) asks to
-/// maintain a persistent Apple `MTLBinaryArchive` alongside the pipeline cache.
+/// Whether `VICTORY_METAL_ARCHIVE=1` explicitly requests maintaining a
+/// persistent Apple `MTLBinaryArchive` alongside the pipeline cache
+/// (recommended during offline `translate --cache --pipelines`, off during
+/// live play so shader compilation never adds overhead to loading threads).
 pub fn metal_archive_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        crate::switch::on("VICTORY_METAL_ARCHIVE")
-            || std::env::var("VICTORY_BACKEND")
-                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("metal"))
-    })
+    *ON.get_or_init(|| crate::switch::on("VICTORY_METAL_ARCHIVE"))
 }
 
 /// Whether zero-copy `MTLResidencySet` registration of large title heaps is
@@ -482,15 +480,13 @@ pub fn present_enabled() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_METAL_PRESENT"))
 }
 
-/// Whether `VICTORY_UPSCALER=metalfx` or `VICTORY_METAL_FX=1` requests serving
-/// the title's FidelityFX upscaler directly via Apple `MTLFXTemporalScaler`.
+/// Whether `VICTORY_METAL_FX=1` requests serving the title's FidelityFX
+/// upscaler directly via Apple `MTLFXTemporalScaler`.
+/// (Deliberately separate from `VICTORY_UPSCALER`, which selects the title's
+/// console upscaler profile 6 vs 7.)
 pub fn metalfx_upscaler_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        crate::switch::on("VICTORY_METAL_FX")
-            || std::env::var("VICTORY_UPSCALER")
-                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("metalfx"))
-    })
+    *ON.get_or_init(|| crate::switch::on("VICTORY_METAL_FX"))
 }
 
 #[cfg(windows)]

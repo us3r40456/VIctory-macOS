@@ -4984,6 +4984,8 @@ impl FrameWindow {
 /// every few seconds.
 struct Meter {
     frames: u64,
+    interp_frames: u64,
+    caption_interp: u64,
     caption_window: FrameWindow,
     report_window: FrameWindow,
     /// The caption the window had, once read.
@@ -4999,6 +5001,8 @@ impl Meter {
         };
         Meter {
             frames: 0,
+            interp_frames: 0,
+            caption_interp: 0,
             caption_window: start,
             report_window: start,
             caption: None,
@@ -5006,10 +5010,11 @@ impl Meter {
     }
 
     /// Counts a presented frame (plus any extra MetalFX interpolated frames).
-    fn frame(&mut self, hwnd: HWND, extra_frames: u64) {
+    fn frame(&mut self, hwnd: HWND, extra_frames: u64, native_metal: bool) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1 + extra_frames;
+        self.interp_frames += extra_frames;
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
@@ -5021,6 +5026,8 @@ impl Meter {
         let Some(caption_rates) = self.caption_window.sample(next, Duration::from_secs(1)) else {
             return;
         };
+        let cap_interp = self.interp_frames.saturating_sub(self.caption_interp);
+        self.caption_interp = self.interp_frames;
         if let Some(report) = self.report_window.sample(next, Duration::from_secs(5)) {
             let FrameRates { frames: report_frames, fps, ms, draws } = report;
             let [cpu, gpu] = SUBMISSION_US.each_ref().map(|counter| {
@@ -5171,8 +5178,17 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let FrameRates { fps, ms, draws, .. } = caption_rates;
-        let text = format!("{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let FrameRates { frames: cap_frames, fps, ms, draws } = caption_rates;
+        let text = if cap_interp > 0 {
+            let real_share = ((cap_frames - cap_interp as f64).max(0.0) / cap_frames.max(1.0)).clamp(0.0, 1.0);
+            let real_fps = fps * real_share;
+            let tag = if native_metal { "MetalFX FG+CAMetalLayer" } else { "MetalFX FG" };
+            format!("{fps:.0} fps ({real_fps:.0} real + {tag}) {ms:.1} ms/frame {draws:.0} draws/frame")
+        } else if native_metal {
+            format!("{fps:.0} fps (CAMetalLayer) {ms:.1} ms/frame {draws:.0} draws/frame")
+        } else {
+            format!("{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame")
+        };
         let mut text: Vec<u16> = crate::caption::with_stats(caption, &text);
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -5337,19 +5353,21 @@ impl Host {
         let mut extra_frames = 0u64;
         if let Some(metal) = p.metal.as_mut() {
             let ui_arg = overlay.map(|(o, s, f)| (o, D3D12_RESOURCE_STATES(s as i32), f));
+            let blend_arg = blended.as_ref().map(|(c, r)| (*c, r));
             let outcome = metal.run(
                 self,
                 &p.copy,
                 &p.swap_chain,
                 (texture, state, picture_format),
                 ui_arg,
+                blend_arg,
                 width,
                 height,
                 format,
             );
             extra_frames = outcome.extra_frames;
             if outcome.handled_present {
-                p.meter.frame(p.hwnd, extra_frames);
+                p.meter.frame(p.hwnd, extra_frames, true);
                 return Some(false);
             }
         }
@@ -5416,7 +5434,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd, extra_frames);
+            p.meter.frame(p.hwnd, extra_frames, false);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]

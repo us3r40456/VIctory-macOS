@@ -1889,6 +1889,12 @@ static NTSTATUS op_surface_present(void *raw) {
 
     @autoreleasepool {
         uint64_t t0 = now_ns();
+        // Update drawableSize cleanly in-place if the texture resolution changed
+        // (avoids destroying/recreating the NSView while drawables are in flight).
+        CGSize want = CGSizeMake(color.width, color.height);
+        if (layer.drawableSize.width != want.width || layer.drawableSize.height != want.height) {
+            layer.drawableSize = want;
+        }
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (!drawable || !drawable.texture) {
             a->status = -4;
@@ -1908,12 +1914,10 @@ static NTSTATUS op_surface_present(void *raw) {
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
 
-        if (a->after_min_duration_ns > 0) {
-            double sec = (double)a->after_min_duration_ns * 1e-9;
-            [cb presentDrawable:drawable afterMinimumDuration:sec];
-        } else {
-            [cb presentDrawable:drawable];
-        }
+        // Present directly without afterMinimumDuration so the 3-drawable pool
+        // never stalls during fast loading screens or mode transitions.
+        (void)a->after_min_duration_ns;
+        [cb presentDrawable:drawable];
         [cb commit];
         if ((a->flags & 1u) != 0) {
             [cb waitUntilCompleted];
@@ -2121,15 +2125,29 @@ static NTSTATUS op_pipeline_create_compute(void *raw) {
     auto *a = static_cast<vm_pipeline_compute_args *>(raw);
     if (!a || a->bytes_ptr == 0 || a->bytes_len == 0) return VM_STATUS_INVALID_PARAM;
     auto &s = state();
-    std::lock_guard<std::mutex> lock(s.mu);
-    if (!s.init_locked()) {
-        a->status = -1;
-        return VM_STATUS_UNSUCCESSFUL;
+    id<MTLDevice> dev = nil;
+    id<MTLBinaryArchive> arch = nil;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (!s.init_locked()) {
+            a->status = -1;
+            return VM_STATUS_UNSUCCESSFUL;
+        }
+        dev = s.device;
+        if (a->archive_handle != 0) {
+            auto ait = s.archives.find(a->archive_handle);
+            if (ait != s.archives.end()) arch = ait->second.archive;
+        }
     }
+    // Compile DXIL -> MetalLib and PSO OUTSIDE s.mu so presentation and
+    // frame interpolation never stall behind background shader compilation.
+    id<MTLComputePipelineState> pso = nil;
+    uint32_t max_tg = 0;
+    uint32_t simd_w = 0;
     @autoreleasepool {
         const char *entry = a->entry_ptr ? reinterpret_cast<const char *>(a->entry_ptr) : "main";
         id<MTLLibrary> lib = compile_library(
-            s.device,
+            dev,
             reinterpret_cast<const uint8_t *>(a->bytes_ptr),
             (size_t)a->bytes_len,
             entry,
@@ -2150,36 +2168,36 @@ static NTSTATUS op_pipeline_create_compute(void *raw) {
         }
         MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
         desc.computeFunction = fn;
-        id<MTLBinaryArchive> arch = nil;
-        if (a->archive_handle != 0) {
-            auto ait = s.archives.find(a->archive_handle);
-            if (ait != s.archives.end()) {
-                arch = ait->second.archive;
-                desc.binaryArchives = @[arch];
-            }
+        if (arch) {
+            desc.binaryArchives = @[arch];
         }
         NSError *err = nil;
-        id<MTLComputePipelineState> pso =
-            [s.device newComputePipelineStateWithDescriptor:desc
-                                                    options:MTLPipelineOptionNone
-                                                 reflection:nil
-                                                      error:&err];
+        pso = [dev newComputePipelineStateWithDescriptor:desc
+                                                 options:MTLPipelineOptionNone
+                                              reflection:nil
+                                                   error:&err];
         if (!pso) {
             a->status = -4;
             return VM_STATUS_SUCCESS;
         }
         if (arch) {
+            std::lock_guard<std::mutex> lock(s.mu);
             NSError *aerr = nil;
             [arch addComputePipelineFunctionsWithDescriptor:desc error:&aerr];
         }
+        max_tg = (uint32_t)pso.maxTotalThreadsPerThreadgroup;
+        simd_w = (uint32_t)pso.threadExecutionWidth;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
         uint64_t h = s.next_handle++;
         ComputePsoEntry e;
         e.handle = h;
         e.pso = pso;
         s.compute_psos.emplace(h, e);
         a->handle = h;
-        a->max_threads_per_tg = (uint32_t)pso.maxTotalThreadsPerThreadgroup;
-        a->simd_width = (uint32_t)pso.threadExecutionWidth;
+        a->max_threads_per_tg = max_tg;
+        a->simd_width = simd_w;
         a->status = 0;
     }
     return VM_STATUS_SUCCESS;
