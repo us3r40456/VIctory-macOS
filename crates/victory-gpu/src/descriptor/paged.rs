@@ -12,7 +12,7 @@
 /// 1,024; slots in one stretch take the same at any size). A smaller page
 /// also makes the table of pages, 16 bytes a page and made with the heap,
 /// larger: 147 KB at 256 slots, 590 KB at 64.
-const PAGE: usize = 256;
+pub(super) const PAGE: usize = 256;
 
 /// `len` slots, each empty or holding a `T`. A slot's page is made when
 /// the slot first holds something, and stays made: what a slot holds is
@@ -32,6 +32,12 @@ impl<T> Paged<T> {
                 .collect(),
             len,
         }
+    }
+
+    /// The slots there are (mac: for `super::slots`' tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
     /// What slot `index` holds; none for an empty slot, a page not made, or

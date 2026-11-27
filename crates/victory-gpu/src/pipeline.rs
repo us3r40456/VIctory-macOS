@@ -98,6 +98,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             .entry(*full.as_bytes())
             .or_insert_with(|| {
                 created = true;
+                // The programs the ambient stand-in follows are known by
+                // name (`crate::ambient`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ambient::note_program(&full.to_hex()[..16], bytes);
+                // So are the ray passes `VICTORY_RAY_SKIP` leaves out
+                // (`crate::ray_skip`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -105,6 +113,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     // Written outside the lock every pipeline creation takes.
     #[cfg(windows)]
     if created {
+        // With the frame recorder asked for (`VICTORY_RECORD`), the
+        // container is kept beside its captures, so that a replay can
+        // translate it again (one look at a flag without it).
+        crate::replay::record::container(&full.to_hex()[..16], bytes);
         spill(&shader, full.as_bytes());
     }
     #[cfg(not(windows))]
@@ -217,9 +229,7 @@ impl Shader {
                         self.stage == "pixel"
                             || (self.stage == "mesh"
                                 && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
+                                    .is_some_and(|o| o.bytes() > link_mesh_over()))
                     });
                     if !keep {
                         *container = Vec::new();
@@ -335,9 +345,60 @@ fn link_mesh_outputs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     // On by default under Wine (D3DMetal): an over-limit mesh pipeline there
     // is made, draws nothing and its submission never completes (#172).
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
-        Some(v) => crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+    // mac: and whenever the rows of a linked pair are merged
+    // (`merge_mesh_rows`), which is a way of linking.
+    *ON.get_or_init(|| {
+        merge_mesh_rows() != 0
+            || match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
+                Some(v) => crate::switch::value_is_on(Some(&v)),
+                None => crate::shader_cache::under_wine(),
+            }
+    })
+}
+
+/// macOS port, `VICTORY_MERGE_MESH_ROWS`: a linked mesh and pixel pair also
+/// gets each output row that holds several elements as one element (1), or
+/// every row as a whole `float4` (2), or as 1 with the rows reordered (3), or
+/// as 3 with the clip and cull distances in the last registers (4, a test),
+/// or as 4 with the three-component rows first, `float4` rows last (5, a test),
+/// or in the order that is smallest by the measured rule, with components
+/// the pixel shader never reads left out of the elements around them (6),
+/// or as 6 with the clip distances the mesh program writes as a constant
+/// that is not negative, which clip nothing, left out (8, exact: the last
+/// two ground pairs then fit with the clipper), or as 8 with the clip
+/// distances of a pair still over Metal's limit passed as an ordinary
+/// element that the pixel shader discards by (7, not exact, and costly
+/// where it applies: such a pixel shader loses its early depth test);
+/// see `victory_shader::emit::translate_linked`.
+#[cfg(windows)]
+pub(crate) fn merge_mesh_rows() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        // On under D3DMetal, whose limit this is for, at level 8: the
+        // measured smallest order, and clip distances a mesh program writes
+        // as a constant that clips nothing left out of the pair. Exact; all
+        // four pairs that were no-ops draw, with the early depth test kept
+        // (run 26 November 17:47: no size error, 270 to 350 ms of GPU time
+        // in the prison yard, as at level 6). `=7` adds a pixel-shader clip
+        // for a pair still over the limit (none now), `=6` is the order
+        // alone, `=3` the reorder before the measured rule, `=0` off.
+        let default = if crate::shader_cache::under_wine() { 8 } else { 0 };
+        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 8).unwrap_or(default)
+    })
+}
+
+/// The output size, as VIctory counts it, above which a mesh shader is
+/// translated again with its pixel shader: Metal's limit, or with
+/// `VICTORY_MERGE_MESH_ROWS` a lower mark (`VICTORY_LINK_MESH_OVER`, bytes;
+/// 24576 if unset), because D3DMetal counts rows of several elements larger.
+#[cfg(windows)]
+pub(crate) fn link_mesh_over() -> u32 {
+    static OVER: OnceLock<u32> = OnceLock::new();
+    *OVER.get_or_init(|| {
+        if merge_mesh_rows() == 0 {
+            return victory_shader::emit::METAL_MESH_OUTPUT_BYTES;
+        }
+        std::env::var("VICTORY_LINK_MESH_OVER").ok().and_then(|v| v.parse().ok()).unwrap_or(24576)
     })
 }
 
@@ -417,9 +478,14 @@ pub(crate) fn translate_linked(
         &mesh_bytes,
         pixel_bytes.as_deref(),
         options,
+        merge_mesh_rows(),
     ) {
         Ok((ms_host, ps_host)) => {
-            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let outputs = victory_shader::emit::mesh_outputs(&ms_host.dxil);
+            let ms_bytes = outputs.map(|o| o.bytes());
+            // Metal's own count (`MeshOutputs::metal_bytes`, measured):
+            // what D3DMetal refuses the pipeline for when it is over.
+            let metal_bytes = outputs.map(|o| o.metal_bytes());
             let ms_used = ms.translated()?.used.clone();
             let mesh = ms.with_translation(Translated {
                 host: ms_host,
@@ -436,8 +502,17 @@ pub(crate) fn translate_linked(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 bytes = ms_bytes,
+                metal_bytes,
                 "mesh and pixel linked under 32 KiB output budget"
             );
+            if metal_bytes.is_some_and(|b| b > victory_shader::emit::METAL_MESH_OUTPUT_BYTES) {
+                tracing::warn!(
+                    mesh = %ms.hash,
+                    pixel = ps.map_or("none", |p| p.hash.as_str()),
+                    metal_bytes,
+                    "linked mesh outputs are over Metal's 32768 bytes: under D3DMetal the pipeline draws nothing"
+                );
+            }
             Some(LinkedPair { mesh, pixel })
         }
         Err(e) => {
@@ -473,6 +548,18 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Whether it is one of the title's acceleration-structure builder's
+    /// ([`builder`]).
+    #[cfg(windows)]
+    builder: bool,
+    /// What its programs are to the ambient stand-in ([`crate::ambient`]):
+    /// bits, 0 for nothing (always while the stand-in is off).
+    #[cfg(windows)]
+    ambient: u8,
+    /// Which ray pass `VICTORY_RAY_SKIP` leaves out it is
+    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off).
+    #[cfg(windows)]
+    ray_pass: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -511,6 +598,53 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Whether a dispatch with the title pipeline is held back: it is the
+/// acceleration-structure builder's, which does not run this frame
+/// ([`builder::runs`]).
+#[cfg(windows)]
+pub(crate) fn held_back(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder && !builder::runs()
+}
+
+/// Whether a dispatch with the title pipeline is left out: it is one of
+/// the ray passes `VICTORY_RAY_SKIP` names (`crate::ray_skip`), and the
+/// acceleration-structure builder does not run this frame
+/// ([`builder::runs`]), so there is nothing to trace against. Counted
+/// there when it is.
+#[cfg(windows)]
+pub(crate) fn ray_pass_left_out(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let kind = pipeline(this).ray_pass;
+    if kind == 0 || builder::runs() {
+        return false;
+    }
+    crate::ray_skip::left_out(kind);
+    true
+}
+
+/// [`ray_pass_left_out`], asked ahead and not counted (mac: hoisted clamps
+/// of indirect dispatches, `crate::list`).
+#[cfg(windows)]
+pub(crate) fn ray_pass_is_left_out(this: This) -> bool {
+    !this.is_null() && pipeline(this).ray_pass != 0 && !builder::runs()
+}
+
+/// What the title pipeline's programs are to the ambient stand-in
+/// ([`crate::ambient`]): bits, 0 for nothing.
+#[cfg(windows)]
+pub(crate) fn ambient_role(this: This) -> u8 {
+    if this.is_null() { 0 } else { pipeline(this).ambient }
+}
+
+/// A title DLL was mapped at `base`, `size` bytes (the acceleration-
+/// structure builder's pipelines are known by its image).
+#[cfg(windows)]
+pub fn note_title_dll(file: &str, base: usize, size: usize) {
+    builder::note_title_dll(file, base, size);
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -522,8 +656,9 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(feature = "diagnostics", any(windows, test)))]
+/// Shader hashes as printed in the pipeline diagnostics and by `shader
+/// translated` lines.
+#[cfg(any(windows, test))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -543,16 +678,45 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// `VICTORY_SKIP_PIPELINES=<hash>,...`: a pipeline with any of these shaders
+/// gets no host pipeline, so its draws and dispatches are dropped as those of
+/// a shader that does not translate are. Read once; in every build (it was a
+/// diagnostics switch), to leave the title's costly passes out of a normal
+/// run. Unset, the list is empty and [`skipped_shader`] returns at its first
+/// line: once per pipeline the title creates, nothing per draw.
+#[cfg(windows)]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let hashes = parse_skip_hashes(&value);
+        if let Some(line) = skip_line(&value, hashes.len()) {
+            tracing::info!("{line}");
+        }
+        hashes
     })
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The line logged once when `VICTORY_SKIP_PIPELINES` is set to `value` and
+/// `hashes` of its entries are shader hashes; none when it is unset or empty.
+#[cfg(any(windows, test))]
+fn skip_line(value: &str, hashes: usize) -> Option<String> {
+    (!value.trim().is_empty()).then(|| {
+        format!(
+            "VICTORY_SKIP_PIPELINES: pipelines with any of {hashes} shader hashes get no host pipeline; \
+             their draws and dispatches are dropped"
+        )
+    })
+}
+
+/// Reads `VICTORY_SKIP_PIPELINES` now (the host device is ready), so that its
+/// line is logged at start and not with the title's first pipeline.
+#[cfg(windows)]
+pub(crate) fn note_skips() {
+    let _ = skip_hashes();
+}
+
+#[cfg(windows)]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
@@ -629,27 +793,52 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
         .then(|| std::ptr::slice_from_raw_parts(code.code, code.size))
 }
 
+/// `code`: the title's bytecode pointers (by which a pipeline of the
+/// acceleration-structure builder is known, [`builder`]).
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    code: &[*const u8],
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    let builder = !code.is_empty() && builder::created_by_builder(code);
+    #[cfg(not(windows))]
+    let _ = code;
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(
         shaders.clone(),
         graphics,
-        #[cfg(feature = "diagnostics")]
         skip_hashes(),
     ));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(windows)]
+    if builder {
+        builder::note(&host);
+    }
+    #[cfg(windows)]
+    let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
+    // Never a program the stand-in works after (it would not run).
+    #[cfg(windows)]
+    let ray_pass = if ambient == 0 {
+        crate::ray_skip::kind(shaders.iter().map(|s| s.hash.as_str()))
+    } else {
+        0
+    };
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
+        #[cfg(windows)]
+        ambient,
+        #[cfg(windows)]
+        ray_pass,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -673,6 +862,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        &[],
         iid,
         out,
     )
@@ -693,6 +883,7 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        &[desc.stage.code],
         iid,
         out,
     )
@@ -772,6 +963,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        &[],
         iid,
         out,
     )
@@ -840,11 +1032,16 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+mod builder;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod screen;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 
@@ -972,7 +1169,6 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -980,6 +1176,21 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// Unset or empty, `VICTORY_SKIP_PIPELINES` gives no hashes and no line;
+    /// set, one line with the count of hashes taken (0 if none was one).
+    #[test]
+    fn skip_line_only_when_set() {
+        assert!(super::parse_skip_hashes("").is_empty());
+        assert_eq!(super::skip_line("", 0), None);
+        assert_eq!(super::skip_line("  ", 0), None);
+        let value = "0123456789abcdef,0011223344556677,xyz";
+        let hashes = super::parse_skip_hashes(value);
+        let line = super::skip_line(value, hashes.len()).expect("a line when set");
+        assert!(line.starts_with("VICTORY_SKIP_PIPELINES: ") && line.contains(" 2 shader hashes "), "{line}");
+        let none = super::skip_line("xyz", 0).expect("a line when set");
+        assert!(none.contains(" 0 shader hashes "), "{none}");
     }
 
     use super::*;
@@ -1028,6 +1239,58 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.lock().unwrap().clone()))
             .collect()
+    }
+
+    /// A compute pipeline the acceleration-structure builder creates (its
+    /// bytecode in the builder's image) is known as the builder's, and its
+    /// dispatches are held back while its host pipeline is not made: here
+    /// never, as its bytes are no shader container. Pipelines of other
+    /// code are never held back.
+    #[cfg(windows)]
+    #[test]
+    fn builder_dispatches_wait_for_every_builder_pipeline() {
+        let _one = builder::test_lock();
+        let code = [0xB0u8; 64];
+        let create = |code: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: code.as_ptr(),
+                    size: code.len(),
+                },
+            };
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
+        let p = create(&code);
+        let other_code = [0xC0u8; 64];
+        let other = create(&other_code);
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        assert!(
+            pipeline(p).builder,
+            "its bytecode is in the builder's image"
+        );
+        assert!(!pipeline(other).builder);
+        // Its host pipeline is started at once and refused.
+        let refused = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(refused, "the builder's pipeline was started");
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
+        assert!(
+            held_back(p),
+            "one builder pipeline missing: the builder waits"
+        );
+        assert!(!held_back(other));
+        for q in [p, other] {
+            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        }
     }
 
     #[test]

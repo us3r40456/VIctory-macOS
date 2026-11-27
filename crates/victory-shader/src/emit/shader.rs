@@ -101,6 +101,8 @@ pub const VIEW_WRITES_BYTES: u32 = ATOMIC_LOCKS_GAVE_UP_AT + 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// `ForceEarlyDepthStencil`: depth and stencil are tested and written
+    /// before a pixel program runs (`lower::mac`). No `SFI0` feature bit.
     pub const EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;

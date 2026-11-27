@@ -295,7 +295,8 @@ impl Host {
         hosts
     }
 
-    /// `device`, if it takes SM 6.6.
+    /// `device` (a hardware adapter's: its work is not serialised), if it
+    /// takes SM 6.6.
     #[cfg(test)]
     fn sm66(device: ID3D12Device) -> Result<Self, String> {
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -946,6 +947,8 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })?;
     Ok(HostShader {
@@ -1469,6 +1472,16 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
     Uint2TextureUav(u32, u32),
+    /// A 2D texture in this format (width, height, levels), not filled and
+    /// not read back: an unordered view of level `uav` whose description
+    /// names the format and the level, or without one a shader view of
+    /// every level (size queries, `uav_size_tests`).
+    Sized {
+        format: DXGI_FORMAT,
+        size: (u32, u32),
+        levels: u32,
+        uav: Option<u32>,
+    },
     /// An RGBA32_UINT texture UAV (width, height), zeroed.
     Uint4TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
@@ -1879,6 +1892,38 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         uavs.push((b, None, n, rb));
+                    }
+                    View::Sized { format, size: (w, h), levels, uav } => {
+                        let (flags, state) = match uav {
+                            Some(_) => (
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            ),
+                            None => (
+                                D3D12_RESOURCE_FLAG_NONE,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ),
+                        };
+                        let mut desc = texture_as(w, h, flags, format);
+                        desc.MipLevels = levels as u16;
+                        let t = make(D3D12_HEAP_TYPE_DEFAULT, &desc, state)?;
+                        match uav {
+                            Some(level) => {
+                                let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                    Format: format,
+                                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                        Texture2D: D3D12_TEX2D_UAV {
+                                            MipSlice: level,
+                                            PlaneSlice: 0,
+                                        },
+                                    },
+                                };
+                                dev.CreateUnorderedAccessView(&t, None, Some(&view), at);
+                            }
+                            None => dev.CreateShaderResourceView(&t, None, at),
+                        }
+                        keep.push(t);
                     }
                     View::TextureUav(w, h)
                     | View::UintTextureUav(w, h)

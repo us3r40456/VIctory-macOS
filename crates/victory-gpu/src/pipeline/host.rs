@@ -219,7 +219,7 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                        f.0 = crate::resource::target_format(f.0 as u32) as i32;
                     }
                 }
                 16 => {
@@ -286,6 +286,15 @@ impl GraphicsState {
             BackFace: d.BackFace,
             DepthBoundsTestEnable: true.into(),
         })
+    }
+
+    /// Whether these are a pass over the screen's draws: no vertex input, no
+    /// depth or stencil. Such passes fill tables once; their shaders are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -389,6 +398,44 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+/// For `victory replay --retranslate` (`crate::replay::play::retranslate`):
+/// the DXIL each stage of a pipeline of the title's containers `stages`
+/// (stage and container) gets from this build with this run's switches, as
+/// [`HostPipeline::new`] chooses it: the stage's own translation or, for a
+/// mesh pipeline over the output mark, the one made for the pair
+/// (`super::translate_linked`, with `VICTORY_MERGE_MESH_ROWS` as this run
+/// has it); and whether it is one made for the pipeline alone.
+pub(crate) fn retranslated(stages: &[(&'static str, &[u8])]) -> Vec<(Result<Vec<u8>, String>, bool)> {
+    let shaders: Vec<Arc<Shader>> = stages
+        .iter()
+        .map(|(stage, bytes)| super::shader(stage, bytes))
+        .collect();
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    // The same test and the same call as in `HostPipeline::new`.
+    let linked = find("mesh").filter(|_| super::link_mesh_outputs()).and_then(|ms| {
+        let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
+        if bytes <= super::link_mesh_over() {
+            return None;
+        }
+        super::translate_linked(ms, find("pixel").map(Arc::as_ref))
+    });
+    shaders
+        .iter()
+        .map(|s| {
+            let alone = match (&linked, s.stage) {
+                (Some((ms, _)), "mesh") => Some(ms),
+                (Some((_, Some(ps))), "pixel") => Some(ps),
+                _ => None,
+            };
+            let dxil = alone.unwrap_or(s).translated().map(|t| t.host.dxil.clone());
+            (
+                dxil.ok_or_else(|| "it does not translate (the log says why)".to_owned()),
+                alone.is_some(),
+            )
+        })
+        .collect()
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -446,7 +493,7 @@ impl HostPipeline {
         // pruning outputs the pixel shader never reads.
         let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
             let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
-            if bytes <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES {
+            if bytes <= super::link_mesh_over() {
                 return None;
             }
             super::translate_linked(ms, find("pixel").map(Arc::as_ref))
@@ -467,9 +514,15 @@ impl HostPipeline {
             // The larger of the packed count and the aligned layout: shaders
             // the packed count puts under the limit (34,816 bytes aligned,
             // #172) still hang the queue.
+            // mac: where a linked pair's rows are merged
+            // (`VICTORY_MERGE_MESH_ROWS`, the default under Wine), the count
+            // is the measured rule's (`MeshOutputs::metal_bytes`), which
+            // the rows were ordered by: the aligned layout above models the
+            // clip distances differently and would refuse pairs that fit
+            // and draw.
             && let Some(bytes) = victory_shader::emit::mesh_outputs(&t.host.dxil)
-                .map(|o| o.bytes())
-                .max(metal_mesh_bytes(&t.host.dxil))
+                .map(|o| if super::merge_mesh_rows() != 0 { o.metal_bytes() } else { o.bytes() })
+                .max(metal_mesh_bytes(&t.host.dxil).filter(|_| super::merge_mesh_rows() == 0))
             && bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
         {
             tracing::warn!(
@@ -709,6 +762,29 @@ impl HostPipeline {
                 &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            // Diagnostics (VICTORY_MESH_SIZE_LOG=1): one mesh pipeline at a
+            // time, its outputs logged before it is made, so a D3DMetal
+            // "Total mesh size" line can be matched to its mesh shader.
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _serial = crate::switch::on("VICTORY_MESH_SIZE_LOG").then(|| {
+                let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+                let elements = (|| {
+                    // Register and column mask of each vertex output element.
+                    let bytes = code_bytes(&code(0));
+                    let c = victory_shader::Container::parse(&bytes).ok()?;
+                    let d = c.part(victory_shader::FourCC::OSG1)?.data;
+                    let word = |at: usize| Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+                    let (count, base) = (word(0)?, word(4)?);
+                    (0..count as usize)
+                        .map(|i| {
+                            let at = base as usize + 32 * i;
+                            Some((word(at + 20)?, *d.get(at + 24)?))
+                        })
+                        .collect::<Option<Vec<(u32, u8)>>>()
+                })();
+                tracing::info!(?shaders, ?elements, "making host mesh pipeline");
+                guard
+            });
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,

@@ -158,6 +158,8 @@ fn lowered_with(
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
+        halves_local: Default::default(),
+        mac: Default::default(),
         host_wave32,
     })
 }

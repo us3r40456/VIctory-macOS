@@ -1,7 +1,8 @@
 //! The title's output size and render scale (`VICTORY_OUTPUT`,
-//! `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each off without it): places
-//! in the title's code changed at load, each compared byte for byte first
-//! and left alone, said so, if it differs (another build of the title).
+//! `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`, `VICTORY_UI_SIZE`; each off
+//! without it): places in the title's code and data changed at load, each
+//! compared byte for byte first and left alone, said so, if it differs
+//! (another build of the title).
 //!
 //! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
 //!
@@ -35,6 +36,21 @@
 //!   count came back 0 and the title divided by it (+0x28f03e8).
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Interface size.** With `VICTORY_OUTPUT` alone the interface (button
+//!   prompts, subtitles, HUD) is laid out for 3840x2160 and drawn into the
+//!   smaller output from its top left corner: at 1920x1080 every box is
+//!   twice as large and twice as far from the corner (runs 2026-11-27
+//!   03:23:57 against 03:28:13). The screen size the output patch sets is
+//!   not where the 3840x2160 comes from: by DexNom (`native_1440p.rs`, which
+//!   writes 2560x1440 there) the interface surface follows the largest
+//!   entry of the title's own display mode list (+0x615c100, 3840x2160 at
+//!   60 Hz, read only by the list's builder +0x5a38910), the console's
+//!   display. A second size pair next to the screen size (+0xa9438ec, the
+//!   interface surfaces of +0x5eb2590 and the settings menu's preview at
+//!   +0x58048d4 read it) has no direct writer; DexNom finds it stays at
+//!   3840x2160. `VICTORY_UI_SIZE=<w>x<h>` writes that mode entry. Not yet
+//!   traced: which reader of the list sizes the interface (a game run
+//!   decides).
 // Ported from avatarmanz/VIctory-7900XTX (crates/victory-loader/src/resolution.rs,
 // commit e151e71 and its follow-up for the back buffer pool check), GPL-3.0-or-later.
 
@@ -64,6 +80,20 @@ pub fn asked_output() -> Option<(u32, u32)> {
     if size.is_none() {
         eprintln!(
             "VIctory: VICTORY_OUTPUT={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160"
+        );
+    }
+    size
+}
+
+/// `VICTORY_UI_SIZE=<w>x<h>`: one of [`MODES`], the size the title's
+/// largest display mode is given ([`DISPLAY_MODE`]). `None` if unset or not
+/// one (said why).
+pub fn asked_ui_size() -> Option<(u32, u32)> {
+    let spec = std::env::var("VICTORY_UI_SIZE").ok()?;
+    let size = parse_output(&spec);
+    if size.is_none() {
+        eprintln!(
+            "VIctory: VICTORY_UI_SIZE={spec}: expected one of the title's modes: 1920x1080, 2560x1440, 1280x720, 1664x936, 3840x2160"
         );
     }
     size
@@ -184,6 +214,28 @@ pub const PICKER: Site = Site {
         0x28, 0xc3,
     ],
 };
+
+/// The last entry of the title's display mode list (+0x615c0c0, five of
+/// 16 bytes: width, height, refresh rate as a fraction), 3840x2160 at 60/1.
+/// Data, not code; only the list's builder +0x5a38910 reads it.
+pub const DISPLAY_MODE: Site = Site {
+    at: 0x615c100,
+    what: "the title's largest display mode (its interface size)",
+    bytes: &[
+        0x00, 0x0f, 0x00, 0x00, 0x70, 0x08, 0x00, 0x00, // 3840, 2160
+        0x3c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // 60 / 1
+    ],
+};
+
+/// What goes at [`DISPLAY_MODE`] for `width` x `height` (the refresh rate
+/// kept).
+pub fn display_mode_code(width: u32, height: u32) -> Vec<u8> {
+    let mut c = Vec::with_capacity(DISPLAY_MODE.bytes.len());
+    c.extend(width.to_le_bytes());
+    c.extend(height.to_le_bytes());
+    c.extend(&DISPLAY_MODE.bytes[8..]);
+    c
+}
 
 /// `rel32` from the end of an instruction at image offset `next` to `to`.
 fn rel(to: usize, next: usize) -> [u8; 4] {
@@ -335,6 +387,12 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         }
         asked.push((group, format!("{w}x{h}")));
     }
+    if let Some((w, h)) = asked_ui_size() {
+        asked.push((
+            vec![(&DISPLAY_MODE, display_mode_code(w, h))],
+            format!("{w}x{h}"),
+        ));
+    }
     if let Some(s) = asked_render_scale() {
         asked.push((vec![(&OWN_SCALE, own_scale_code(s))], format!("{s}")));
     }
@@ -435,6 +493,23 @@ mod tests {
         assert_eq!(c[48], 0xeb);
         assert_eq!(50 + c[49] as usize, 61, "jmp lands at the end");
         assert!(c[50..].iter().all(|&x| x == 0xcc));
+    }
+
+    /// The display mode entry is the last of the title's five modes, the
+    /// 3840x2160 one; the replacement keeps its refresh rate.
+    #[test]
+    fn the_display_mode_code() {
+        let b = DISPLAY_MODE.bytes;
+        assert_eq!(b.len(), 16);
+        let word = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        assert_eq!((word(0), word(4)), MODES[4]);
+        assert_eq!((word(8), word(12)), (60, 1));
+        let c = display_mode_code(1920, 1080);
+        assert_eq!(c.len(), b.len());
+        assert_eq!(c[..4], 1920u32.to_le_bytes());
+        assert_eq!(c[4..8], 1080u32.to_le_bytes());
+        assert_eq!(c[8..], b[8..]);
+        assert_eq!(display_mode_code(3840, 2160), b);
     }
 
     #[test]

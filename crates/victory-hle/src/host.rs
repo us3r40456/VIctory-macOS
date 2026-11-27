@@ -74,7 +74,15 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        // macOS port: with `VICTORY_HEAP_REPORTS` the title's memcpy and
+        // memmove tell of the view records they copy into its view heap
+        // (`victory_gpu::heap_reports`); the host's own without it.
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::heap_reports::import(name, address));
+        }
+        Some(address)
     }
 }
 

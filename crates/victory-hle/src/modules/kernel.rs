@@ -242,12 +242,21 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    recorder_ending();
     host::exit(code)
+}
+
+/// The title ends the process: a frame capture under way (`VICTORY_RECORD`,
+/// docs/replay.md) gets to write down what it is in the middle of.
+fn recorder_ending() {
+    #[cfg(windows)]
+    victory_gpu::replay::record::ending();
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
+    recorder_ending();
     host::abort()
 }
 
@@ -255,6 +264,7 @@ pub extern "C" fn abort() -> ! {
 /// the host's `abort`.
 pub extern "C" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
+    recorder_ending();
     host::abort()
 }
 
@@ -290,6 +300,7 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        recorder_ending();
     }
     host::terminate_process(process, code)
 }

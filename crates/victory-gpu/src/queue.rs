@@ -151,6 +151,8 @@ pub(crate) enum Why {
 
 #[cfg(windows)]
 use crate::hold::Item;
+#[cfg(windows)]
+use crate::host::unwaited;
 
 /// Every queue's held work.
 #[cfg(windows)]
@@ -196,34 +198,68 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    // mac: with flights, a value the submission left to the host GPU will
+    // write counts as there (`unwaited::pending_value`): the work behind
+    // the wait goes to the GPU behind it.
+    let read = |address: u64, bytes: u8| unwaited::pending_value(address, bytes).or_else(|| read_value(address, bytes));
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
-    let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
-        let at = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-        host.execute(&lists);
-        ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
+    // In host submissions, and waiting for one the host GPU was left with
+    // (`crate::host::unwaited`).
+    let ran = std::cell::Cell::new(std::time::Duration::ZERO);
+    let mut run = |queue: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
+        // One host submission, or with `VICTORY_COPY_ORDER=split` one more
+        // for each title copy in the piece that changes what its earlier
+        // lists read: the part before it has run when the copy is made.
+        for part in crate::host::copy_order_parts(segments) {
+            let at = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+            // The lists that have run: these, unless the host GPU was left
+            // with them (then they come back with a later piece).
+            let done = host.execute_title(queue, part);
+            ran.set(ran.get() + at.elapsed());
+            done.into_iter().for_each(crate::list::recycle);
+        }
     };
+    // The title's fence moves once the work before the Signal has run.
     let mut signal = |f: usize, value: u64| {
+        // Left to whoever finishes the submission the host GPU has, with
+        // the hold on the fence (`VICTORY_ASYNC_SIGNALS`).
+        if unwaited::signal_after(f, value) {
+            return;
+        }
+        let at = std::time::Instant::now();
+        if unwaited::settle(unwaited::By::Signal) {
+            ran.set(ran.get() + at.elapsed());
+        }
         crate::fence::set(f as This, value);
         crate::fence::let_go(f as This);
+    };
+    // A wait may be for a bottom-of-pipe write of a submission the host
+    // GPU was left with: that one is finished before a head is held.
+    let mut seen = unwaited::finished();
+    let mut owed = |waits: &[crate::hold::ValueWait], next: &[&std::sync::Arc<crate::host::HostList>]| {
+        let at = std::time::Instant::now();
+        let finished = unwaited::settle_waits(waits, next, &mut seen);
+        if finished {
+            ran.set(ran.get() + at.elapsed());
+        }
+        finished
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
+        owed: &mut owed,
+        ahead: unwaited::prewarms(),
     });
+    let ran = ran.get();
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
         a.pump += started.elapsed().saturating_sub(ran);
@@ -289,9 +325,23 @@ fn account() -> std::sync::MutexGuard<'static, Account> {
 #[cfg(windows)]
 fn account_frame(frame: u64) {
     let (cuts, early) = crate::list::take_cuts();
+    let (copy_cuts, copy_splits) = (crate::list::take_copy_cuts(), crate::host::take_copy_splits());
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
     let blocked = held().blocked(&read_value);
+    // `VICTORY_COPY_ORDER=split`: what it did this frame, on a line of its
+    // own (the line below is only written when work was held).
+    if copy_cuts > 0 || copy_splits > 0 {
+        tracing::info!(
+            frame,
+            copy_cuts,
+            copy_splits,
+            pieces = a.pieces,
+            "copy order this frame: title lists cut at a copy that changes what their earlier commands read; \
+             host submissions added for such copies (the cuts, and copies that change what an earlier list of \
+             the piece reads); the queues' pieces before the splits"
+        );
+    }
     if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
         return;
     }
@@ -346,16 +396,13 @@ fn account_frame(frame: u64) {
     }
 }
 
-/// One plane of a `PresentX` call (0x48-byte stride): frame token,
-/// resource count, and pointer to the plane's resources.
+/// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
-    _rest: [u64; 6],
 }
-const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -386,7 +433,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
+        } else if unwaited::signal_behind(this as usize, fence as usize, value) {
+            // The fence moves when the queue's work the host GPU was left
+            // with is finished, by whoever finishes it
+            // (`VICTORY_ASYNC_SIGNALS`).
         } else {
+            // The queue's work the host GPU was left with has run first.
+            unwaited::settle_signal(this as usize);
             crate::fence::set(fence, value);
         }
         // Another queue may wait for this fence.
@@ -623,6 +676,9 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    // What ran is finished, before the picture and its state are looked at.
+    #[cfg(windows)]
+    unwaited::settle(unwaited::By::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -658,6 +714,11 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    // The draws run so far, for the frame recorder's world frame
+    // (`VICTORY_RECORD_AT=w<n>`): read where `capture::presented` reads
+    // them, so that both tell the same frame as the world's first.
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -671,12 +732,17 @@ extern "system" fn present(
     let shown = shown_plane(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if present_target(frame) {
+        // A frame's end for the frame recorder too, without its picture.
+        crate::replay::record::present(frame, None, drawn);
+        return S_OK;
+    }
     #[cfg(windows)]
     if let Some(&resource) = found.get(shown).and_then(|p| p.first())
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
-
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
@@ -696,15 +762,41 @@ extern "system" fn present(
             crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
+        // The frame recorder's end of a frame (`VICTORY_RECORD`): the
+        // picture is in `state` again.
+        crate::replay::record::present(frame, Some((&texture, state)), drawn);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        crate::replay::record::present(frame, None, drawn);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Diagnostics, `VICTORY_PRESENT_TARGET`: shows the render target it names
+/// in place of the shown plane, if frame `frame` used one and the window
+/// takes it. False (always, unless the variable is set): the plane is shown
+/// as usual. No overlay is blended over a target.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn present_target(frame: u64) -> bool {
+    let Some(target) = crate::capture::present_override(frame) else {
+        return false;
+    };
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let state = crate::host::legal_state(&target.texture, target.state.load(Ordering::Relaxed));
+    if host.present(&target.texture, state, None, frame).is_none() {
+        return false;
+    }
+    // The draws traced for `blinks`, which is not asked about this frame.
+    crate::draw::take_frame();
+    true
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -786,6 +878,10 @@ extern "system" fn copy_page_mappings(
     if held().holds_work(this as usize) {
         account().mappings += 1;
     }
+    // The queue's work before it has run: what it owes title memory goes
+    // where the pages still are.
+    #[cfg(windows)]
+    unwaited::settle(unwaited::By::Mapping);
     #[cfg(not(windows))]
     let _ = this;
     let batches = (count > 0).then(|| {

@@ -345,6 +345,50 @@ impl Bools {
         }
     }
 
+    /// Whether `b` is the same whatever `atom` is, in every lane where
+    /// `unless` does not hold (`emit::lower::lds_order`: a compare result
+    /// that only means something where its guard holds).
+    pub(crate) fn ignores(&self, b: Bool, atom: Atom, unless: Bool) -> bool {
+        let Some(&a) = self.ids.get(&atom) else {
+            return true;
+        };
+        self.ignores_in(b, a, unless, &mut HashSet::new())
+    }
+
+    fn ignores_in(&self, b: Bool, a: u32, g: Bool, seen: &mut HashSet<(Bool, Bool)>) -> bool {
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        // Variables grow downwards: below `a`'s level `b` has no `a`.
+        if g == Bool::TRUE || top(b) > a || !seen.insert((b, g)) {
+            return true;
+        }
+        if top(b) == a && top(g) > a {
+            let (lo, hi) = self.split(b, a);
+            return self.same_unless(lo, hi, g, &mut HashSet::new());
+        }
+        let v = top(b).min(top(g));
+        // `unless` itself turning on the atom: not followed.
+        if v == a {
+            return false;
+        }
+        let ((b0, b1), (g0, g1)) = (self.split(b, v), self.split(g, v));
+        self.ignores_in(b0, a, g0, seen) && self.ignores_in(b1, a, g1, seen)
+    }
+
+    /// Whether `x` and `y` agree in every lane where `g` does not hold.
+    fn same_unless(&self, x: Bool, y: Bool, g: Bool, seen: &mut HashSet<(Bool, Bool, Bool)>) -> bool {
+        if g == Bool::TRUE || x == y || !seen.insert((x, y, g)) {
+            return true;
+        }
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        let v = top(x).min(top(y)).min(top(g));
+        if v == TERMINAL {
+            // Two different constants, and `g` is false.
+            return false;
+        }
+        let ((x0, x1), (y0, y1), (g0, g1)) = (self.split(x, v), self.split(y, v), self.split(g, v));
+        self.same_unless(x0, y0, g0, seen) && self.same_unless(x1, y1, g1, seen)
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -463,6 +507,12 @@ pub struct Structured {
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: Map<Value, Value>,
+    /// Wave64 masks of [`Structured::other`]: the high dword's value by the
+    /// low dword's, as their uses read the pair (none where two uses pair
+    /// one low dword with different high ones). The two dwords of such a
+    /// mask may be written by different instructions (`s_mov_b32` each), so
+    /// the write of the low one does not name the high one.
+    pub other_highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
@@ -473,6 +523,12 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: Map<(usize, usize), Bool>,
+    /// The lane's bit of what a lane-mask join ([`Atom::Phi`]) takes in on
+    /// an edge, by its low dword's value, where nothing read that value as
+    /// a mask (so `masks` has none for it) and it is one all the same: a
+    /// copy, a spill read back or a mask operation of tracked masks, or a
+    /// join all of whose edges bring one mask ([`Lanes::join_arguments`]).
+    pub joined: Map<Value, Bool>,
 }
 
 impl Structured {
@@ -553,7 +609,27 @@ struct Lanes<'a> {
     /// A pixel's discards (see [`Structured::discards`]) by block and
     /// instruction.
     kills: HashSet<(usize, usize)>,
+    /// The incoming masks of each join made an [`Atom::Phi`] this round.
+    phi_joins: Vec<Vec<Key>>,
+    /// While [`Lanes::join_arguments`] runs: the masks it works out, kept
+    /// apart from `masks` and `other`.
+    late: Option<Late>,
 }
+
+/// What [`Lanes::join_arguments`] works out for one join argument.
+#[derive(Default)]
+struct Late {
+    /// (mask, derived) by pair, as `masks` and `other` together.
+    found: Map<Key, (Bool, bool)>,
+    /// The pairs being worked out, outermost first.
+    open: Vec<Key>,
+    /// The argument needs a join of its own, or more steps than
+    /// [`MAX_LATE`]: it stays untracked.
+    failed: bool,
+}
+
+/// How deep [`Lanes::join_arguments`] follows one argument.
+const MAX_LATE: usize = 64;
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
 /// incoming mask held (or failed) on its edge.
@@ -623,6 +699,8 @@ impl<'a> Lanes<'a> {
             active: Set::default(),
             restored: Map::default(),
             kills: HashSet::new(),
+            phi_joins: Vec::new(),
+            late: None,
         };
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
@@ -699,6 +777,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.phi_joins.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -877,7 +956,19 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        let joined = self.join_arguments();
+        let mut other_highs: Map<Value, Value> = Map::default();
+        let mut twice: Vec<Value> = Vec::new();
+        for &(lo, hi) in self.other.keys().filter(|(lo, hi)| lo != hi) {
+            if other_highs.insert(lo, hi).is_some_and(|old| old != hi) {
+                twice.push(lo);
+            }
+        }
+        for lo in twice {
+            other_highs.remove(&lo);
+        }
         Ok(Structured {
+            other_highs,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -902,7 +993,45 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            joined,
         })
+    }
+
+    /// See [`Structured::joined`]. A join reads its incoming masks only
+    /// when it is lowered, so one that nothing else reads was never asked
+    /// for: a mask a loop leaves alone comes back to the loop's header
+    /// through the joins of the branches inside it, a copy, or the two
+    /// lanes of a VGPR the compiler parked it in.
+    ///
+    /// Worked out last and kept apart, so that nothing made before depends
+    /// on it; and only by steps that are the same for every lane however it
+    /// came (no new per-lane join, no join taken as a constant), so the
+    /// mask found is the register's on that edge exactly. What needs more
+    /// stays untracked, and is refused where the join is lowered.
+    fn join_arguments(&mut self) -> Map<Value, Bool> {
+        let mut joined = Map::default();
+        let joins = std::mem::take(&mut self.phi_joins);
+        let tracked = |l: &Self, a: &Key| l.masks.contains_key(a) || l.other.contains_key(a);
+        if joins.iter().flatten().all(|a| tracked(self, a)) {
+            return joined;
+        }
+        for &a in joins.iter().flatten() {
+            if tracked(self, &a) || joined.contains_key(&a.0) {
+                continue;
+            }
+            self.late = Some(Late::default());
+            let (m, derived) = self.mask(a);
+            let failed = self.late.take().is_none_or(|l| l.failed);
+            if self.b.overflow {
+                // Too large to tell: as if never looked at.
+                self.b.overflow = false;
+                return Map::default();
+            }
+            if derived && !failed {
+                joined.insert(a.0, m);
+            }
+        }
+        joined
     }
 
     fn key(&self, value: impl Fn(Reg) -> Option<Value>, code: u8) -> Option<Key> {
@@ -938,6 +1067,16 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        if let Some(late) = &mut self.late {
+            if let Some(&found) = late.found.get(&k) {
+                return found;
+            }
+            if late.failed || late.open.len() >= MAX_LATE || late.open.contains(&k) {
+                late.failed = true;
+                return (Bool::FALSE, false);
+            }
+            late.open.push(k);
+        }
         let p = self.p;
         let restored = (
             self.restored.get(&k.0).copied(),
@@ -971,6 +1110,11 @@ impl<'a> Lanes<'a> {
                 (m, derived)
             }
         };
+        if let Some(late) = &mut self.late {
+            late.open.pop();
+            late.found.insert(k, (m, derived));
+            return (m, derived);
+        }
         let cache = if derived {
             &mut self.masks
         } else {
@@ -1018,6 +1162,11 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
+        if let Some(late) = &mut self.late {
+            // A join of its own: more than `join_arguments` takes.
+            late.failed = true;
+            return Some((Bool::FALSE, false));
+        }
         if !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
@@ -1037,6 +1186,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        self.phi_joins.push(args);
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
@@ -1124,9 +1274,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_after_loop(scc) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1140,6 +1294,47 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// Whether SCC value `scc` is clear wherever it is read: the instruction
+    /// before an `s_cbranch_execnz` that closes a loop wrote it as "the EXEC
+    /// it leaves is not empty" (`s_andn2_wrexec`, say), and the wave leaves
+    /// `do { .. } while (EXEC)` with EXEC empty. A read inside the loop or
+    /// behind another way out of it sees a join of this value, not the
+    /// value itself.
+    fn clear_after_loop(&self, scc: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let (Some(writer), Some(last)) = (block.insts.get(i), block.insts.last()) else {
+            return false;
+        };
+        // A lane-mask operation: its SCC is "the result is not zero".
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let masks = writer
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(width))
+            .map(|op| op.trim_end_matches("_saveexec").trim_end_matches("_wrexec"))
+            .is_some_and(|f| {
+                matches!(
+                    f,
+                    "and" | "or" | "xor" | "andn2" | "orn2" | "andn1" | "orn1" | "nand" | "nor" | "xnor"
+                )
+            });
+        let exec = writer.write(Reg::S(EXEC));
+        let back = match block.exit {
+            Exit::Branch { taken, .. } => self.index[taken] <= self.index[b],
+            _ => false,
+        };
+        masks
+            && back
+            && i + 2 == block.insts.len()
+            && exec.is_some()
+            && last.name() == "s_cbranch_execnz"
+            && last.read(Reg::S(EXEC)) == exec
+            && (!self.p.wave64 || last.read(Reg::S(EXEC + 1)) == writer.write(Reg::S(EXEC + 1)))
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -1448,6 +1643,32 @@ mod tests {
         ir::build(&code, wave64, 256).unwrap()
     }
 
+    /// `ignores`: a condition that has an atom only together with a guard
+    /// is the same without the guard, whatever the atom; one that has it
+    /// beside the guard is not.
+    #[test]
+    fn a_condition_ignores_an_atom_it_only_has_under_a_guard() {
+        let mut b = Bools::new();
+        let atoms = [Atom::Lane(Value(1)), Atom::Lane(Value(2)), Atom::Lane(Value(3))];
+        let [g, c, h] = atoms.map(|a| b.atom(a, 0));
+        let both = b.and(g, c);
+        let not_both = b.not(both);
+        let saved = b.and(h, not_both);
+        let either = b.or(g, c);
+        let other = b.and(h, c);
+        for (cond, ignored) in [(both, true), (saved, true), (h, true), (either, false), (other, false)] {
+            assert_eq!(b.ignores(cond, atoms[1], g), ignored);
+        }
+        // Under the guard itself everything may turn on the atom; with no
+        // guard at all nothing that has it may.
+        assert!(b.ignores(either, atoms[1], Bool::TRUE));
+        assert!(!b.ignores(both, atoms[1], Bool::FALSE));
+        // The guard ordered below the atom is followed too.
+        let late = b.and(c, h);
+        assert!(b.ignores(late, atoms[1], h));
+        assert!(!b.ignores(late, atoms[2], g));
+    }
+
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
     }
@@ -1576,6 +1797,103 @@ mod tests {
         );
     }
 
+    /// The header phi of the loop that reads `s[2:3]` (or `s2`) as a mask.
+    fn header(p: &Program) -> &ir::Phi {
+        let at = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "v_cndmask_b32"))
+            .expect("the loop");
+        let phi = p.blocks[at].phis.iter().find(|phi| phi.reg == Reg::S(2));
+        phi.expect("the mask's join")
+    }
+
+    /// A mask the loop leaves alone, parked in two lanes of a VGPR and read
+    /// back before the back edge (the water transmission programs): nothing
+    /// reads the two lane reads as a mask, and the join at the loop's
+    /// header takes them in as the mask it holds itself.
+    #[test]
+    fn a_join_takes_in_a_mask_read_back_from_the_lanes_it_was_parked_in() {
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let p = build(
+            &[
+                0xD4C2_0002,
+                0x0002_0080, // 0: v_cmp_eq_u32 s[2:3], 0, v0
+                0xBE84_0380, // 8: s_mov_b32 s4, 0
+                0xD501_0001,
+                cnd, // 12: v_cndmask_b32 v1, v2, v3, s[2:3]
+                0xD761_0005,
+                0x0001_0002, // 20: v_writelane_b32 v5, s2, 0
+                0xD761_0005,
+                0x0001_0203, // 28: v_writelane_b32 v5, s3, 1
+                0xBE82_0480, // 36: s_mov_b64 s[2:3], 0
+                0xD760_0002,
+                0x0001_0105, // 40: v_readlane_b32 s2, v5, 0
+                0xD760_0003,
+                0x0001_0305, // 48: v_readlane_b32 s3, v5, 1
+                0x8004_8104, // 56: s_add_u32 s4, s4, 1
+                0xBF0A_8404, // 60: s_cmp_lt_u32 s4, 4
+                0xBF85_FFF2, // 64: s_cbranch_scc1 -> 12
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let phi = header(&p);
+        let own = s.masks[&phi.value];
+        assert_eq!(
+            s.bools.node(own),
+            Some((Atom::Phi(phi.value), Bool::FALSE, Bool::TRUE))
+        );
+        let back = phi.args[1];
+        assert_eq!(s.restored.get(&back), Some(&phi.value));
+        assert!(!s.masks.contains_key(&back) && !s.other.contains_key(&back));
+        assert_eq!(s.joined.get(&back), Some(&own));
+        assert_eq!(s.joined.len(), 1);
+    }
+
+    /// The same through the join of a branch inside the loop, one of whose
+    /// edges brings a copy of the mask and the other the mask.
+    #[test]
+    fn a_join_takes_in_a_join_all_of_whose_edges_bring_one_mask() {
+        let cnd = 258 | (259 << 9) | (2 << 18);
+        let program = |copied: u32| {
+            build(
+                &[
+                    0xD4C2_0002,
+                    0x0002_0080, // 0: v_cmp_eq_u32 s2, 0, v0
+                    0xD4C1_0007,
+                    0x0002_0080, // 8: v_cmp_lt_u32 s7, 0, v0
+                    0xBE84_0380, // 16: s_mov_b32 s4, 0
+                    0xD501_0001,
+                    cnd,         // 20: v_cndmask_b32 v1, v2, v3, s2
+                    0xBE86_0302, // 28: s_mov_b32 s6, s2
+                    0xBF06_8104, // 32: s_cmp_eq_u32 s4, 1
+                    0xBF85_0001, // 36: s_cbranch_scc1 -> 44
+                    copied,      // 40: s_mov_b32 s2, s6 (or s7)
+                    0x8004_8104, // 44: s_add_u32 s4, s4, 1
+                    0xBF0A_8404, // 48: s_cmp_lt_u32 s4, 4
+                    0xBF85_FFF7, // 52: s_cbranch_scc1 -> 20
+                    S_ENDPGM,
+                ],
+                false,
+            )
+        };
+        let p = program(0xBE82_0306);
+        let s = structure(&p).unwrap();
+        let phi = header(&p);
+        let back = phi.args[1];
+        assert!(p.blocks.iter().any(|b| b.phis.iter().any(|x| x.value == back)));
+        assert!(!s.masks.contains_key(&back));
+        assert_eq!(s.joined.get(&back), Some(&s.masks[&phi.value]));
+
+        // Another mask on one edge: a join of its own, which is not taken.
+        let p = program(0xBE82_0307);
+        let s = structure(&p).unwrap();
+        assert!(s.masks.contains_key(&header(&p).value));
+        assert!(s.joined.is_empty());
+    }
+
     #[test]
     fn data_loaded_where_a_mask_was_is_no_mask() {
         // s1 holds a mask on one path and a loaded value on the other; the
@@ -1689,6 +2007,88 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    /// `s_cselect` on the SCC a lane loop ended with (the blend-shape skinning
+    /// programs): the loop is left when no lane remains, so the select takes
+    /// its second operand; it was a uniform atom whose value no lane has.
+    #[test]
+    fn a_select_on_the_condition_a_lane_loop_ended_with_takes_its_second_operand() {
+        let cnd = 256 | (256 << 9) | (3 << 18);
+        let p = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
+                0xBF89_FFFC, // s_cbranch_execnz -> 8
+                0xBEFE_0303, // s_mov_b32 exec_lo, s3
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let select = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_cselect_b32")
+            .expect("the select");
+        let mask = select.write(Reg::S(3)).unwrap();
+        assert_eq!(s.masks.get(&mask), Some(&Bool::FALSE));
+    }
+
+    /// Not so inside the loop, before its branch (the flag is what the
+    /// round left), nor on the flag of an operation that writes no EXEC.
+    #[test]
+    fn a_select_on_a_mask_operations_flag_elsewhere_keeps_the_flag() {
+        let cnd = 256 | (256 << 9) | (3 << 18);
+        let inside = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xBF89_FFFB, // s_cbranch_execnz -> 8
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let other = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0x8A1C_7E1C, // s_andn2_b32 s28, s28, exec_lo
+                0xBEFE_031C, // s_mov_b32 exec_lo, s28
+                0xBF89_FFFB, // s_cbranch_execnz -> 8
+                0xBEFE_0303, // s_mov_b32 exec_lo, s3
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        for (p, writer) in [(inside, "s_andn2_wrexec_b32"), (other, "s_andn2_b32")] {
+            let s = structure(&p).unwrap();
+            let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+            let select = insts().find(|i| i.name() == "s_cselect_b32").expect("select");
+            let scc = insts().find(|i| i.name() == writer).expect("the flag's writer");
+            assert_eq!(select.read(Reg::Scc), scc.write(Reg::Scc), "{writer}");
+            let mask = s.masks[&select.write(Reg::S(3)).unwrap()];
+            let flag = Atom::Uniform(select.read(Reg::Scc).unwrap());
+            assert!(s.bools.support(mask).contains(&flag), "{writer}");
+        }
     }
 
     #[test]

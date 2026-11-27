@@ -118,9 +118,11 @@ impl HeapRefusal {
             ),
             #[cfg(windows)]
             Self::HostAllocator { len_bytes } => super::xmem::report_allocator_refusal(len_bytes),
+            // `xmem`, and the crash log's report of the host's commit, are
+            // Windows only.
             #[cfg(not(windows))]
             Self::HostAllocator { len_bytes } => {
-                tracing::warn!(len_bytes, "the host allocator refused a heap block")
+                tracing::warn!(len_bytes, "the host allocator refused APU heap memory")
             }
         }
     }

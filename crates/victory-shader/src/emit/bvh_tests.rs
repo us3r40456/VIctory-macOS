@@ -598,6 +598,8 @@ fn build(wide: bool, memory: bool) -> HostShader {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })
     .expect("lower");

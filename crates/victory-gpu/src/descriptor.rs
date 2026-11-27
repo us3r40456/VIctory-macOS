@@ -11,10 +11,19 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+pub(crate) mod ahead;
+#[cfg(windows)]
 pub(crate) mod host;
 // Also built for tests, which run where `host` cannot.
 #[cfg(any(windows, test))]
 mod paged;
+// mac: plain std too.
+#[cfg(any(windows, test))]
+pub(crate) mod pool;
+#[cfg(any(windows, test))]
+pub(crate) mod reports;
+#[cfg(any(windows, test))]
+pub(crate) mod slots;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -212,76 +221,174 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    /// A heap's start, its address, and the ranges written since the last sync.
-    type Written = (u64, usize, Vec<(usize, usize)>);
-    // The written ranges of every heap, taken in one short hold of the lock.
-    let work: Vec<Written> = {
-        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-        heaps
-            .iter()
-            .filter_map(|&(start, _, at)| {
-                // SAFETY: registered heaps are live (removed when dropped).
-                let heap = unsafe { &*(at as *const Heap) };
-                // As before: ranges are taken only once the heap has its
-                // host heap, so writes before that are not lost.
-                let (Some(Some(_)), Some(written), Some(_)) =
-                    (heap.host.get(), &heap.written, increment(heap.desc.kind))
-                else {
-                    return None;
-                };
-                Some((start, at, written.take(start as usize, usize::MAX)))
-            })
-            .collect()
-    };
-    // Then page by page, the lock held for one page at a time: title
-    // threads writing views (`mirror`) wait on it, and held across every
-    // page of every heap they waited ~100 ms a frame in the world (some
-    // 650,000 slots checked a frame, 29 submissions). A heap is not dropped
-    // while its page is made: `Heap::drop` takes the write lock to leave the
-    // list, so a heap still listed under the lock is alive.
-    let page_size = crate::watch::PAGE;
-    let mut page_buf = vec![0u8; page_size];
-    for (start, at, ranges) in work {
-        for (from, to) in ranges {
+    sync(None);
+}
+
+/// A round of [`sync_heaps`] while the host GPU runs a submission left to
+/// it ([`ahead`]): what the title wrote so far for the lists to come, but
+/// for the slots a round leaves ([`host::HostHeap::mirror`]). `ran` says
+/// that the GPU has run the submission: the round stops at the next page,
+/// and the pages it took and did not look at are kept for the next sync.
+#[cfg(windows)]
+pub(crate) fn sync_heaps_ahead(ran: &dyn Fn() -> bool) {
+    let _round = ahead::Round::start();
+    sync(Some(ran));
+}
+
+/// `VICTORY_HEAP_FAST_SKIP=1`: heap syncs look at a written page the way
+/// VIctory-macOS #279 does ([`host::HostHeap::sync_slots_bytes`]). Off
+/// unless asked for: this line's syncs have changed since (rounds ahead,
+/// told slots, slot locks), nothing here has run it in the game, and a
+/// tester of the Mac port reported loading screens that froze with it.
+#[cfg(windows)]
+fn fast_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_FAST_SKIP"))
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// A heap page's bytes, for [`fast_skip`]'s look.
+    static PAGE_BUF: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+#[cfg(windows)]
+fn sync(ran: Option<&dyn Fn() -> bool>) {
+    // mac: lock waits and made slots are counted as a sync's (`slots`).
+    let _syncing = slots::Syncing::enter();
+    // Held throughout: a heap is not dropped while its slots are made.
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
+            continue;
+        };
+        let step = u64::from(step);
+        // mac: the heap whose slots the title's own stores report
+        // (`VICTORY_HEAP_REPORTS`, `reports`; `No` without the switch).
+        let told = reports::told(start, heap.desc.count);
+        if told == reports::Told::Use {
+            // The told slots in place of the written pages; what rounds
+            // ahead left first, as below.
+            if ahead::on() && ran.is_none() {
+                host.sync_left(start, step);
+            }
+            if !sync_told(heap, host, start, step, ran) {
+                return;
+            }
+            // The fallback, in the sync before a submission every so many
+            // frames: the watch asked and its pages looked at whole, below.
+            if ran.is_some() || !reports::ask_due(crate::frame::current()) {
+                continue;
+            }
+        }
+        let mut runs = written.take(start as usize, usize::MAX);
+        // mac: what rounds ahead left comes first, the slots only before a
+        // submission.
+        if ahead::on() {
+            runs = host.with_left(runs);
+            if ran.is_none() && told != reports::Told::Use {
+                host.sync_left(start, step);
+            }
+        }
+        let mut runs = runs.into_iter();
+        while let Some((from, to)) = runs.next() {
+            // By page: one with nothing mapped (the title unmaps heap pages
+            // too) holds no records.
+            let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-                if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
-                    break;
-                }
-                // SAFETY: listed under the lock we hold, so not yet dropped.
-                let heap = unsafe { &*(at as *const Heap) };
-                let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind))
-                else {
-                    break;
-                };
-                let step = u64::from(step);
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                let len = end - page;
-                // By page: read the whole mapped range once; one with nothing
-                // mapped (the title unmaps heap pages too) holds no records.
-                if !crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
+                // mac: a round ahead ends when the GPU has run the
+                // submission; the rest of what it took is kept.
+                if ran.is_some_and(|ran| ran()) {
+                    host.leave(std::iter::once((page, to)).chain(runs));
+                    ahead::cut();
+                    return;
+                }
+                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = (
-                    (page as u64 - start) / step,
-                    (end as u64 - start).div_ceil(step),
-                );
+                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots_bytes(
-                    first as u32,
-                    last.min(u64::from(heap.desc.count)) as u32,
-                    start,
-                    step,
-                    page as u64,
-                    &page_buf[..len],
-                );
+                let (first, last) = (first as u32, last.min(u64::from(heap.desc.count)) as u32);
+                if told == reports::Told::No {
+                    // VIctory-macOS #279's look, on this line a switch
+                    // (`fast_skip`): the page read once, empty and verified
+                    // slots passed by without the view lock.
+                    if fast_skip() {
+                        let len = end - page;
+                        let mut buf = PAGE_BUF.take();
+                        buf.resize(page_size, 0);
+                        if crate::host::read_into(page as *const u8, &mut buf[..len]) {
+                            host.sync_slots_bytes(first, last, start, step, page as u64, &buf[..len]);
+                        }
+                        PAGE_BUF.set(buf);
+                        continue;
+                    }
+                    host.sync_slots(first, last, start, step);
+                    continue;
+                }
+                // mac: what the look finds changed is sorted by what told
+                // of it (`reports`), then made as ever.
+                let stale = host.stale_slots(first, last, start, step);
+                // SAFETY: records on a page of the heap found mapped above.
+                let is_view = |i: u32| unsafe { ((start + u64::from(i) * step) as *const u32).read_unaligned() } == VIEW_TAG;
+                reports::looked(start, first, last, &stale, is_view);
+                host.make_stale(stale, start, step);
             }
         }
+        if told == reports::Told::Check && ran.is_none() {
+            reports::clear_rest(start);
+        }
     }
+}
+
+/// mac: a heap sync of the slots the title's own stores told of
+/// (`VICTORY_HEAP_REPORTS=1`, [`reports`]) in place of the written pages:
+/// the same look and the same making ([`host::HostHeap::sync_slots`]), of
+/// those slots alone. By 64 KiB page of the title's heap, as the look at
+/// written pages goes: a page with nothing mapped holds no records, and a
+/// round ahead of a submission (`ran`) ends at the next page once the GPU
+/// has run it. False for a round that ended so: the slots it took and did
+/// not look at are told again.
+#[cfg(windows)]
+fn sync_told(heap: &Heap, host: &host::HostHeap, start: u64, step: u64, ran: Option<&dyn Fn() -> bool>) -> bool {
+    let runs = reports::take(start);
+    let page = crate::watch::PAGE as u64;
+    for (k, &(first, n)) in runs.iter().enumerate() {
+        let end = (first + n).min(heap.desc.count);
+        let mut at = first;
+        while at < end {
+            let address = start + u64::from(at) * step;
+            // The slots that start on this page.
+            let next_page = (address / page + 1) * page;
+            let to = end.min((next_page - start).div_ceil(step) as u32);
+            if ran.is_some_and(|ran| ran()) {
+                reports::put_back(start, at, first + n - at);
+                for &(first, n) in &runs[k + 1..] {
+                    reports::put_back(start, first, n);
+                }
+                ahead::cut();
+                return false;
+            }
+            if crate::host::read_into(address as *const u8, &mut [0u8; 4]) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncSlots, u64::from(to - at));
+                let stale = host.stale_slots(at, to, start, step);
+                reports::changed(stale.len());
+                host.make_stale(stale, start, step);
+            }
+            at = to;
+        }
+    }
+    true
 }
 
 /// Makes the views of slots `slots` that were left null (textures the title
@@ -412,6 +519,8 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         unregister_heap(&mut heaps, at);
+        // mac: its slots are told no more (`VICTORY_HEAP_REPORTS`).
+        reports::let_go(self.start);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
         // round, so it is taken here after the heaps' lock is let go.
@@ -490,7 +599,9 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        // Render target and depth views: a packed 16-bit target may be
+        // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
+        words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
@@ -992,6 +1103,12 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // mac: the title's own stores tell this heap's slots
+    // (`VICTORY_HEAP_REPORTS`; nothing without it).
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        reports::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     let at = std::ptr::from_ref::<Heap>(&heap) as usize;
     #[cfg(not(windows))]
@@ -1203,23 +1320,6 @@ pub(crate) mod tests {
         heap[0] = 0;
     }
 
-    /// An object of ours that frees itself at its last release, as a
-    /// resource does: its views go stale first (`forget`), and `FREED` notes
-    /// its address.
-    static FREED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-
-    fn freed(address: usize) -> bool {
-        FREED.lock().unwrap().contains(&address)
-    }
-
-    extern "system" fn release_resource_like(this: This) -> u32 {
-        if crate::object::refs(this) == 1 {
-            forget(this as usize);
-            FREED.lock().unwrap().push(this as usize);
-        }
-        crate::object::release_boxed::<crate::object::Object>(this)
-    }
-
     /// A null CBV description overwrites the slot (D3D12 null CBV), so a
     /// later read does not see the previous view.
     #[test]
@@ -1235,6 +1335,23 @@ pub(crate) mod tests {
         assert_eq!(view(a).as_deref(), Some(&View::Shader(0, None)));
         create_cbv(null, std::ptr::null(), a);
         assert_eq!(view(a).as_deref(), Some(&View::Constant(0, 0)));
+    }
+
+    /// An object of ours that frees itself at its last release, as a
+    /// resource does: its views go stale first (`forget`), and `FREED` notes
+    /// its address.
+    static FREED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    fn freed(address: usize) -> bool {
+        FREED.lock().unwrap().contains(&address)
+    }
+
+    extern "system" fn release_resource_like(this: This) -> u32 {
+        if crate::object::refs(this) == 1 {
+            forget(this as usize);
+            FREED.lock().unwrap().push(this as usize);
+        }
+        crate::object::release_boxed::<crate::object::Object>(this)
     }
 
     /// A released resource's views go stale; the same view of a new

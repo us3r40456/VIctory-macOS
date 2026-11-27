@@ -69,6 +69,10 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Programs that ask a writable image for its size: from its
+    /// descriptor's dwords only, by a query only, both ways (mac,
+    /// `emit::uav_size_queries`).
+    uav_sizes: [usize; 3],
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -133,6 +137,9 @@ impl Tally {
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
+        for (a, b) in self.uav_sizes.iter_mut().zip(other.uav_sizes) {
+            *a += b;
+        }
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
@@ -153,6 +160,23 @@ struct Checks {
     /// Translate for a host of 32-lane waves (`--wave32`, or the GPU
     /// `--pipelines` makes them on).
     wave32: bool,
+    /// With `wave32`: programs that read across the halves are translated
+    /// with each half as its own wave (`VICTORY_HALVES_LOCAL=1`, as `run`),
+    /// and one-wave groups share LDS between the halves without sync
+    /// (`VICTORY_HALVES_SHARED_LDS=1`).
+    halves_local: [bool; 2],
+    /// One-wave groups that share LDS get its exact order where there is
+    /// one (`VICTORY_HALVES_LDS_ORDER=1`, as `run`).
+    lds_order: bool,
+    /// Lane reads across the halves are handed over through group-shared
+    /// memory where every lane runs (`VICTORY_HALVES_EXCHANGE=1`, as `run`).
+    exchange: bool,
+    /// With `exchange`: every lane walks the skips around a hand-over
+    /// (`VICTORY_HALVES_WALK=1`, as `run`).
+    walk: bool,
+    /// With half-local reads: the Mac port's hand-over across the halves
+    /// comes before them (`VICTORY_HALVES_ACROSS=1`, as `run`).
+    across: bool,
 }
 
 pub fn run(
@@ -186,6 +210,32 @@ pub fn run(
     };
     if wave32 {
         println!("waves        of 32 lanes at most (wave64 programs in halves)");
+    }
+    let halves_local = [
+        victory_gpu::shader_cache::halves_local(),
+        victory_gpu::shader_cache::halves_shared_lds(),
+    ];
+    if halves_local[0] {
+        println!("halves       answer reads across them on their own (VICTORY_HALVES_LOCAL=1)");
+    }
+    if halves_local[1] {
+        println!("halves       share one-wave LDS without sync (VICTORY_HALVES_SHARED_LDS=1)");
+    }
+    let lds_order = victory_gpu::shader_cache::halves_lds_order();
+    if lds_order {
+        println!("LDS          of one-wave groups ordered exactly where it can be (VICTORY_HALVES_LDS_ORDER=1)");
+    }
+    let exchange = victory_gpu::shader_cache::halves_exchange();
+    if exchange {
+        println!("halves       hand lane reads over through shared memory where every lane runs (VICTORY_HALVES_EXCHANGE=1)");
+    }
+    let walk = victory_gpu::shader_cache::halves_walk();
+    if walk {
+        println!("halves       walk the skips around a hand-over, where that is exact (VICTORY_HALVES_WALK=1)");
+    }
+    let across = victory_gpu::shader_cache::halves_across();
+    if across {
+        println!("halves       hand reads over as VIctory-macOS does, before half-local reads (VICTORY_HALVES_ACROSS=1)");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -228,6 +278,11 @@ pub fn run(
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
                                 wave32,
+                                halves_local,
+                                lds_order,
+                                exchange,
+                                walk,
+                                across,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -297,6 +352,14 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if t.uav_sizes != [0; 3] {
+        let [descriptor, query, both] = t.uav_sizes;
+        println!(
+            "sizes        of writable images asked by {} programs: {descriptor} from descriptors, \
+             {query} by query, {both} both ways (--list names them)",
+            descriptor + query + both
+        );
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -581,11 +644,41 @@ fn translate(
                     let marks = emit::Options {
                         view_marks: true,
                         host_wave32: checks.wave32,
+                        halves_local: checks.halves_local[0],
+                        halves_shared_lds: checks.halves_local[1],
+                        lds_order: checks.lds_order,
+                        halves_exchange: checks.exchange,
+                        halves_walk: checks.walk,
+                        halves_across: checks.across,
                         ..Default::default()
                     };
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    let _ = emit::uav_size_queries();
+                    let emitted = emit::emit_with(&container, &p, &program, &s, &i, &r, marks);
+                    let sizes = emit::uav_size_queries();
+                    match emitted {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            // The other source of sizes: descriptors the
+                            // program reads only as numbers, which the host
+                            // fills in (`HostShader::view_addresses`).
+                            if t.list && shader.view_addresses {
+                                t.lines.push(format!(
+                                    "{}  descriptors read only as numbers (the host's view table)",
+                                    label()
+                                ));
+                            }
+                            if sizes != [0; 2] {
+                                let k = usize::from(sizes[1] != 0) * (1 + usize::from(sizes[0] != 0));
+                                t.uav_sizes[k] += 1;
+                                if t.list {
+                                    t.lines.push(format!(
+                                        "{}  sizes of writable images: {} from descriptors, {} by query",
+                                        label(),
+                                        sizes[0],
+                                        sizes[1]
+                                    ));
+                                }
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t

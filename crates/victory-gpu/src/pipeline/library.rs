@@ -716,8 +716,8 @@ pub(crate) fn save(now: bool) {
             // with it the pre-build's list that holds for its bytes. A load
             // reads the early list on its own, not from the library, so a
             // change of it is written alone: serialising the library holds
-            // this lock against every worker's loads and stores, for a list
-            // of 270 KB at most.
+            // this lock against every worker's stores, for a list of 270 KB
+            // at most.
             if !USED_CHANGED.swap(false, Ordering::Relaxed) {
                 return;
             }

@@ -291,6 +291,8 @@ pub fn build_bounded(
     })
 }
 
+pub(crate) mod walk;
+
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
 /// SGPR codes 0-127, SCC, VGPRs 0-255.

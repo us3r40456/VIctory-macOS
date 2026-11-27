@@ -148,6 +148,8 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         atomic_lock_rounds: false,
         atomic_umax: false,
         bias_as_gradients: false,

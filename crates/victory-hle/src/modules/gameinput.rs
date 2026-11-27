@@ -22,6 +22,10 @@ use super::xasync::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+// macOS port: input switches of our own (`VICTORY_INPUT_*`), off by default.
+#[path = "gameinput_mac.rs"]
+mod mac;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -359,6 +363,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// macOS port: our input switches.
+    mac: mac::Mac,
 }
 
 pub struct Hub {
@@ -400,6 +406,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                mac: mac::Mac::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -416,6 +423,7 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source);
+        hub.state().mac = mac::Mac::from_env();
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -502,23 +510,32 @@ impl State {
             }
             self.seen_input[slot].then_some(pad)
         });
+        self.mac.dead_zones(&mut pads);
         #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]
         let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = self.mac.latch(slot, pad, now);
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
             let base = fallback(&keys);
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
-                return Value::Pad(merge_pad(base, fallback(scripted)));
+                return merge_pad(base, fallback(scripted));
             }
-            Value::Pad(base)
+            base
         });
-        self.update(devices, FALLBACK, fallback, now, &mut events);
+        let fallback = self.mac.latch(FALLBACK, fallback, now);
+        self.update(
+            devices,
+            FALLBACK,
+            fallback.map(Value::Pad),
+            now,
+            &mut events,
+        );
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -652,7 +669,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -677,7 +694,14 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let handed = found.and_then(|r| hub.index(r.device));
+    let hr = hand(out, found);
+    if hr == S_OK
+        && let Some(index) = handed
+    {
+        state.mac.handed(index, now());
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -765,9 +789,13 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
+    let mut state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let hr = hand(out, history.iter().rev().find(|r| r.timestamp <= time));
+    if hr == S_OK {
+        state.mac.handed(index, now());
+    }
+    hr
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -1201,6 +1229,10 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// macOS port: `VICTORY_INPUT_REFOCUS`.
+        refocus: super::mac::Refocus,
+        /// macOS port: `VICTORY_INPUT_WATCH`.
+        watch: super::mac::Watch,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1217,30 +1249,41 @@ mod host {
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                self.watch.pad(slot, None, now());
                 return None;
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                self.watch.pad(slot, None, now());
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            let pad = convert(&state.Gamepad);
+            let packet = state.dwPacketNumber;
+            self.watch.pad(slot, Some((pad, packet)), now());
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            // macOS port: scripted keys also in the normal build, so a test
+            // run needs nobody at the keyboard (empty unless VICTORY_KEYS is set).
             let mut down = scripted();
-            if focused() {
+            let focused = focused();
+            let mut held = Vec::new();
+            if focused {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
+                held = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
             }
+            self.refocus.filter(focused, &mut held);
+            down.extend(held);
+            self.watch.keys(&down, now());
             down.into_iter().map(key_state).collect()
         }
 
@@ -1273,10 +1316,17 @@ mod host {
     /// In every build, so that unattended runs can get past the title's
     /// prompts; unset, it holds nothing.
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        // macOS port: `<seconds>:<key>[:<seconds held>]`; a key is held
+        // 0.2 s unless the entry says how long (a stick direction needs
+        // seconds at a frame or two per second).
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8, Duration)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
+                let (key, held) = match key.split_once(':') {
+                    Some((key, held)) => (key, Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?),
+                    None => (key, Duration::from_millis(200)),
+                };
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1294,6 +1344,7 @@ mod host {
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
+                    held,
                 ))
             });
             (Instant::now(), keys.collect())
@@ -1301,8 +1352,8 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, _, held)| (at..at + held).contains(&now))
+            .map(|&(_, vk, _)| vk)
             .collect()
     }
 
@@ -1803,6 +1854,55 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r), physical);
         release(r);
+    }
+
+    #[test]
+    fn latch_shows_a_tap_between_readings_once_and_held_buttons_while_held() {
+        let (hub, host) = fake();
+        let set = |buttons| {
+            host.lock().unwrap().pads[1] = Some(PadState {
+                buttons,
+                left_x: 0.1,
+                ..Default::default()
+            })
+        };
+        let read = || {
+            let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+            let buttons = pad(r).buttons;
+            release(r);
+            buttons
+        };
+        let tap = || {
+            set(A);
+            hub.poll();
+            set(0);
+            hub.poll();
+        };
+        set(0);
+        hub.poll();
+        // Off (the default): the title never sees a tap between two readings.
+        tap();
+        assert_eq!(read(), 0);
+
+        hub.state().mac = mac::latch_for_tests(0);
+        hub.poll();
+        assert_eq!(read(), 0);
+        tap();
+        assert_eq!(read(), A, "the tap");
+        hub.poll();
+        assert_eq!(read(), 0, "once");
+        hub.poll();
+        assert_eq!(read(), 0);
+
+        // Held across readings: down in each, up in the first after release.
+        set(B);
+        for _ in 0..3 {
+            hub.poll();
+            assert_eq!(read(), B);
+        }
+        set(0);
+        hub.poll();
+        assert_eq!(read(), 0);
     }
 
     #[test]

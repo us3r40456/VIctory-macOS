@@ -265,6 +265,12 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// From 64bitMango 131721b7 (`VICTORY_VETTED_PAGES=1`): pages found to be
+    /// the runtime's GPU memory when they were last guarded, with the page
+    /// their region was known to end before: guarded again after a write
+    /// opened them, they are not asked about again. Forgotten when the
+    /// runtime maps or unmaps them and when no tracker holds them any more.
+    vetted: BTreeMap<usize, usize>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -277,11 +283,117 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    vetted: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet::new(),
 });
+
+/// mac: since the last frame line, microseconds threads waited for the
+/// guard lock (in the title's write faults, elsewhere), microseconds in
+/// protection calls and their number ([`frame_line`]). A lock taken at once
+/// is not timed; a clock read costs a Wine call.
+static TIMES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether pages guarded before are guarded again without asking what memory
+/// they are (`VICTORY_VETTED_PAGES=1`, from 64bitMango 131721b7; off by default).
+fn vetted_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_VETTED_PAGES"))
+}
+
+/// mac: since the last frame line, the exceptions the write-fault handler
+/// (the first vectored handler) saw: write faults that opened a guarded
+/// block, that found it writable already (another thread's fault opened it),
+/// that were not ours, and every other exception.
+static FAULTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn fault(kind: usize) {
+    FAULTS[kind].fetch_add(1, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// mac: whether this thread is in the write-fault handler ([`TIMES`]).
+    static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A protection call `f`, timed and counted ([`TIMES`]).
+fn timed_protect(f: impl FnOnce() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    let done = f();
+    TIMES[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    TIMES[3].fetch_add(1, Ordering::Relaxed);
+    done
+}
+
+/// From 64bitMango e4444060 (`VICTORY_OPENED_FAULTS=1`, off by default):
+/// blocks a title write fault opened that nothing has guarded since, by a
+/// slot their number picks (0: none). Set under the guard lock by the fault
+/// that opened the block, after every tracker holding it was marked;
+/// cleared before the block is guarded again (and when it is remapped or
+/// no tracker holds it); read without the lock by a fault on a block
+/// another thread's fault opened meanwhile, which then has nothing to do.
+/// One block's entry may push out another's: that one's next fault takes
+/// the lock, as before. Fixed and never allocated: the handler writes it.
+static OPENED_BLOCKS: [AtomicU64; 1 << 12] = [const { AtomicU64::new(0) }; 1 << 12];
+
+/// Whether faults on blocks found open skip the lock (`VICTORY_OPENED_FAULTS`).
+fn opened_faults() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_OPENED_FAULTS"))
+}
+
+fn opened_slot(page: usize) -> &'static AtomicU64 {
+    &OPENED_BLOCKS[((page as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize % OPENED_BLOCKS.len()]
+}
+
+/// A title write fault opened `page` (under the guard lock).
+fn note_opened(page: usize) {
+    if opened_faults() {
+        opened_slot(page).store(page as u64 + 1, Ordering::Release);
+    }
+}
+
+/// `[first, last)` is about to be guarded, or shows something new: not
+/// open from a fault any more.
+fn forget_opened(first: usize, last: usize) {
+    if opened_faults() {
+        for page in first..last {
+            let _ = opened_slot(page).compare_exchange(page as u64 + 1, 0, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether a fault opened `page` and nothing guarded it since.
+fn opened(page: usize) -> bool {
+    opened_faults() && opened_slot(page).load(Ordering::Acquire) == page as u64 + 1
+}
+
+thread_local! {
+    /// The last block this thread found open, and how many faults in a row
+    /// it has had there: past three it takes the lock, should the block be
+    /// read-only for another reason.
+    static FOUND_OPEN: std::cell::Cell<(usize, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// mac: the end of the frame line, per frame over `frames` frames: the
+/// guard lock's waits and the protection calls.
+pub(crate) fn frame_line(frames: f64) -> String {
+    let [faults, others, protect, calls, vetted] =
+        TIMES.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let [opened, writable, foreign, other, found] =
+        FAULTS.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!(
+        "; guard lock waits {:.1} ms ({:.1} ms of it in write faults), protection calls {:.1} ms ({calls:.0}), {vetted:.0} pages guarded again unasked (VICTORY_VETTED_PAGES); \
+         exceptions {:.0}: write faults {opened:.0} opened a guarded block, {writable:.0} found it writable, \
+         {foreign:.0} not ours, {found:.0} found it open (no lock, VICTORY_OPENED_FAULTS), {other:.0} others",
+        (faults + others) / 1e3,
+        faults / 1e3,
+        protect / 1e3,
+        opened + writable + foreign + other + found
+    )
+}
 
 thread_local! {
     /// Whether this thread holds the guard lock. A guarded block it faults
@@ -333,7 +445,18 @@ struct Held {
 #[track_caller]
 fn guards() -> Held {
     use std::sync::atomic::Ordering::AcqRel;
-    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    // mac: a wait for the lock is timed ([`TIMES`]).
+    let guard = match GUARDS.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+            let k = usize::from(!IN_FAULT.with(|f| f.get()));
+            TIMES[k].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            guard
+        }
+    };
     HOLDING.with(|h| h.set(true));
     let mut held = Held {
         guard: Some(guard),
@@ -486,6 +609,23 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     })
 }
 
+/// Whether `protect_noting` asks about runs of pages at once
+/// (`VICTORY_WATCH_RUNS=1`, off by default).
+fn watch_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_RUNS"))
+}
+
+/// Whether all of `[at, at + len)` lies in one write-watched pool (one
+/// lookup: the watch answers for a range only when one watched allocation
+/// holds all of it).
+fn write_watched_range(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    // SAFETY: room for one answer; no reset, so nothing changes.
+    unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+}
+
 /// Whether the page holding `at` is in a write-watched pool (one lookup).
 fn write_watched(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -563,7 +703,10 @@ impl Drop for Tracked {
         for page in free {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
+                g.vetted.remove(&page);
                 open(&mut g, page);
+                // Nobody's any more: what is there next is not known open.
+                forget_opened(page, page + 1);
             }
         }
     }
@@ -577,7 +720,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
     }
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    timed_protect(|| unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) } != 0);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, 1);
     true
@@ -592,7 +735,7 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
     }
     let mut old = 0;
     // SAFETY: blocks we made read-only.
-    if unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } == 0 {
+    if !timed_protect(|| unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } != 0) {
         for page in first..last {
             open(g, page);
         }
@@ -816,8 +959,11 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         #[cfg(test)]
         tests::PROTECTS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
+        // Before it is read-only: a fault that still finds it open writes
+        // while it is open, ahead of the caller's copy.
+        forget_opened(from, to);
         // SAFETY: title memory; only its protection changes.
-        unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
+        timed_protect(|| unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 })
     };
     let unmapped = |page: usize| {
         // SAFETY: plain data filled in by the query.
@@ -840,13 +986,32 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     // (the runtime's page mappings make one per page) failed and was then
     // guarded page by page, one call more than needed.
     let mut allowed = RuntimeRegions::default();
+    // From 64bitMango 131721b7: asking costs up to three calls into Wine per
+    // page of a physical-page view (one view a page) under this lock, which
+    // the title's write faults wait for; what the answer depends on changes
+    // only when the runtime maps or unmaps the memory (`VICTORY_VETTED_PAGES`).
+    let vetted = vetted_pages();
+    // Where the run of consecutive pages each page starts ends: a pool is
+    // asked about once for the run (`VICTORY_WATCH_RUNS`).
+    let mut run_ends = vec![0; pages.len()];
+    for i in (0..pages.len()).rev() {
+        run_ends[i] = match pages.get(i + 1) {
+            Some(&next) if next == pages[i] + 1 => run_ends[i + 1],
+            _ => pages[i] + 1,
+        };
+    }
     let (pages, ends): (Vec<usize>, Vec<usize>) = pages
         .into_iter()
-        .filter_map(|p| {
+        .zip(run_ends)
+        .filter_map(|(p, run_end)| {
             if g.protected.contains(&p) {
                 return Some((p, usize::MAX));
             }
-            allowed.region(p).map(|end| (p, end))
+            if vetted && let Some(&end) = g.vetted.get(&p) {
+                TIMES[4].fetch_add(1, Ordering::Relaxed);
+                return Some((p, end));
+            }
+            allowed.region(p, run_end).map(|end| (p, end))
         })
         .unzip();
     let mut i = 0;
@@ -866,16 +1031,23 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             i += 1;
         }
         let run = &pages[first..=i];
+        let run_ends = &ends[first..=i];
         i += 1;
         if set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
             taken.extend(run);
+            if vetted {
+                g.vetted.extend(run.iter().copied().zip(run_ends.iter().copied()));
+            }
             continue;
         }
-        for &page in run {
+        for (&page, &end) in run.iter().zip(run_ends) {
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
+                if vetted {
+                    g.vetted.insert(page, end);
+                }
             } else if unmapped(page) {
                 taken.push(page);
                 unmapped_pages.push(page);
@@ -897,7 +1069,9 @@ struct RuntimeRegions {
 impl RuntimeRegions {
     /// If `page` is the runtime's GPU memory, the page its region is known
     /// to end before (`usize::MAX` for a pool, whose end is not asked).
-    fn region(&mut self, page: usize) -> Option<usize> {
+    /// `run_end`: where the run of consecutive pages asked about from `page`
+    /// on ends.
+    fn region(&mut self, page: usize, run_end: usize) -> Option<usize> {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
@@ -905,6 +1079,15 @@ impl RuntimeRegions {
             && (a..b).contains(&page)
         {
             return yes.then_some(b);
+        }
+        // mac: one lookup for the whole run when one pool holds all of it
+        // (`VICTORY_WATCH_RUNS=1`): the profile of 27 November counted 9.7 ms
+        // a frame of `NtGetWriteWatch`, 94 % of it here, page by page, under
+        // the guard lock. The range question answers as the page ones do
+        // (`runtime_pages` asks it so).
+        if watch_runs() && run_end > page + 1 && write_watched_range(page * PAGE, (run_end - page) * PAGE) {
+            self.last = Some((page, run_end, true));
+            return Some(usize::MAX);
         }
         // A pool's write watch answers with one lookup. `VirtualQuery` walks
         // Wine's page table to the region's end, under the guard lock that
@@ -946,10 +1129,10 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // open, a write by another thread lands without a fault, and a save
     // after it would keep that write as the page's old bytes.
     mark_changed(g, first, last, save);
-    // The pages showing the same memory are marked, not opened: nothing
-    // writes through them now, and opening them only made the next take
-    // guard them again, one Wine call each (two thirds of all protection
-    // changes in #50's world).
+    // The pages showing the same memory elsewhere are marked, not opened:
+    // nothing writes through them now, and opening them only made the next
+    // take guard them again, one Wine call each (two thirds of all
+    // protection changes in #50's world).
     for page in others {
         mark_changed(g, page, page + 1, save);
     }
@@ -973,7 +1156,7 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
     }
 }
 
-/// Marks pages `[first, last)` changed in every tracker holding them,
+/// Marks `[first, last)` changed in the trackers holding its pages,
 /// leaving their protection as it is. With `save`, before the write lands:
 /// trackers armed for a page they had taken keep its bytes.
 fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
@@ -1043,10 +1226,19 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    forget_opened(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // First (before the guard lock): a texture copy-back landing there now
+    // is let finish, and none pending lands after (`crate::texback`).
+    crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
+    // Nor what it was: asked about again when next guarded.
+    let gone: Vec<usize> = g.vetted.range(first..last).map(|(&p, _)| p).collect();
+    for page in gone {
+        g.vetted.remove(&page);
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1061,22 +1253,35 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Reports GPU shader writes into aliased title memory `[at, at + len)` so
-/// any other trackers over those pages (such as textures' staging) know they
-/// changed and re-upload on next use. Fast-paths out when no tracker or alias
-/// covers the range.
-pub(crate) fn notify_written(at: usize, len: usize) {
+/// Shaders wrote aliased title memory `[at, at + len)` (`crate::alias`):
+/// every tracker holding its pages (textures' staging, heaps, other host
+/// copies), and the pages showing the same memory elsewhere, sees them
+/// changed. Nothing is saved (the write happened; there is no "before" to
+/// keep) and no guard is opened: a GPU write does not go through the CPU's
+/// page protection, so the title's own writes stay seen. Opened, as through
+/// [`changed`] in VIctory-macOS #207, each run of pages cost two protection
+/// calls a submission and the title's next write there a fault. The idea is
+/// Marvisak/VIctory 29decb3's `watch::gpu_wrote` (derz92's good pair on
+/// VIctory-macOS #322 ran with a marking patch of their own). Returns the
+/// tracked pages marked.
+pub(crate) fn notify_written(at: usize, len: usize) -> usize {
     if len == 0 {
-        return;
+        return 0;
     }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     if g.holders.range(first..last).next().is_none()
         && g.alias_of.range(first..last).next().is_none()
     {
-        return;
+        return 0;
     }
-    changed(&mut g, first, last, false);
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    let marked = g.holders.range(first..last).count() + others.iter().filter(|p| g.holders.contains_key(p)).count();
+    mark_changed(&mut g, first, last, false);
+    for page in others {
+        mark_changed(&mut g, page, page + 1, false);
+    }
+    marked
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
@@ -1153,6 +1358,9 @@ fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // mac: the sampler leaves a thread alone while it takes exceptions
+        // (`crate::profile::excepted`; one load without `VICTORY_PROFILE`).
+        crate::profile::excepted();
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
@@ -1160,30 +1368,61 @@ fn install() {
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
+            fault(3);
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+        // From 64bitMango e4444060: another thread's fault opened the block
+        // while this one was on its way here; every tracker is marked and
+        // write access is back, so there is nothing to do and no lock to
+        // wait for (`VICTORY_OPENED_FAULTS`).
+        if opened(at / PAGE) {
+            let again = FOUND_OPEN.with(|f| {
+                let (last, n) = f.get();
+                let n = if last == at { n.saturating_add(1) } else { 1 };
+                f.set((at, n));
+                n
+            });
+            if again <= 3 {
+                fault(4);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        FOUND_OPEN.with(|f| f.set((0, 0)));
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         if HOLDING.with(|h| h.get()) {
             if read_only(at) {
                 open_under_lock(at / PAGE);
+                fault(0);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            fault(2);
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        IN_FAULT.with(|f| f.set(true));
         let mut g = guards();
+        IN_FAULT.with(|f| f.set(false));
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+            fault(0);
+            // Every tracker holding it is marked: other threads' faults on
+            // it need no lock.
+            note_opened(at / PAGE);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            // mac: who wrote a block of the title's view heap last
+            // (`VICTORY_HEAP_REPORTS`; one load without it).
+            crate::descriptor::reports::faulted(at, r.ExceptionAddress as usize);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
+            fault(1);
             EXCEPTION_CONTINUE_EXECUTION
         } else {
+            fault(2);
             EXCEPTION_CONTINUE_SEARCH
         }
     }

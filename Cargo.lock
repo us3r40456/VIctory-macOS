@@ -749,6 +749,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "victory-formats",
+ "victory-gpu",
  "victory-pipeline",
  "victory-shader",
  "windows",

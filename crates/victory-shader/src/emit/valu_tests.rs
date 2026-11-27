@@ -156,6 +156,8 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })?;
 
@@ -1694,6 +1696,23 @@ fn lower_cs32_with(
     atomic_lock_rounds: bool,
     atomic_umax: bool,
 ) -> HostShader {
+    lower_cs32_mac(
+        words,
+        used,
+        validate,
+        (atomic_locks, atomic_lock_rounds, atomic_umax),
+        Default::default(),
+    )
+}
+
+/// [`lower_cs32_with`], with the Mac line's settings `mac`.
+fn lower_cs32_mac(
+    words: &[u32],
+    used: &[(u8, ResourceType, u32, u8)],
+    validate: bool,
+    (atomic_locks, atomic_lock_rounds, atomic_umax): (bool, bool, bool),
+    mac: lower::Mac,
+) -> HostShader {
     let param = |root, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -1752,6 +1771,8 @@ fn lower_cs32_with(
         bias_as_gradients: super::host::under_wine(),
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac,
         view_marks: false,
     })
     .expect("lower");
@@ -2054,6 +2075,114 @@ fn image_atomics_of_64_bits() {
             if locks {
                 assert!(out[1].iter().all(|&w| w == 0), "{label}: a lock left taken or a page marked");
             }
+        }
+    }
+}
+
+/// 64-bit unsigned maxima under locks with the lanes that cannot change
+/// the texel left out of the lock loop (`lower::mac`, "Lock writers"):
+/// the texels are what the lock loop alone leaves. 32 lanes; all write
+/// `a` to texel (0, 0), where lanes of four high dwords meet, eight lanes
+/// with each and different low dwords; lane `l` writes `a` then `b` to
+/// (l, 1) and `b` then `a` to (l, 2), so in each of those rows the second
+/// value has the lower high dword in some lanes. Compute has no helper
+/// lanes: that setting is covered by the translation tests only
+/// (`mac_tests`).
+#[test]
+fn image_maxima_of_64_bits_lock_only_where_they_can_change_the_texel() {
+    let (v0, v5) = (vgpr(0), vgpr(5));
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    // s_load_dwordx8 s[8:15], s[4:5], 0: the texture's descriptor.
+    words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1, 125 << 25]);
+    words.extend([
+        0x1B << 25 | 5 << 17 | (v0 as u32 & 0xFF) << 9 | 131, // v_and_b32 v5, 3, v0
+        0x26 << 25 | 1 << 17 | (v0 as u32 & 0xFF) << 9 | 159, // v_sub_nc_u32 v1, 31, v0
+        0x1A << 25 | 2 << 17 | (v5 as u32 & 0xFF) << 9 | 158, // v_lshlrev_b32 v2, 30, v5
+        vop1(0x001, 14, 128),
+        vop1(0x001, 15, 128),
+        vop1(0x001, 3, v0),
+        vop1(0x001, 4, 129),
+        vop1(0x001, 8, v0),
+        vop1(0x001, 9, 129),
+    ]);
+    // a = (31 - l) | (l & 3) << 62 into texel (0, 0), then a and b = l |
+    // 1 << 32 into (l, 1), then b and a into (l, 2).
+    words.extend(image_atomic(0x17, 1, 14, 8, 3, false));
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    words.extend(image_atomic(0x17, 8, 3, 8, 3, false));
+    words.push(vop1(0x001, 4, 130));
+    words.extend(image_atomic(0x17, 8, 3, 8, 3, false));
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    words.push(S_ENDPGM);
+    let key = |lo: u32, hi: u32| u64::from(lo) | u64::from(hi) << 32;
+    let a = |l: u32| key(31 - l, (l & 3) << 30);
+    let b = |l: u32| key(l, 1);
+    let mut want = vec![0u64; 32 * 4];
+    want[0] = (0..32).map(a).max().unwrap();
+    for l in 0..32 {
+        want[32 + l as usize] = a(l).max(b(l));
+        want[64 + l as usize] = a(l).max(b(l));
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let settings = [
+        ("lock loop", lower::Mac::default()),
+        (
+            "low keys stay out",
+            lower::Mac {
+                lock_keys: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "low keys and helper lanes stay out",
+            lower::Mac {
+                lock_keys: true,
+                lock_helpers: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    // Each with the lock loop alone and with the lock tried in rounds first
+    // (VIctory-macOS #257, what a run has by default since it was merged).
+    for ((setting, mac), rounds) in settings.into_iter().flat_map(|s| [(s, false), (s, true)]) {
+        let setting = format!("{setting}{}", if rounds { ", rounds first" } else { "" });
+        let locks = (true, rounds, false);
+        let shader = lower_cs32_mac(&words, &[(4, ResourceType::Uav, 0, 8)], true, locks, mac);
+        assert!(shader.view_marks, "the lock words' buffer");
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let label = format!("{label}, {setting}");
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
+                ud[u.index as usize] = 0;
+            }
+            let roots = vec![
+                (0, Root::Constants(ud)),
+                (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE, 0] }),
+                (2, Root::Uav(super::VIEW_WRITES_BYTES / 4)),
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &[View::Uint2TextureUav(32, 4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let got: Vec<u64> = out[0].chunks(2).map(|t| key(t[0], t[1])).collect();
+            assert_eq!(got, want, "{label}");
+            assert!(out[1].iter().all(|&w| w == 0), "{label}: a lock left taken or a page marked");
         }
     }
 }
@@ -2733,6 +2862,95 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             got, want,
             "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn v_cvt_f32_f64_matches_ieee754() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
+    let plain = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    // Same with abs + neg on src0 (VOP3: abs[0] = bit 8 of w0, neg[0] = bit 29 of w1).
+    let [mut w0, mut w1] = vop3(0x18f, 0, vgpr(1), 0, 0);
+    w0 |= 1 << 8;
+    w1 |= 1 << 29;
+    let neg_abs = build_valu_cs(&[w0, w1]);
+
+    let values: &[f64] = &[
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        3.5,
+        -123456.75,
+        // Tie-to-even: even mantissa stays, odd mantissa rounds up.
+        f64::from_bits(0x3FF0_0000_1000_0000), // 1.0 + 0.5 ulp(f32) -> 1.0
+        f64::from_bits(0x3FF0_0000_3000_0000), // (1.0 + 1 ulp) + 0.5 ulp -> 1.0 + 2 ulp
+        f64::from_bits(0x3FF0_0000_1000_0001), // > 0.5 ulp -> rounds up
+        // Largest finite f32 and overflow to +Inf / -Inf.
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * 1.000_001,
+        -f64::from(f32::MAX) * 1.000_001,
+        1e300,
+        // Subnormal range (exp64 in [874, 896]), including carry into smallest normal.
+        f64::from(f32::MIN_POSITIVE),
+        f64::from(f32::MIN_POSITIVE) * 0.5,
+        f64::from(f32::MIN_POSITIVE) * 0.75,
+        f64::from(f32::from_bits(0x007F_FFFF)),
+        f64::from_bits(0x380F_FFFF_F000_0000), // max subnormal + 0.5 ulp -> min normal
+        // exp64 == 873: exact 2^-150 ties to 0; strictly greater rounds to min subnormal (1).
+        f64::from_bits(0x3690_0000_0000_0000),
+        f64::from_bits(0x3690_0000_0000_0001),
+        f64::from_bits(0xB690_0000_0000_0001),
+        // Deep underflow -> +/-0.0.
+        1e-200,
+        -1e-200,
+        // Infinities and NaNs.
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0000), // +qNaN
+        f64::from_bits(0x7FF0_0000_0000_0001), // +sNaN -> quieted
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .map(|&x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&plain, &inputs, |backend, i, _, got| {
+        let x = values[i];
+        let want = (x as f32).to_bits();
+        if x.is_nan() {
+            assert!(
+                f32::from_bits(got).is_nan() && (got & 0x0040_0000) != 0,
+                "{backend}: v_cvt_f32_f64({:#018x}) = {got:#010x}, expected qNaN",
+                x.to_bits(),
+            );
+        } else {
+            assert_eq!(
+                got, want,
+                "{backend}: v_cvt_f32_f64({x} / {:#018x}) = {got:#010x}, want {want:#010x}",
+                x.to_bits(),
+            );
+        }
+    });
+
+    // -|x| via VOP3 abs + neg modifiers.
+    let mod_values: &[f64] = &[2.5, -2.5, 0.0, f64::INFINITY];
+    let mod_in: Vec<[u32; 4]> = mod_values
+        .iter()
+        .map(|&x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&neg_abs, &mod_in, |backend, i, _, got| {
+        let x = mod_values[i];
+        let want = (-(x.abs()) as f32).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_f32_f64(-|{x}|) = {got:#010x}, want {want:#010x}",
         );
     });
 }

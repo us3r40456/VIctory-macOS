@@ -279,7 +279,8 @@ unsafe impl Sync for Staging {}
 /// get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+        // mac: a flag of ours only (`Step::Own`).
+        list.defer_own(0, 0, move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
     }
 }
 

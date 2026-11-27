@@ -23,7 +23,14 @@
 
 #[cfg(windows)]
 mod crash;
+pub mod descriptor_sites;
+pub mod map_budget;
+pub mod map_evict;
 pub mod masked;
+pub mod pool_watch;
+pub mod probe_guard;
+pub mod srl_slice;
+pub mod time_step;
 pub mod wide;
 #[cfg(windows)]
 mod patch;
@@ -31,6 +38,7 @@ pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
+pub mod upscaler_patch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]

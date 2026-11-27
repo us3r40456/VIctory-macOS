@@ -55,7 +55,19 @@ pub fn run(
     if execute {
         // Before the host's own memory (the image read below, the GPU
         // device, the caches) takes the space the title's 32-bit memory needs.
-        victory_hle::modules::xmem::low_guards::install();
+        // macOS port: off under Rosetta unless VICTORY_LOW_GUARDS=1. With the guards in
+        // place, a later address-limited allocation has made Wine search for free space
+        // for minutes while it held its virtual-memory lock (three stalled runs on
+        // 26 November, watchdog at +0x23cf683); the start-up failure the guards fix on
+        // Windows has not been seen here.
+        let low_guards = match std::env::var("VICTORY_LOW_GUARDS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => !victory_gpu::rosetta(),
+        };
+        if low_guards {
+            victory_hle::modules::xmem::low_guards::install();
+        }
     }
     let cfg = victory_core::Config::load()?;
     // Before the import registry is first used: it holds the module only
@@ -157,7 +169,7 @@ pub fn run(
         }
     }
     // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
-    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`, `VICTORY_UI_SIZE`; each
     // off without it), ported from avatarmanz/VIctory-7900XTX.
     #[cfg(windows)]
     if execute {
@@ -182,6 +194,104 @@ pub fn run(
         let (n, refused) =
             victory_loader::wide::patch(image.base() as u64, std::path::Path::new(&list));
         println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
+    }
+    // macOS port: the title's stores of descriptor records tell the layer
+    // the slots they write (victory_loader::descriptor_sites,
+    // victory_gpu::heap_reports); off unless asked for.
+    #[cfg(windows)]
+    if victory_gpu::heap_reports::wanted() {
+        use victory_loader::descriptor_sites::{MARKS_LEN, SITES, SWITCH, apply};
+        const _: () = assert!(MARKS_LEN == victory_gpu::heap_reports::MARKS_LEN);
+        let form = match victory_gpu::heap_reports::mode() {
+            victory_gpu::heap_reports::Mode::Check => "check",
+            _ => "1",
+        };
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and
+        // the cells are a static.
+        let done = unsafe { apply(image.base(), size, victory_gpu::heap_reports::marks_address(), &SITES) };
+        match done {
+            Ok(n) => println!(
+                "heap reports   on ({SWITCH}={form}): {n} of {} descriptor record stores of the title tell the layer their slots; its memcpy and memmove are bound to tell too",
+                SITES.len()
+            ),
+            Err(why) => println!(
+                "heap reports   on ({SWITCH}={form}), but the title's descriptor record stores are not patched: {why}; heap syncs look at the written pages as before"
+            ),
+        }
+        victory_gpu::heap_reports::hooked(image.base(), size, done.unwrap_or(0), SITES.len());
+    }
+    // macOS port: a way out of a title lookup that can loop forever
+    // (victory_loader::probe_guard); off unless asked for.
+    let guard_lookup = std::env::var("VICTORY_GUARD_LOOKUP").as_deref() == Ok("1");
+    if guard_lookup {
+        match victory_loader::probe_guard::patch(image.base() as u64) {
+            Ok(()) => println!("lookup guard   on: the lookup at +0x50eb750 gives up when its key is absent"),
+            Err(why) => println!("lookup guard   not applied: {why}"),
+        }
+    }
+    // macOS port: the title's time budget for placing map pieces, made
+    // larger (victory_loader::map_budget); off unless asked for.
+    if let Some(k) = victory_loader::map_budget::wanted(std::env::var(victory_loader::map_budget::SWITCH).ok().as_deref())
+    {
+        match victory_loader::map_budget::patch(image.base() as u64, k) {
+            Ok(()) => println!(
+                "map budget     on: {} to {} us a frame for placing map pieces (the title's limits times {k})",
+                250 * k,
+                1250 * k
+            ),
+            Err(why) => println!("map budget     not applied: {why}"),
+        }
+    }
+    // macOS port: the time a frame the title's streaming request list may
+    // spend issuing requests, made larger (victory_loader::srl_slice); off
+    // unless asked for.
+    if let Some(k) = victory_loader::srl_slice::wanted(std::env::var(victory_loader::srl_slice::SWITCH).ok().as_deref())
+    {
+        match victory_loader::srl_slice::patch(image.base() as u64, k) {
+            Ok(us) => println!(
+                "request slice  on: {us} us a frame for a time-sliced request list (the title's 500; asked for times {k}, took times {})",
+                us / 500
+            ),
+            Err(why) => println!("request slice  not applied: {why}"),
+        }
+    }
+    // macOS port: the longest step the title's clamped timers take in a
+    // frame, made longer (victory_loader::time_step); off unless asked for.
+    if let Some(seconds) =
+        victory_loader::time_step::wanted(std::env::var(victory_loader::time_step::SWITCH).ok().as_deref())
+    {
+        match victory_loader::time_step::patch(image.base() as u64, seconds) {
+            Ok(step) => println!(
+                "time step      on: the title's clamped timers step up to {step} s a frame (the title's 1/15 s; asked for {seconds})"
+            ),
+            Err(why) => println!("time step      not applied: {why}"),
+        }
+    }
+    // macOS port: map pieces nobody asks for any more are put out when the
+    // title's pool of buildings fills up (victory_loader::map_evict); off
+    // unless asked for.
+    if victory_loader::map_evict::wanted(std::env::var(victory_loader::map_evict::SWITCH).ok().as_deref()) {
+        match victory_loader::map_evict::patch(image.base() as u64) {
+            Ok(()) => println!(
+                "map evict      on: pieces let go of, 1.5 km from the player for 10 s, go while the building pool is half full"
+            ),
+            Err(why) => println!("map evict      not applied: {why}"),
+        }
+    }
+    // macOS port: on a Series S the title's upscaler choice returns its own
+    // upscaler (type 6), not FSR 4, whose passes show nothing here
+    // (victory_loader::upscaler_patch); `VICTORY_UPSCALER_PATCH=0` leaves it.
+    if let Some(line) = victory_loader::upscaler_patch::at_start(
+        matches!(console, Console::SeriesS),
+        std::env::var(victory_loader::upscaler_patch::SWITCH).ok().as_deref(),
+        &hash,
+        // In the registry only when the host's FidelityFX serves.
+        victory_hle::registry().iter().any(|m| m.serves("amd_fidelityfx_loader_xbox.dll")),
+        image.base() as u64,
+        image.info().size_of_image,
+    ) {
+        println!("upscaler       {line}");
     }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
@@ -214,6 +324,7 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
     let imported: Vec<&str> = image
         .info()
@@ -274,6 +385,19 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    if guard_lookup {
+        victory_loader::probe_guard::watch();
+    }
+    // macOS port: the title's pools of buildings and objects in the log
+    // (victory_loader::pool_watch); off unless asked for.
+    if victory_loader::pool_watch::watch_wanted(
+        std::env::var(victory_loader::pool_watch::WATCH_SWITCH).ok().as_deref(),
+    ) {
+        match victory_loader::pool_watch::watch(image.base() as u64) {
+            Ok(()) => println!("pool watch     on: buildings and objects are logged every 5 s"),
+            Err(why) => println!("pool watch     not started: {why}"),
+        }
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -287,6 +411,14 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // macOS port: a sampling profile of the process's threads
+    // (victory_gpu::profile); off unless VICTORY_PROFILE names a file.
+    let titled = std::iter::once((exe_name.as_ref(), image.base(), image.info().size_of_image as usize)).chain(
+        dlls.iter().map(|(name, dll)| (name.as_str(), dll.base(), dll.info().size_of_image as usize)),
+    );
+    if let Some(line) = victory_gpu::profile::start(titled) {
+        println!("profile        {line}");
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -504,6 +636,11 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    victory_gpu::pipeline::note_title_dll(
+                        name,
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    );
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

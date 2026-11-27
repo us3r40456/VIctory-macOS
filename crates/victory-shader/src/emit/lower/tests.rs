@@ -1,3 +1,6 @@
+//! Tests of the lowering (`super`). In a file of their own so that
+//! `lower.rs` stays under the asset policy's file size limit (512 KiB).
+
 use super::{
     Lowered, Numeric, Parts, barycentric_signature, buffer_format, code_table_start, half_shift,
     lower, packed_half,
@@ -8,19 +11,6 @@ use crate::native::{
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
-
-#[test]
-fn direct_barycentric_modes_match_dxil_semantics() {
-    use crate::io::Barycentric::*;
-
-    assert_eq!(barycentric_signature(PerspectiveSample), Some((0, 6)));
-    assert_eq!(barycentric_signature(PerspectiveCenter), Some((0, 2)));
-    assert_eq!(barycentric_signature(PerspectiveCentroid), Some((0, 3)));
-    assert_eq!(barycentric_signature(LinearSample), Some((1, 7)));
-    assert_eq!(barycentric_signature(LinearCenter), Some((1, 4)));
-    assert_eq!(barycentric_signature(LinearCentroid), Some((1, 5)));
-    assert_eq!(barycentric_signature(PerspectivePullModel), None);
-}
 
 /// A program's constant table starts after its instructions, unless a
 /// load at a fixed offset reads below that.
@@ -45,6 +35,19 @@ fn the_code_table_starts_after_the_instructions() {
     assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
     // Loads past the instructions only: from the lowest of them.
     assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+}
+
+#[test]
+fn direct_barycentric_modes_match_dxil_semantics() {
+    use crate::io::Barycentric::*;
+
+    assert_eq!(barycentric_signature(PerspectiveSample), Some((0, 6)));
+    assert_eq!(barycentric_signature(PerspectiveCenter), Some((0, 2)));
+    assert_eq!(barycentric_signature(PerspectiveCentroid), Some((0, 3)));
+    assert_eq!(barycentric_signature(LinearSample), Some((1, 7)));
+    assert_eq!(barycentric_signature(LinearCenter), Some((1, 4)));
+    assert_eq!(barycentric_signature(LinearCentroid), Some((1, 5)));
+    assert_eq!(barycentric_signature(PerspectivePullModel), None);
 }
 
 /// Whether a synthetic compute program translates with these input registers.
@@ -82,6 +85,8 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })
     .map(|_| ())
@@ -139,6 +144,8 @@ fn lower_wave(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })
 }
@@ -423,6 +430,8 @@ fn perm_features(selector: u32) -> u64 {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })
     .unwrap();
@@ -1323,6 +1332,25 @@ fn packed_halves_fill_parameters_first_fit() {
     }
 }
 
+#[test]
+fn ds_bpermute_refuses_gds() {
+    // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
+    let words = [
+        0x7E02_0285,           // v_mov_b32 v1, 5
+        0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
+        2 << 24 | 1 << 8,
+        0x7E00_0502, // v_readfirstlane_b32 s0, v2
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    assert!(matches!(
+        lowers(&words, 0),
+        Err(crate::ShaderError::Unsupported { what: "GDS", .. })
+    ));
+}
+
 // ---- one console wave split across host waves ----
 
 const V_LSHLREV_V1_2_V0: u32 = 0x3402_0082; // v_lshlrev_b32 v1, 2, v0
@@ -1390,6 +1418,8 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
+        halves_local: Default::default(),
+        mac: Default::default(),
         host_wave32: false,
         view_marks: false,
     })
@@ -1627,6 +1657,8 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
+            halves_local: Default::default(),
+            mac: Default::default(),
             atomic_lock_rounds: false,
         atomic_umax: false,
             bias_as_gradients: false,
@@ -1645,25 +1677,6 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             v.validate(&mut lowered.dxil).unwrap();
         }
     }
-}
-
-#[test]
-fn ds_bpermute_refuses_gds() {
-    // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
-    let words = [
-        0x7E02_0285,           // v_mov_b32 v1, 5
-        0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
-        2 << 24 | 1 << 8,
-        0x7E00_0502, // v_readfirstlane_b32 s0, v2
-        0xBF07_8000, // s_cmp_lg_u32 s0, 0
-        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-        0xBE83_0380, // s_mov_b32 s3, 0
-        S_ENDPGM,
-    ];
-    assert!(matches!(
-        lowers(&words, 0),
-        Err(crate::ShaderError::Unsupported { what: "GDS", .. })
-    ));
 }
 
 fn lower_ps_for_early_z(
@@ -1725,6 +1738,8 @@ fn lower_ps_for_early_z(
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         atomic_lock_rounds: false,
         atomic_umax: false,
         bias_as_gradients: false,

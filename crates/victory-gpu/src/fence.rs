@@ -91,6 +91,14 @@ extern "system" fn completed(this: This) -> u64 {
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
+    // A wait with no event blocks until the value is reached: a Signal that
+    // stands behind a submission left to the host GPU
+    // (`crate::host::unwaited::signal_behind`) moves the fence once that
+    // submission is finished, here if nothing has yet.
+    #[cfg(windows)]
+    if event.is_null() && fence.value.load(Ordering::Acquire) < value {
+        crate::host::unwaited::settle(crate::host::unwaited::By::Signal);
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -147,6 +155,11 @@ pub(crate) fn take_waited() -> (u64, std::time::Duration) {
 /// A fence's value.
 pub(crate) fn value(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
+}
+
+/// Where a fence's value lives in memory (titles read it there too).
+pub(crate) fn address(this: This) -> u64 {
+    gpu_address(this)
 }
 
 /// Keeps a fence alive while a queue holds a Signal of it, until

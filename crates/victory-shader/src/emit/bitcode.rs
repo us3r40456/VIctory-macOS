@@ -635,6 +635,126 @@ impl Module {
         self.written_call_blocks(name).len()
     }
 
+    /// Argument `arg` (the opcode is argument 0) of each written call of
+    /// functions named `name`, as the 32 bits it holds where it is an
+    /// expression over constants: i32 and i1 `bin`, `cmp` and `select`, bit
+    /// casts between i32 and f32, and conversions of an i32 to f32. `None`
+    /// for anything else, and for a shift by 32 or more anywhere in the
+    /// expression, taken or not (LLVM leaves its result undefined).
+    #[cfg(test)]
+    pub fn constant_call_args(&self, name: &str, arg: usize) -> Vec<Option<u32>> {
+        let plan = self.plan();
+        let mut known = HashMap::new();
+        let mut out = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && let Op::Call(f, args) = &self.insts[i as usize].op
+                    && self.funcs[*f as usize].name == name
+                {
+                    out.push(self.constant_bits(args[arg], &mut known));
+                }
+            }
+        }
+        out
+    }
+
+    /// `v` as [`Module::constant_call_args`] works an argument out.
+    #[cfg(test)]
+    pub fn constant_value(&self, v: V) -> Option<u32> {
+        self.constant_bits(v, &mut HashMap::new())
+    }
+
+    #[cfg(test)]
+    fn constant_bits(&self, v: V, known: &mut HashMap<V, Option<u32>>) -> Option<u32> {
+        if let Some(&x) = known.get(&v) {
+            return x;
+        }
+        let bits = |ty: Ty| match self.types[ty.0 as usize] {
+            TypeDef::Int(n @ (1 | 32)) => Some(n),
+            _ => None,
+        };
+        let x = match v {
+            V::Const(i) => match self.consts[i as usize] {
+                (ty, Const::Int(x)) => {
+                    bits(ty).map(|n| if n == 1 { x as u32 & 1 } else { x as u32 })
+                }
+                (_, Const::Float(x)) => Some(x),
+                _ => None,
+            },
+            V::Inst(i) => {
+                let inst = &self.insts[i as usize];
+                match inst.op {
+                    Op::Bin(op, a, b) => (|| {
+                        let n = bits(inst.ty)?;
+                        let (a, b) = (self.constant_bits(a, known)?, self.constant_bits(b, known)?);
+                        let x = match op {
+                            Bin::Add => a.wrapping_add(b),
+                            Bin::Sub => a.wrapping_sub(b),
+                            Bin::Mul => a.wrapping_mul(b),
+                            Bin::Shl => a.checked_shl(b)?,
+                            Bin::LShr => a.checked_shr(b)?,
+                            Bin::AShr => (a as i32).checked_shr(b)? as u32,
+                            Bin::And => a & b,
+                            Bin::Or => a | b,
+                            Bin::Xor => a ^ b,
+                            Bin::UDiv | Bin::SDiv | Bin::URem => return None,
+                        };
+                        (n == 32 || matches!(op, Bin::And | Bin::Or | Bin::Xor)).then_some(x)
+                    })(),
+                    Op::Cmp(p, a, b) => (|| {
+                        bits(self.type_of(a)).filter(|&n| n == 32)?;
+                        let (a, b) = (self.constant_bits(a, known)?, self.constant_bits(b, known)?);
+                        let (sa, sb) = (a as i32, b as i32);
+                        Some(u32::from(match p {
+                            pred::EQ => a == b,
+                            pred::NE => a != b,
+                            pred::IUGT => a > b,
+                            pred::IUGE => a >= b,
+                            pred::IULT => a < b,
+                            pred::IULE => a <= b,
+                            pred::SGT => sa > sb,
+                            pred::SGE => sa >= sb,
+                            pred::SLT => sa < sb,
+                            pred::SLE => sa <= sb,
+                            _ => return None,
+                        }))
+                    })(),
+                    Op::Select(c, t, f) => (|| {
+                        let c = self.constant_bits(c, known)?;
+                        let (t, f) = (self.constant_bits(t, known)?, self.constant_bits(f, known)?);
+                        Some(if c != 0 { t } else { f })
+                    })(),
+                    Op::Cast(Cast::Bitcast, a) => {
+                        let both = [inst.ty, self.type_of(a)].iter().all(|t| {
+                            matches!(self.types[t.0 as usize], TypeDef::Int(32) | TypeDef::Float)
+                        });
+                        if both {
+                            self.constant_bits(a, known)
+                        } else {
+                            None
+                        }
+                    }
+                    // An i32 as the nearest f32, as the CPU converts it.
+                    Op::Cast(op @ (Cast::UiToFp | Cast::SiToFp), a) => (|| {
+                        let int = self.types[self.type_of(a).0 as usize] == TypeDef::Int(32);
+                        let float = self.types[inst.ty.0 as usize] == TypeDef::Float;
+                        let a = self.constant_bits(a, known).filter(|_| int && float)?;
+                        Some(if op == Cast::UiToFp {
+                            (a as f32).to_bits()
+                        } else {
+                            (a as i32 as f32).to_bits()
+                        })
+                    })(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        known.insert(v, x);
+        x
+    }
+
     /// The blocks, instructions (phis included) and conditional branches
     /// [`Module::write`] writes.
     #[cfg(test)]

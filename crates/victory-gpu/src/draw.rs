@@ -96,6 +96,21 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// The run of indirect draws being recorded whose clamps go to the host
+    /// list before (`crate::indirect::hoisting`).
+    hoist: Option<Hoist>,
+}
+
+/// Where the clamps of a run of indirect draws go: `clamps`, the host list
+/// before the one at `into`, still open, as long as that one has `writes`
+/// dispatches and copies (a later one may write the arguments). Those of
+/// indirect dispatches as long as it has `orders` barriers, syncs and
+/// copies (`crate::indirect::hoisting_dispatches`).
+struct Hoist {
+    clamps: std::sync::Arc<HostList>,
+    into: usize,
+    writes: u64,
+    orders: u64,
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -310,8 +325,9 @@ impl State {
         unsafe { list.list.OMSetStencilRef(reference) };
     }
 
-    /// The title list goes on in a fresh host list (a segment after a wait,
-    /// `crate::list`): the state it set is given to `list` again.
+    /// The title list goes on in a fresh host list (a segment after a wait
+    /// or from a run of indirect draws on, `crate::list`): the state it set
+    /// is given to `list` again.
     ///
     /// Replayed: topology, viewports, scissors, blend factor, stencil
     /// reference, render targets and depth (set at once); heaps, root
@@ -348,6 +364,75 @@ impl State {
         }
         if let Some((targets, depth)) = &fixed.targets {
             self.set_targets(list, targets, *depth);
+        }
+    }
+
+    /// Whether an indirect execution of `kind` recorded now would have its
+    /// clamp hoisted: a draw or mesh dispatch that is not dropped before
+    /// its clamp. Draws of rectangles too: no vertices of ours are made
+    /// between indirect draws (they run only where the pipeline's geometry
+    /// shader completes the rectangles, and are clamped either way).
+    pub(crate) fn hoistable(&self, kind: u32) -> bool {
+        kind != INDIRECT_DISPATCH
+            && !crate::pipeline::held_back(self.pipeline as This)
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some()
+    }
+
+    /// Whether the clamps of indirect draws recorded in `list` now go to
+    /// the host list before it.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+    }
+
+    /// Whether an indirect dispatch recorded now would have its clamp
+    /// hoisted (`crate::indirect::hoisting_dispatches`): one that is not
+    /// dropped or left out before its clamp.
+    pub(crate) fn dispatch_hoistable(&self) -> bool {
+        let pipeline = self.pipeline as This;
+        !crate::pipeline::held_back(pipeline)
+            && !crate::pipeline::ray_pass_is_left_out(pipeline)
+            && crate::pipeline::host_pipeline(pipeline).is_some_and(|p| p.compute)
+    }
+
+    /// Whether the clamps of indirect dispatches recorded in `list` now go
+    /// to the host list before it: nothing that orders an earlier write
+    /// before them was recorded since the run began. The title's
+    /// dispatches since may have written their arguments, but D3D12 reads
+    /// such arguments only after a barrier, which ends the run (as does a
+    /// copy, clear or immediate write, and a clamp in `list` itself).
+    pub(crate) fn hoists_dispatches_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.orders == list.orders())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to `clamps`,
+    /// the host list before it.
+    pub(crate) fn hoist(&mut self, clamps: std::sync::Arc<HostList>, into: &HostList) {
+        self.hoist = Some(Hoist {
+            clamps,
+            into: std::ptr::from_ref(into) as usize,
+            writes: into.writes(),
+            orders: into.orders(),
+        });
+    }
+
+    /// The host list the clamps of the run being recorded go to, if any.
+    #[cfg(test)]
+    pub(crate) fn hoist_clamps(&self) -> Option<std::sync::Arc<HostList>> {
+        self.hoist.as_ref().map(|h| h.clamps.clone())
+    }
+
+    /// Ends the run whose clamps go to the host list before `list`, if
+    /// any: that list closes, its clamped arguments readable.
+    pub(crate) fn end_hoist(&mut self, list: &HostList) {
+        if let Some(h) = self.hoist.take() {
+            if h.into == std::ptr::from_ref(list) as usize {
+                list.clamp_end(&h.clamps);
+            }
+            h.clamps.close();
         }
     }
 
@@ -581,6 +666,13 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        // The sky dome the ambient light follows (`crate::ambient`).
+        if crate::ambient::on()
+            && crate::pipeline::ambient_role(self.pipeline as This) & crate::ambient::DRAWS_SKY != 0
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -1146,6 +1238,7 @@ impl State {
         readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
+        list.count_write();
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
@@ -1166,6 +1259,27 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             dropped(list, self.pipeline, "dispatch");
+            return;
+        }
+        // The acceleration-structure builder runs whole or not at all
+        // (`pipeline::builder`).
+        if crate::pipeline::held_back(self.pipeline as This) {
+            once!("a dispatch of the BVH builder held back");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out, and counted there, not as dropped.
+        if crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT dispatch {x}x{y}x{z} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(self.pipeline as This)
+                )
+            });
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1192,11 +1306,118 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        #[cfg(feature = "diagnostics")]
+        self.probe_reads(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.count_dispatch();
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list);
+    }
+
+    /// After a dispatch: the stand-in for ray-traced indirect light
+    /// (`crate::ambient`, `VICTORY_AMBIENT=1`; from Belobug 0603123), if the
+    /// program is one it follows. Its pass sets a view heap, a compute root
+    /// signature and a pipeline of its own: the title's are set again by the
+    /// next draw or dispatch.
+    fn ambient(&mut self, list: &HostList) {
+        if !crate::ambient::on() {
+            return;
+        }
+        let role = crate::pipeline::ambient_role(self.pipeline as This);
+        let estimate = crate::ambient_estimate::roles();
+        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS | estimate) == 0 {
+            return;
+        }
+        let Some(stage) =
+            crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.stages.first())
+        else {
+            return;
+        };
+        // The texture viewed at a place of one of the program's tables, if
+        // its code uses that place as `kind`; the view stays pinned while
+        // the pass is recorded.
+        let image = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let pin = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            // A texture the title placed in memory itself: the resource made
+            // for that memory.
+            let placed = crate::descriptor::host::placed_texture(&pin);
+            let texture = match (placed.as_ref().unwrap_or(&pin), kind) {
+                (&View::Unordered(r, ..), ResourceType::Uav) => r,
+                (&View::Shader(r, _), ResourceType::Srv) => r,
+                _ => 0,
+            };
+            (texture != 0).then_some((pin, texture as This))
+        };
+        let recorded = if crate::ambient_estimate::on() {
+            // The estimate in the constant's place (`VICTORY_AMBIENT=estimate`,
+            // from avatarmanz 82ca1347).
+            use crate::ambient_estimate as estimate;
+            if role & estimate::KEEPS != 0 {
+                match &image(ResourceType::Uav, estimate::RADIANCE) {
+                    Some((_, radiance)) => estimate::keep(list, *radiance),
+                    None => {
+                        once!("no ambient estimate: the light visible surfaces send out is not at its place in the table");
+                        false
+                    }
+                }
+            } else if role & estimate::LIGHTS_AIR != 0 {
+                // (Nothing unless `VICTORY_AMBIENT_AIR` is set.)
+                match &image(ResourceType::Uav, estimate::AIR) {
+                    Some((_, scattered)) => estimate::air(list, *scattered),
+                    None => false,
+                }
+            } else if role & crate::ambient::RESOLVES != 0 {
+                let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+                let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+                match &light {
+                    Some((_, light)) => estimate::raise(list, *light, depth.as_ref().map(|d| d.1)),
+                    None => {
+                        once!("no ambient estimate: the resolve's light image is not at its place in the table");
+                        false
+                    }
+                }
+            } else {
+                // The reflections, held to the light around.
+                match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                    Some((_, reflections)) => estimate::hold(list, *reflections),
+                    None => false,
+                }
+            }
+        } else if role & crate::ambient::RESOLVES != 0 {
+            let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+            let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+            match &light {
+                Some((_, light)) => {
+                    crate::ambient::raise(list, *light, depth.as_ref().map(|d| d.1))
+                }
+                None => {
+                    once!("no ambient light: the resolve's light image is not at its place in the table");
+                    false
+                }
+            }
+        } else {
+            // The reflections, held to the light around.
+            match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some((_, reflections)) => crate::ambient::hold(list, *reflections),
+                None => false,
+            }
+        };
+        if recorded {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "the ambient light's pass (VICTORY_AMBIENT)".into());
+            self.host_state_lost();
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1509,6 +1730,71 @@ impl State {
         }
     }
 
+    /// In a listed frame, for a pipeline with a shader `VICTORY_TRACE_READS`
+    /// names: every view its shaders read through a table, one line each
+    /// (a texture with its resource, as the target dumps name it). A
+    /// buffer's first bytes follow as hex dwords, as title memory holds
+    /// them now and as the host copy does once the list has run; a
+    /// texture's values are logged when its submission has run
+    /// (`crate::capture`, with `VICTORY_DUMP_TARGETS`; nothing is saved).
+    #[cfg(feature = "diagnostics")]
+    fn probe_reads(&self, list: &HostList, compute: bool) {
+        /// Bytes of a buffer shown.
+        const SHOWN: u64 = 3072;
+        if crate::host::traced_reads().is_empty() || !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let names = crate::pipeline::shaders_of(self.pipeline as This);
+        if !crate::host::traced_reads().iter().any(|h| names.contains(h.as_str())) {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let frame = crate::queue::presented() + 1;
+        let hex = |b: &[u8]| -> String {
+            let words: Vec<String> =
+                b.as_chunks::<4>().0.iter().map(|&c| format!("{:x}", u32::from_le_bytes(c))).collect();
+            words.join(" ")
+        };
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                let who = format!("{} {:?} s{}+{}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
+                let (range, texture) = match view.as_deref() {
+                    Some(View::Constant(address, size)) => (Some((*address, u64::from(*size))), None),
+                    Some(v @ (View::Shader(r, _) | View::Unordered(r, ..))) => {
+                        if crate::resource::host_resource(*r as This).is_some() {
+                            (None, Some(*r))
+                        } else {
+                            (crate::descriptor::host::buffer_range(v), None)
+                        }
+                    }
+                    Some(v) => (crate::descriptor::host::buffer_range(v), None),
+                    None => (None, None),
+                };
+                let resource = texture.map_or_else(String::new, |r| format!(" resource {r:#x}"));
+                tracing::info!(target: "victory_gpu::trace", "reads {who} frame {frame}: {}{resource}", describe(view.as_deref()));
+                if let Some(r) = texture {
+                    list.note_target(r, &format!("read {who}"));
+                }
+                let Some((at, len)) = range.filter(|r| r.1 > 0) else { continue };
+                let shown = len.min(SHOWN);
+                let mut now = vec![0u8; shown as usize];
+                if crate::host::read_into(at as *const u8, &mut now) {
+                    tracing::info!(target: "victory_gpu::trace", "reads {who} {at:#x}+{len} title memory now: {}", hex(&now));
+                }
+                let Some(shadow) = crate::shadow::find(at, shown) else { continue };
+                list.defer_after(move || {
+                    tracing::info!(target: "victory_gpu::trace", "reads {who} {at:#x}+{len} host copy after the list: {}", shadow.peek_words(at, shown))
+                });
+            }
+        }
+    }
+
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it
     /// writes through a table, read back in the list itself (what the
     /// dispatch left there, before anything later in the frame).
@@ -1650,6 +1936,8 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            #[cfg(feature = "diagnostics")]
+            self.probe_reads(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1702,7 +1990,8 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host(move || {
+            // mac: title vertices into the list's own scratch (`Step::Own`).
+            list.defer_own(from, n * 3 * stride, move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
@@ -1782,8 +2071,8 @@ impl State {
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
-        const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
+        const DISPATCH: u32 = INDIRECT_DISPATCH;
+        const MESH: u32 = INDIRECT_MESH;
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
@@ -1800,6 +2089,23 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
+        if crate::pipeline::held_back(self.pipeline as This) {
+            why("the BVH builder held back");
+            return false;
+        }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out before its arguments are refreshed
+        // and clamped, and counted there, not as a dropped execution.
+        if kind == DISPATCH && crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT indirect kind {kind} max {max} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(pipeline)
+                )
+            });
+            return true;
+        }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -1828,19 +2134,70 @@ impl State {
             why("no host signature");
             return false;
         };
-        args.refresh(list, arguments, len);
+        // The clamp reads the count, so that it stops where the execution
+        // does.
+        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        // A draw of a run: clamped in the host list before, which the run's
+        // first draw left open for it (`crate::list`), so that nothing of
+        // ours comes between the draws. That list reads the arguments and
+        // the count, so both are brought up to date with it (the count
+        // with this list too, whose execution reads it).
+        // An indirect dispatch's too, with VICTORY_DISPATCH_CLAMPS: a run of
+        // them ends at a barrier, not at a dispatch.
+        let hoists = if kind == DISPATCH {
+            crate::indirect::hoisting_dispatches() && self.hoists_dispatches_into(list)
+        } else {
+            self.hoists_into(list)
+        };
+        let hoisted = hoists
+            .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
+            .flatten()
+            .and_then(|clamps| {
+                // (With the start of the buffer each is in: a batch of
+                // clamps reads them from there.)
+                let start = |s: &crate::shadow::Shadow, at: u64| (s.gpu(at) - s.offset(at), s.gpu(at));
+                let count = counter.as_ref().map(|(s, at)| start(s, *at));
+                let out = crate::indirect::bound_before(&clamps, list, start(&args, arguments), (kind, stride, max), count)?;
+                args.refresh(&clamps, arguments, len);
+                list.note_hoisted_read(arguments as usize, len.min(args.left(arguments)) as usize);
+                if let Some((s, at)) = &counter {
+                    s.refresh(&clamps, *at, 4);
+                }
+                #[cfg(feature = "diagnostics")]
+                clamps.note_op(|| format!("hoisted clamp of indirect kind {kind} max {max} at {arguments:#x}"));
+                Some(out)
+            });
+        let inline = hoisted.is_none();
+        if inline {
+            args.refresh(list, arguments, len);
+        }
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own. It
-        // reads the count, so that it stops where the execution does.
-        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        let (clamped, clamped_at) = match hoisted {
+            Some(h) => {
+                // The dispatch may write arguments a later draw reads.
+                if kind == DISPATCH {
+                    list.count_dispatch();
+                }
+                h
+            }
+            None => {
+                // Bounded first: the clamp binds a compute pipeline of its
+                // own.
+                let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                // A clamp in the list itself charges the budget after the
+                // clamps hoisted so far: the run ends here, so that those
+                // of later draws do not come before it.
+                list.count_write();
+                (clamped, 0)
+            }
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1856,7 +2213,9 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            if inline {
+                crate::indirect::done(list, &clamped);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1879,14 +2238,17 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        self.probe_reads(list, kind == DISPATCH);
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh) and the list's own, the
+        // signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
                 &clamped,
-                0,
+                clamped_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1900,12 +2262,15 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, (&clamped, clamped_at), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        if inline {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -2020,6 +2385,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, *resource as This);
+            // A texture the title's CPU code reads too (`crate::texback`).
+            list.texture_written(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
@@ -2107,6 +2474,10 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
+
+/// Indirect argument kinds (PC numbering) of dispatches and mesh dispatches.
+pub(crate) const INDIRECT_DISPATCH: u32 = 2;
+const INDIRECT_MESH: u32 = 10;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
@@ -2579,6 +2950,127 @@ void main() {
         compile_cs(SOURCE, &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)]), constants])
     }
 
+    /// The order of a title copy and a dispatch before it, on the GPU
+    /// (`VICTORY_COPY_ORDER=split`, `crate::host::copy_order_parts`). Two
+    /// host lists: the first reads 16 dwords of a buffer into one output,
+    /// the second copies new values over them and reads them into another
+    /// output. Run as one submission, both outputs hold the new values (a
+    /// submission's copies are all made before its first GPU command);
+    /// split, the first holds the old ones, as on the console.
+    #[test]
+    fn a_copy_keeps_its_order_with_an_earlier_lists_dispatch_when_the_piece_is_split() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let src = buffer(4096);
+        let at = crate::resource::buffer_bytes(src).unwrap().0 as u64 + 0x100;
+        dispatches_around_a_copy(host, at);
+    }
+
+    /// [`a_copy_keeps_its_order_with_an_earlier_lists_dispatch_when_the_piece_is_split`]
+    /// with the 16 dwords in aliased title memory (`VICTORY_ALIAS_BUFFERS`,
+    /// `crate::alias`): the GPU reads the title's memory itself, so only when
+    /// the copy is made decides what each dispatch reads. As one submission
+    /// both read the new values, as with a host copy; split, the copy is made
+    /// once the first part has run on the GPU, and the first reads the old
+    /// ones: the cut needs no host copy.
+    #[test]
+    fn a_copy_into_aliased_memory_keeps_its_order_when_the_piece_is_split() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let page = crate::watch::PAGE;
+        // SAFETY: a fresh allocation of our own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let aliased = crate::alias::alias_region(base, page, false);
+        // Under Rosetta (Wine with D3DMetal) the remap works: the test runs.
+        assert!(aliased || !crate::watch::rosetta(), "no alias under Rosetta");
+        if aliased {
+            let aliased = crate::shadow::find(base as u64, 4).expect("the aliased region");
+            assert!(aliased.is_aliased());
+            drop(aliased);
+            dispatches_around_a_copy(host, base as u64 + 0x100);
+            assert!(crate::alias::unalias_region(base));
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two host lists: the first reads the 16 dwords 64 bytes apart at `at`
+    /// into one output, the second copies new values over them and reads
+    /// them into another; run as one submission, then split.
+    fn dispatches_around_a_copy(host: &crate::host::Host, at: u64) {
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        let outs = [buffer(256), buffer(256)];
+        let out_bytes = outs.map(|o| crate::resource::buffer_bytes(o).unwrap().0 as u64);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        for (k, out) in outs.iter().enumerate() {
+            crate::descriptor::create_uav(null, *out, null, &uav, title_heap.start + 32 * (k as u64 + 1));
+        }
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile();
+        let copies = out_bytes.map(|o| crate::shadow::find(o, 256).expect("an output's host copy"));
+        // A dispatch that reads the 16 dwords into output `k`.
+        let record = |list: &HostList, k: u32| {
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_view(true, 0, at);
+            let (index, offset) = state.root_view(list, true, 0, false, None).expect("a root view");
+            let constants = [offset, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(k + 1));
+                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        let old: Vec<u32> = (0..16).map(|k| 0x0a00 + k).collect();
+        let new: Vec<u32> = (0..16).map(|k| 0x0b00 + k).collect();
+        // The new values as the copy's source: 16 dwords 64 bytes apart.
+        let mut source = vec![0u32; 16 * 16];
+        for (k, value) in new.iter().enumerate() {
+            source[16 * k] = *value;
+        }
+        for split in [false, true] {
+            for (k, value) in old.iter().enumerate() {
+                // SAFETY: inside the title buffer.
+                unsafe { ((at + 64 * k as u64) as *mut u32).write(*value) };
+            }
+            let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+            record(&lists[0], 0);
+            lists[0].close();
+            lists[1].title_copies(at as usize, 4 * source.len());
+            lists[1].defer_copy(at as *mut u8, source.as_ptr().cast(), 4 * source.len());
+            record(&lists[1], 1);
+            lists[1].close();
+            let parts = if split {
+                crate::host::copy_order_parts(lists.to_vec())
+            } else {
+                vec![lists.to_vec()]
+            };
+            assert_eq!(parts.len(), if split { 2 } else { 1 }, "split {split}");
+            for part in &parts {
+                let runs: Vec<&HostList> = part.iter().map(|l| &**l).collect();
+                host.execute(&runs);
+            }
+            let read = |k: usize| copies[k].read_host(out_bytes[k], 16);
+            assert_eq!(read(1), new, "the dispatch after the copy, split {split}");
+            assert_eq!(read(0), if split { &old } else { &new }[..], "the dispatch before the copy, split {split}");
+        }
+    }
+
     /// A compute shader with a root signature of `params`.
     fn compile_cs(source: &str, params: &[Param]) -> (ID3D12RootSignature, ID3D12PipelineState) {
         crate::compute::pipeline(source, s!("root"), 0, params).unwrap()
@@ -2939,6 +3431,19 @@ void main() { dst.Store4(0, asuint(src[1])); }
     /// after that barrier must see the heap's then-current UAV range.
     #[test]
     fn a_late_widened_view_follows_a_bindless_write() {
+        late_widened_view(1);
+    }
+
+    /// mac: the same with three heap-writing draws of the heap before the
+    /// barrier (`VICTORY_CENSUS_FAST=1` puts its ranges in once).
+    #[test]
+    fn a_heap_written_by_several_draws_before_its_barrier_widens_as_by_one() {
+        late_widened_view(3);
+    }
+
+    /// [`a_late_widened_view_follows_a_bindless_write`] with `marks`
+    /// heap-writing draws before the barrier.
+    fn late_widened_view(marks: usize) {
         if !crate::under_wine() {
             return;
         }
@@ -3002,6 +3507,9 @@ void main() { dst.Store4(0, asuint(src[1])); }
         // descriptor and the range sampled for widening must name the new view.
         crate::descriptor::create_uav(null, src, null, &new_raw, title_heap.start);
         viewed.set(0, Some(&new), true);
+        for _ in 1..marks {
+            list.mark_widened_heap(&viewed);
+        }
         // SAFETY: an open list.
         unsafe {
             list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
@@ -4157,15 +4665,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             &st,
             &io,
             &res,
-            Options {
-                view_marks: true,
-                atomic_locks: false,
-                atomic_lock_rounds: false,
-                atomic_umax: false,
-                bias_as_gradients: false,
-                host_wave32: false,
-                narrow_waves: false,
-            },
+            Options { view_marks: true, ..Default::default() },
         )
         .unwrap();
         assert!(host_shader.view_marks);

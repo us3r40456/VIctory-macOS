@@ -40,6 +40,13 @@ const GREATER_EQUAL: u32 = 7;
 const ALWAYS: u32 = 8;
 
 impl ValueWait {
+    /// Whether the value it tests lies in the `bytes` bytes at `at` (even
+    /// in part): a write there can change what it sees.
+    pub(crate) fn reads(&self, at: u64, bytes: u64) -> bool {
+        at < self.address.saturating_add(u64::from(self.bytes))
+            && self.address < at.saturating_add(bytes)
+    }
+
     /// Whether it holds with `read` giving the memory's value: `None` for a
     /// comparison we do not know (counted by the caller, taken as holding)
     /// and for memory that cannot be read (taken as not holding).
@@ -117,6 +124,16 @@ pub(crate) struct World<'a, S> {
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// Finishes what `run` left unfinished (a piece given to the host GPU
+    /// and not waited for still owes its bottom-of-pipe writes), which may
+    /// be what a segment's waits are for: whether anything was finished
+    /// since they were tested. Always `false` where `run` runs every piece
+    /// to completion. With `ahead`, it is also given what runs next if the
+    /// waits come to hold: the queue's piece so far, the segment, and the
+    /// segments right behind it that wait for nothing (else nothing).
+    pub(crate) owed: &'a mut dyn FnMut(&[ValueWait], &[&S]) -> bool,
+    /// Whether `owed` wants to know what runs next.
+    pub(crate) ahead: bool,
 }
 
 impl<S> Held<S> {
@@ -138,15 +155,33 @@ impl<S> Held<S> {
             for (queue, items) in &mut self.queues {
                 let mut piece = Vec::new();
                 loop {
-                    let ready = match items.front_mut() {
+                    let mut behind = items.iter_mut();
+                    let ready = match behind.next() {
                         None => false,
-                        Some((Item::Segment(_, waits), since, fresh)) => {
+                        Some((Item::Segment(head, waits), since, fresh)) => {
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
                                     None => done.unknown += 1,
+                                }
+                            }
+                            // What they wait for may be owed by a piece not
+                            // waited for: that is finished first, and they
+                            // are looked at again.
+                            if !ok {
+                                let next: Vec<&S> = if w.ahead {
+                                    let after = behind.map_while(|(item, ..)| match item {
+                                        Item::Segment(s, none) if none.is_empty() => Some(&*s),
+                                        _ => None,
+                                    });
+                                    piece.iter().chain([&*head]).chain(after).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                if (w.owed)(waits.as_slice(), &next) {
+                                    ok = waits.iter().all(|wait| wait.holds(w.read) != Some(false));
                                 }
                             }
                             if !ok {
@@ -257,6 +292,11 @@ mod tests {
         log: Vec<String>,
         /// Bottom-of-pipe writes of each segment: (address, value).
         writes: HashMap<&'static str, Vec<(u64, u64)>>,
+        /// Pieces are not waited for: their writes are owed until finished.
+        unwaited: bool,
+        owed: Vec<(u64, u64)>,
+        /// What each head whose waits did not hold was told runs next.
+        next: Vec<Vec<&'static str>>,
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
@@ -270,17 +310,33 @@ mod tests {
             let mut f = fake.borrow_mut();
             for s in &segments {
                 for (a, v) in f.writes.get(s).cloned().unwrap_or_default() {
-                    f.memory.insert(a, v);
+                    if f.unwaited {
+                        f.owed.push((a, v));
+                    } else {
+                        f.memory.insert(a, v);
+                    }
                 }
             }
             f.log.push(format!("q{q}: {}", segments.join(" ")));
+        };
+        let mut owed = |_: &[ValueWait], next: &[&&'static str]| {
+            let mut f = fake.borrow_mut();
+            f.next.push(next.iter().map(|s| **s).collect());
+            let owed = std::mem::take(&mut f.owed);
+            for &(a, v) in &owed {
+                f.memory.insert(a, v);
+            }
+            if !owed.is_empty() {
+                f.log.push("finished".into());
+            }
+            !owed.is_empty()
         };
         let mut signal = |fence: usize, value: u64| {
             let mut f = fake.borrow_mut();
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, owed: &mut owed, ahead: true })
     }
 
     #[test]
@@ -296,6 +352,21 @@ mod tests {
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
         assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+    }
+
+    #[test]
+    fn a_wait_reads_the_bytes_of_its_value_only() {
+        let w = ValueWait { address: 0x100, bytes: 4, comparison: EQUAL, reference: 1, mask: 0xffff_ffff };
+        assert!(w.reads(0x100, 4));
+        assert!(w.reads(0x100, 8), "a 64-bit write over a 32-bit value");
+        assert!(w.reads(0xfc, 8), "a write that ends inside it");
+        assert!(w.reads(0x103, 1));
+        assert!(!w.reads(0xfc, 4), "the word before");
+        assert!(!w.reads(0x104, 4), "the word after");
+        assert!(!w.reads(0x100, 0));
+        let last = ValueWait { address: u64::MAX - 3, ..w };
+        assert!(last.reads(u64::MAX - 7, 8));
+        assert!(!last.reads(0, 8));
     }
 
     /// The compute queue's list waits for a value the graphics queue's list
@@ -315,6 +386,68 @@ mod tests {
         assert_eq!((p.pieces, p.segments, p.waited.len()), (2, 2, 1));
         assert_eq!(p.waited[0].0, 2);
         assert!(!held.holds_work(2));
+    }
+
+    /// The graphics piece was not waited for, so its write is still owed
+    /// when the compute queue's wait is tested: it is finished first, and
+    /// the compute list runs in the same pump without counting as held.
+    #[test]
+    fn a_wait_for_what_an_unwaited_piece_owes_finishes_it_first() {
+        let fake = RefCell::new(Fake { unwaited: true, ..Fake::default() });
+        fake.borrow_mut().writes.insert("draw", vec![(0x100, 7)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("draw", vec![]));
+        held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: draw", "finished", "q2: depth"]);
+        assert_eq!((p.pieces, p.segments, p.waited.len()), (2, 2, 0));
+        assert!(held.is_empty());
+    }
+
+    /// Nothing is owed that could meet the wait: the list is held as
+    /// before, and runs (counted as having waited) once the value is there.
+    #[test]
+    fn a_wait_nothing_owed_meets_holds_its_queue() {
+        let fake = RefCell::new(Fake { unwaited: true, ..Fake::default() });
+        fake.borrow_mut().writes.insert("draw", vec![(0x200, 1)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("draw", vec![]));
+        held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
+        let p = pump(&mut held, &fake);
+        // The piece's write was finished for the test, and did not meet it.
+        assert_eq!(fake.borrow().log, ["q1: draw", "finished"]);
+        assert_eq!((p.pieces, p.segments), (1, 1));
+        assert!(held.holds_work(2));
+        fake.borrow_mut().memory.insert(0x100, 7);
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: draw", "finished", "q2: depth"]);
+        assert_eq!(p.waited.len(), 1);
+    }
+
+    /// A head whose wait does not hold is told what runs with it once it
+    /// does: the piece gathered before it, itself, and the segments behind
+    /// it up to the next one that waits.
+    #[test]
+    fn a_held_head_knows_what_runs_next() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(2, Item::Segment("a", vec![]));
+        held.push(2, Item::Segment("b", vec![ge(0x100, 1)]));
+        held.push(2, Item::Segment("c", vec![]));
+        held.push(2, Item::Segment("d", vec![ge(0x200, 1)]));
+        held.push(2, Item::Segment("e", vec![]));
+        pump(&mut held, &fake);
+        // Asked twice: with the piece before it, and again once that ran.
+        assert_eq!(fake.borrow().next, [vec!["a", "b", "c"], vec!["b", "c"]]);
+        assert_eq!(fake.borrow().log, ["q2: a"]);
+        // Held again with nothing gathered before it; a Signal ends the run.
+        let mut held = Held::default();
+        held.push(3, Item::Segment("f", vec![ge(0x100, 1)]));
+        held.push(3, Item::Signal(5, 1));
+        held.push(3, Item::Segment("g", vec![]));
+        fake.borrow_mut().next.clear();
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().next, [["f"]]);
     }
 
     #[test]

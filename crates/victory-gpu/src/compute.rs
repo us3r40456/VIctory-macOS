@@ -104,6 +104,10 @@ pub(crate) fn pipeline(
             ..Default::default()
         })
     }?;
+    // A pass of ours, by the name it was compiled under: what a frame
+    // replay's reports call it (`VICTORY_RECORD`).
+    // SAFETY: the caller's name, a string that ends with a NUL.
+    crate::host::name(&pso, || format!("victory: {}", unsafe { name.display() }));
     Ok((root, pso))
 }
 

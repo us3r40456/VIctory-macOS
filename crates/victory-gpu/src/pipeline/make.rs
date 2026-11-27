@@ -14,6 +14,10 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
+//! Passes over the screen have workers and a longer wait of their own (see
+//! [`screen`], from Belobug 18e57db): the title fills its lighting tables
+//! with such draws once, at the world's first frame.
+//!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
@@ -25,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use super::screen;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -36,7 +41,11 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
-    #[cfg(feature = "diagnostics")]
+    /// A pass over the screen (see [`screen`]).
+    screen: bool,
+    /// Its shader named by `VICTORY_SKIP_PIPELINES`, if one is: it has no
+    /// host pipeline and is never queued.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -54,7 +63,7 @@ impl Pending {
     pub(crate) fn new(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
-        #[cfg(feature = "diagnostics")] skip_hashes: &[String],
+        skip_hashes: &[String],
     ) -> Pending {
         let key = key(&shaders, graphics.as_deref());
         #[cfg(feature = "diagnostics")]
@@ -62,15 +71,14 @@ impl Pending {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
             format!("{shaders:?}\t{state}")
         });
-        #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
         let made = OnceLock::new();
         // Publish the completed result before the pipeline can be queued.
-        #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
             let _ = made.set(None);
         }
         Pending {
+            screen: screen::budget().is_some() && screen_pass(&shaders, graphics.as_deref()),
             key,
             shaders,
             graphics,
@@ -78,7 +86,6 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
-            #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
         }
@@ -104,6 +111,13 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Whether a pipeline is a pass over the screen (see [`screen`]): a vertex
+/// shader without vertex input or depth. Mesh pipelines have no vertex input
+/// either and are not meant.
+fn screen_pass(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> bool {
+    shaders.iter().any(|s| s.stage == "vertex") && graphics.is_some_and(GraphicsState::screen_pass)
 }
 
 /// What identifies a title pipeline across runs: its shader containers
@@ -205,6 +219,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Starts making `p` now, without waiting for it.
+pub(crate) fn begin(p: &Arc<Pending>) {
+    if !p.shaders.is_empty() {
+        start(p, false);
+    }
+}
+
+/// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
+/// translated (`Some(false)`), or not yet (`None`); never waits.
+pub(crate) fn state(p: &Pending) -> Option<bool> {
+    p.made.get().map(Option::is_some)
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
@@ -218,6 +245,9 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        if p.screen {
+            screen::queued();
+        }
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
     (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
@@ -235,6 +265,9 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    if p.screen && wait_long(p) {
+        return;
+    }
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
@@ -257,22 +290,68 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// A screen pass's own wait (see [`screen`]): for `p`, to the end of the
+/// time screen passes have before the next present. False if none is left,
+/// and `p` waits as the others do.
+fn wait_long(p: &Pending) -> bool {
+    let Some(left) = screen::left(crate::queue::presented()) else {
+        return false;
+    };
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = left.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    drop(held);
+    let made = p.made.get().is_some();
+    if !made {
+        screen::ran_out();
+    }
+    let ms = started.elapsed().as_millis() as u64;
+    if ms >= 100 {
+        tracing::info!(shaders = ?p.shaders, ms, made, "waited for a screen-pass pipeline");
+    }
+    true
+}
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Pipelines for the workers: those draws wait for, then those started
+/// early. The second pair is the screen passes' (see [`screen`]).
+type Queues = (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar);
+static QUEUES: [Queues; 2] = [
+    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new()),
+    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new()),
+];
+
+/// Hands `p` to the workers (half the logical processors, 2 to 8, and
+/// [`screen::WORKERS`] for screen passes), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
-    static WORKERS: OnceLock<usize> = OnceLock::new();
-    let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+    static WORKERS: [OnceLock<usize>; 2] = [const { OnceLock::new() }; 2];
+    let kind = usize::from(p.screen);
+    let workers = *WORKERS[kind].get_or_init(|| {
+        let n = if p.screen {
+            tracing::info!(
+                workers = screen::WORKERS,
+                wait_s = screen::budget().map_or(0, |b| b.as_secs()),
+                "screen-pass pipelines have workers and a wait of their own"
+            );
+            screen::WORKERS
+        } else {
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        };
+        let name = if p.screen { "victory-pipelines-screen" } else { "victory-pipelines" };
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
-                    .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
+                    .name(format!("{name}-{i}"))
+                    .spawn(move || work(kind));
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
@@ -285,24 +364,28 @@ fn queue(p: Arc<Pending>, now: bool) {
         if !p.taken.swap(true, Ordering::Relaxed) {
             p.make();
             WAITING.fetch_sub(1, Ordering::Relaxed);
+            if p.screen {
+                screen::made();
+            }
         }
         return;
     }
-    let (lock, work) = &QUEUES;
+    let (lock, work) = &QUEUES[kind];
     lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
     work.notify_one();
 }
 
-/// A worker: makes queued pipelines, those draws wait for first, and saves
-/// the cache when idle (first uses of pipelines made before).
-fn work() {
+/// A worker: makes queued pipelines (the screen passes if `kind` is 1, else
+/// the others), those draws wait for first, and saves the cache when idle
+/// (first uses of pipelines made before).
+fn work(kind: usize) {
     // Below the title's own threads (loading, recording).
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
-    let (lock, work) = &QUEUES;
+    let (lock, work) = &QUEUES[kind];
     loop {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,6 +408,9 @@ fn work() {
             continue; // its other queue entry
         }
         p.make();
+        if p.screen {
+            screen::made();
+        }
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
@@ -345,6 +431,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            screen_passes = screen::total(),
             "host pipelines all made"
         );
     }
@@ -362,7 +449,6 @@ mod tests {
         let p = Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         );
         assert_eq!(enqueue(&p, false), Some(false));
@@ -372,7 +458,6 @@ mod tests {
         let q = Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         );
         assert_eq!(enqueue(&q, false), Some(false));
@@ -381,7 +466,6 @@ mod tests {
         let r = Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         );
         assert_eq!(enqueue(&r, true), Some(true));
@@ -397,7 +481,6 @@ mod tests {
         let p = Arc::new(Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         ));
         assert!(ready(&p).is_none());
@@ -409,16 +492,44 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
-    #[cfg(feature = "diagnostics")]
+    /// A vertex shader with no vertex input and no depth is a pass over the
+    /// screen; a mesh pipeline with the same state is not, nor is a
+    /// pipeline without graphics state.
+    #[test]
+    fn screen_passes_are_told_apart() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        let shader = |stage| {
+            Arc::new(Shader {
+                stage,
+                hash: "0123456789abcdef".into(),
+                full_hash: [0; 32],
+                size: 0,
+                container: Mutex::new(Vec::new()),
+                translated: OnceLock::new(),
+                spilled: OnceLock::new(),
+            })
+        };
+        let mut state = GraphicsState::default();
+        assert!(!state.screen_pass());
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        assert!(state.screen_pass());
+        assert!(screen_pass(&[shader("vertex"), shader("pixel")], Some(&state)));
+        assert!(!screen_pass(&[shader("mesh"), shader("pixel")], Some(&state)));
+        assert!(!screen_pass(&[shader("vertex"), shader("pixel")], None));
+        assert!(!screen_pass(&[shader("compute")], None));
+    }
+
+    /// In every build, not only with diagnostics.
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
         let shader = Arc::new(Shader {
             stage: "compute",
             hash: "0123456789abcdef".into(),
+            #[cfg(windows)]
             full_hash: [0; 32],
             size: 0,
-            container: std::sync::Mutex::new(Vec::new()),
+            container: Mutex::new(Vec::new()),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
         });

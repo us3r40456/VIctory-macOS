@@ -148,6 +148,8 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })
 }
@@ -934,9 +936,11 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             mesh_stride: 0,
             atomic_locks: false,
             atomic_lock_rounds: false,
-        atomic_umax: false,
+            atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            halves_local: Default::default(),
+            mac: Default::default(),
             host_wave32: false,
             view_marks: false,
         })

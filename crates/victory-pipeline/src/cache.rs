@@ -73,7 +73,7 @@ impl Cache {
         }
         if let Err(err) = std::fs::rename(&tmp, &path) {
             let _ = std::fs::remove_file(&tmp);
-            if !path.is_file() {
+            if !published(&path) {
                 return Err(err.into());
             }
         }

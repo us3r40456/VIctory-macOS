@@ -17,13 +17,33 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod ambient_estimate;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_estimate_set;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_set;
+#[cfg(windows)]
 mod alias;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod alias_plan;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod batch;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(any(windows, test))]
 mod caption;
+#[cfg(any(windows, test))]
+mod census_fast;
+#[cfg(any(windows, test))]
+mod census_maps;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]
@@ -39,6 +59,9 @@ pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+// mac: plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod flights;
 pub mod frame;
 mod hold;
 #[cfg(windows)]
@@ -56,14 +79,23 @@ pub mod pipeline;
 mod placement;
 #[cfg(windows)]
 mod primitive;
+// mac: a sampling profile of the process's threads (`VICTORY_PROFILE`).
+pub mod profile;
 pub mod query;
 pub mod queue;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod physical_runs;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ranges;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
+mod ray_skip;
+#[cfg(any(windows, test))]
 mod recent;
+// The capture format is plain std: read, and tested, everywhere.
+pub mod replay;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -73,9 +105,13 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod mac_switches;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+// Its rules are plain std, so their tests run everywhere.
+#[cfg(any(windows, test))]
+mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -88,14 +124,27 @@ mod widened;
 #[cfg(all(windows, test))]
 mod inplace_probe;
 
+/// mac: the title's descriptor stores report the slots they write
+/// (`VICTORY_HEAP_REPORTS`, `descriptor::reports`): what the launcher and
+/// the import resolver need of it.
+#[cfg(windows)]
+pub mod heap_reports {
+    pub use crate::descriptor::reports::{MARKS_LEN, Mode, hooked, import, marks_address, mode, wanted};
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+pub use alias::{
+    alias_region, committed as alias_committed, enabled as alias_buffers, unalias_region,
+    uncommitted as alias_uncommitted,
+};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
+#[cfg(windows)]
+pub use physical_runs::{mapped as physical_mapped, unmapped as physical_unmapped};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
