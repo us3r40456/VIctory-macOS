@@ -1329,6 +1329,19 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
         .collect()
 }
 
+/// [`castable`] under D3DMetal: Metal views a block-compressed texture only
+/// in its own compression, sRGB on or off, and can corrupt or abort on any
+/// other block view, so a block format keeps only its sRGB partner. Memory
+/// the title reuses in another block format gets its own host texture instead.
+pub(crate) fn castable_metal(format: u32) -> Vec<u32> {
+    const SRGB_PAIRS: [u32; 8] = [71, 72, 74, 75, 77, 78, 98, 99];
+    let mut c = castable(format);
+    if element(format).is_some_and(|(_, texels)| texels > 1) {
+        c.retain(|&f| SRGB_PAIRS.contains(&format) && SRGB_PAIRS.contains(&f) && family(f) == family(format));
+    }
+    c
+}
+
 /// Live host textures by texture memory: title textures (resource objects
 /// and placed views) of one memory share one.
 #[cfg(windows)]
@@ -1453,7 +1466,11 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    let mut castable_formats = match () {
+        () if d.flags & DEPTH != 0 => Vec::new(),
+        () if crate::under_wine() => castable_metal(d.format),
+        () => castable(d.format),
+    };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
@@ -3094,6 +3111,16 @@ mod tests {
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
         assert!(castable(57).contains(&56) && !castable(57).contains(&68) && !castable(57).contains(&69));
+    }
+
+    /// Under D3DMetal a block format casts only to its sRGB partner; other
+    /// formats keep the whole list.
+    #[test]
+    fn metal_casts_block_formats_only_to_their_srgb_partner() {
+        assert_eq!(castable_metal(98), vec![99]);
+        assert_eq!(castable_metal(72), vec![71]);
+        assert!(castable_metal(83).is_empty() && castable_metal(95).is_empty() && castable_metal(80).is_empty());
+        assert_eq!(castable_metal(42), castable(42));
     }
 
     #[test]

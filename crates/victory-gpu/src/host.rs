@@ -238,6 +238,17 @@ static PREP_PROFILE: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Sub-phase breakdown of `deferred+prelude` (`PREP_PROFILE[3]`) when `VICTORY_SUBMISSION_PROFILE=1`:
+/// [0]=Step::Memory, [1]=Step::Host|Step::Own, [2]=Step::Copy|Move|Fill|GpuWrite (mid_flush),
+/// [3]=Step::Heap|Slot|Refresh (bindless), [4]=list.prelude().
+static DEFERRED_PROFILE: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 fn note_submission_profile(gpu: Duration, runs: &[&HostList]) {
     if !submission_profile_on() {
         return;
@@ -271,10 +282,20 @@ fn log_submission_profile(frames: f64) {
     let denom = frames.max(1.0);
     let [evict, sync_heaps, uploads, deferred, flush] =
         PREP_PROFILE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / denom);
+    let [mem_total, host_work, mid_flush, bindless, prelude] =
+        DEFERRED_PROFILE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / denom);
+    let (rw_us, rw_cnt, rw_pairs) = crate::memory::take_rewrite_profile();
+    let mem_rewrite = rw_us as f64 / 1e3 / denom;
+    let mem_scan = (mem_total - mem_rewrite).max(0.0);
     tracing::info!(
         "preparing profile (VICTORY_SUBMISSION_PROFILE): evict {evict:.1} ms, sync_heaps {sync_heaps:.1} ms, \
          uploads {uploads:.1} ms, deferred+prelude {deferred:.1} ms, flush {flush:.1} ms (sum {:.1} ms)",
         evict + sync_heaps + uploads + deferred + flush
+    );
+    tracing::info!(
+        "  deferred+prelude breakdown: mem_rewrite {mem_rewrite:.1} ms ({rw_cnt} rewrites, {rw_pairs} new pairs), \
+         mem_scan {mem_scan:.1} ms, host_work {host_work:.1} ms, mid_flush {mid_flush:.1} ms, \
+         bindless {bindless:.1} ms, prelude {prelude:.1} ms"
     );
     let mut entries = std::mem::take(&mut *SUB_PROFILE.lock().unwrap_or_else(|e| e.into_inner()));
     if entries.is_empty() {
@@ -2112,11 +2133,15 @@ impl Host {
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+            let t_pre = prof_prep.then(std::time::Instant::now);
             if let Some((prelude, uav_to_srv)) = list.prelude(split_preludes) {
                 if uav_to_srv && !lists.is_empty() {
                     native_boundaries.push(lists.len());
                 }
                 lists.push(Some(prelude));
+            }
+            if let Some(t) = t_pre {
+                DEFERRED_PROFILE[4].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             lists.push(list.list.cast().ok());
         }
@@ -4011,6 +4036,7 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch, mut gate: Option<&mut dyn FnMut(&Step)>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let prof = submission_profile_on();
         for step in &self.deferred().copies {
             if let Some(gate) = gate.as_mut() {
                 gate(step);
@@ -4068,6 +4094,10 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     batch.reads.read(*address, *len);
                     batch.add(shadow, *address, *len);
+                    if prof {
+                        DEFERRED_PROFILE[3]
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 Step::Slot(viewed, index) => {
@@ -4076,14 +4106,22 @@ impl HostList {
                         batch.reads.read(address, len);
                     }
                     crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
+                    if prof {
+                        DEFERRED_PROFILE[3]
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 Step::Host(work) | Step::Own(work, ..) => {
                     work();
+                    let elapsed = started.elapsed().as_micros() as u64;
+                    if prof {
+                        DEFERRED_PROFILE[1].fetch_add(elapsed, Ordering::Relaxed);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, elapsed);
                     }
                     continue;
                 }
@@ -4094,20 +4132,36 @@ impl HostList {
                         batch.flush();
                     }
                     shadow.writing(*address, *len, *marked);
+                    if prof {
+                        DEFERRED_PROFILE[2]
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    if prof {
+                        DEFERRED_PROFILE[3]
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 &Step::Memory(heap) => {
                     crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    if prof {
+                        DEFERRED_PROFILE[0]
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let elapsed = started.elapsed().as_micros() as u64;
+            if prof {
+                DEFERRED_PROFILE[2].fetch_add(elapsed, Ordering::Relaxed);
+            }
+            PREPARING[0].fetch_add(elapsed, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }

@@ -33,14 +33,68 @@
 //! past that, the smallest copies read as missing (logged once).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use victory_formats::pagetable::{self, BLOCK, CAPACITY, LEVEL1};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::core::Interface;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
+
+/// Longest raw view D3D12 allows (2^27 dwords = 512 MiB).
+const PIECE_VIEWED: u64 = (1 << 27) * 4;
+/// Stride between pieces of a copy longer than [`PIECE_VIEWED`]: each piece
+/// owns 256 MiB of pages and views up to 512 MiB so reads crossing a piece
+/// boundary stay in bounds.
+const PIECE: u64 = 256 << 20;
+
+/// Splits `(start, len)` into `(piece_start, owned_len, viewed_len)` pieces
+/// that each fit in one raw view ([`PIECE_VIEWED`]).
+fn pieces((start, len): (u64, u64)) -> impl Iterator<Item = (u64, u64, u64)> {
+    let n = if len <= PIECE_VIEWED { 1 } else { len.div_ceil(PIECE) };
+    (0..n).map(move |i| {
+        if n == 1 {
+            (start, len, len)
+        } else {
+            let at = i * PIECE;
+            (start + at, PIECE.min(len - at), PIECE_VIEWED.min(len - at))
+        }
+    })
+}
+
+/// Rewrite telemetry for `VICTORY_SUBMISSION_PROFILE=1`:
+/// [0] = microseconds in `Shared::rewrite`, [1] = rewrite count, [2] = new descriptor pairs created.
+static REWRITE_PROFILE: [AtomicU64; 3] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Takes `(rewrite_us, rewrite_count, pairs_made)` since the last call.
+pub(crate) fn take_rewrite_profile() -> (u64, u64, u64) {
+    (
+        REWRITE_PROFILE[0].swap(0, Ordering::Relaxed),
+        REWRITE_PROFILE[1].swap(0, Ordering::Relaxed),
+        REWRITE_PROFILE[2].swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Key for a raw SRV+UAV descriptor pair held by a page table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PairKey {
+    /// Whole backing buffer `[0, width)` (used by aliased shadows whose
+    /// buffer fits in [`PIECE_VIEWED`] and whose base offset is 4-byte aligned,
+    /// so all physical views inside a 32 MiB chunk share 1 descriptor pair
+    /// regardless of coalescing/splitting; `entry_low = start.wrapping_sub(base)`).
+    WholeBuffer(usize),
+    /// Specific `[first_byte, first_byte + viewed)` sub-range of a buffer
+    /// (used by non-aliased copies, arena slices, and `>512 MiB` pieces so
+    /// out-of-range accesses stay 0-clamped per copy).
+    SubRange(usize, u64, u64),
+}
 
 /// Bits in a list's dirty-page bitmap (one per level-2 entry across all blocks).
 const BITMAP_BITS: usize = (CAPACITY + 1) * BLOCK;
@@ -81,13 +135,17 @@ impl Map {
     }
 }
 
-/// What a heap's page table names: the copies, the level-1 index of each
-/// block (block 0 is the null one), and the copy each entry names (or none).
+/// What a heap's page table names: the copies (one per piece, indexed by
+/// `owner`), the non-aliased copies checked on submission (`tracked`), the
+/// aliased copies (only checked when a widened view exists), the level-1 index
+/// of each block (block 0 is the null one), and the copy each entry names.
 #[derive(Default)]
 struct Layout {
     copies: Vec<Arc<Shadow>>,
-    /// Each copy's bit in the change tracker (`crate::watch::clean_bit`).
-    bits: Vec<Option<u32>>,
+    /// Non-aliased copies and their dirty bit in the change tracker.
+    tracked: Vec<(Arc<Shadow>, Option<u32>)>,
+    /// Aliased copies (zero-copy; skipped unless `any_aliased_widened()`).
+    aliased: Vec<Arc<Shadow>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
 }
@@ -198,8 +256,15 @@ struct Shared {
     gpu: u64,
     /// The pair of null views entries without a copy name.
     null: u32,
-    /// Each copy's view pair (its first slot), by copy.
-    pairs: HashMap<usize, u32>,
+    /// Live raw view pairs (first slot) by backing buffer or sub-range.
+    /// `heap.keep` retains a COM reference to every buffer in `pairs` until
+    /// `raw_pair_at(slot, None, 0, 0)` frees it, preventing COM pointer ABA.
+    pairs: HashMap<PairKey, u32>,
+    /// Cached `ID3D12Resource::GetDesc().Width` per live aliased backing buffer.
+    buf_widths: HashMap<usize, u64>,
+    /// Reusable sets/buffers for [`Shared::rewrite`] to avoid per-rewrite churn.
+    live_keys: HashSet<PairKey>,
+    live_bufs: HashSet<usize>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
@@ -410,7 +475,7 @@ impl Shared {
         let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
-        heap.raw_pair_at(null, None, 0);
+        heap.raw_pair_at(null, None, 0, 0);
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
@@ -420,6 +485,9 @@ impl Shared {
             gpu,
             null,
             pairs: HashMap::new(),
+            buf_widths: HashMap::new(),
+            live_keys: HashSet::new(),
+            live_bufs: HashSet::new(),
             generation: u64::MAX,
             layout: Arc::default(),
             scratch: pagetable::Scratch::default(),
@@ -431,19 +499,64 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        let started = std::time::Instant::now();
         let copies = crate::shadow::all();
-        let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
-        self.pairs.retain(|copy, &mut slot| {
-            let keep = live.contains(copy);
+        self.live_keys.clear();
+        self.live_bufs.clear();
+        let mut planned: Vec<(usize, PairKey, u64, u64, u64, u64, u32)> =
+            Vec::with_capacity(copies.len());
+        let mut tracked: Vec<(Arc<Shadow>, Option<u32>)> = Vec::new();
+        let mut aliased: Vec<Arc<Shadow>> = Vec::new();
+        for (idx, c) in copies.iter().enumerate() {
+            let buf_raw = c.buffer.as_raw() as usize;
+            let (start, len) = c.range();
+            let base = c.base_offset();
+            if c.is_aliased() {
+                aliased.push(c.clone());
+                self.live_bufs.insert(buf_raw);
+                let buf_width = *self.buf_widths.entry(buf_raw).or_insert_with(|| {
+                    // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
+                    unsafe { c.buffer.GetDesc() }.Width
+                });
+                if buf_width <= PIECE_VIEWED && base.is_multiple_of(4) {
+                    let key = PairKey::WholeBuffer(buf_raw);
+                    self.live_keys.insert(key);
+                    let viewed = buf_width.next_multiple_of(4);
+                    let low = start.wrapping_sub(base) as u32;
+                    planned.push((idx, key, start, len, 0, viewed, low));
+                    continue;
+                }
+            } else {
+                tracked.push((c.clone(), c.dirty_bit()));
+            }
+            // Non-aliased copies (preserving exact per-copy bounds clamping)
+            // and >512 MiB aliased buffers use per-piece raw sub-range views.
+            for (p_start, p_len, p_viewed) in pieces((start, len)) {
+                let first_byte = c.offset(p_start);
+                let viewed = p_viewed.next_multiple_of(4);
+                let key = PairKey::SubRange(buf_raw, first_byte, viewed);
+                self.live_keys.insert(key);
+                planned.push((idx, key, p_start, p_len, first_byte, viewed, p_start as u32));
+            }
+        }
+        let live_keys = &self.live_keys;
+        self.pairs.retain(|key, &mut slot| {
+            let keep = live_keys.contains(key);
             if !keep {
-                heap.raw_pair_at(slot, None, 0);
+                heap.raw_pair_at(slot, None, 0, 0);
                 heap.free_pair(slot);
             }
             keep
         });
-        let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
-        for c in copies {
-            let key = Arc::as_ptr(&c) as usize;
+        let live_bufs = &self.live_bufs;
+        self.buf_widths.retain(|buf, _| live_bufs.contains(buf));
+        let mut named: Vec<Arc<Shadow>> = Vec::with_capacity(planned.len());
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(planned.len());
+        let mut slots: Vec<u32> = Vec::with_capacity(planned.len());
+        let mut lows: Vec<u32> = Vec::with_capacity(planned.len());
+        let mut pairs_made = 0u64;
+        for (idx, key, start, len, first_byte, viewed, low) in planned {
+            let c = &copies[idx];
             let slot = match self.pairs.get(&key) {
                 Some(&slot) => slot,
                 None => {
@@ -452,15 +565,17 @@ impl Shared {
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
                         continue;
                     };
-                    heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
+                    heap.raw_pair_at(slot, Some(&c.buffer), first_byte, viewed);
                     self.pairs.insert(key, slot);
+                    pairs_made += 1;
                     slot
                 }
             };
-            named.push(c);
+            named.push(c.clone());
+            ranges.push((start, len));
             slots.push(slot);
+            lows.push(low);
         }
-        let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
         // The last table's blocks and owners, built back into if no list
         // still reads them (a reader clones the layout, under the lock
         // this holds); their buffers are kept between rewrites.
@@ -469,23 +584,33 @@ impl Shared {
             Ok(Layout { blocks, owner, .. }) => pagetable::Outputs { blocks, owners: owner },
             Err(_) => pagetable::Outputs::default(),
         };
-        let built = self.scratch.build(&ranges, &slots, self.null, &mut out);
+        let built = self.scratch.build_with_lows(&ranges, &slots, &lows, self.null, &mut out);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which the
         // builder keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
-        tracing::debug!(copies = ranges.len(), blocks = built.blocks.len() - 1, "title memory page table");
+        tracing::debug!(
+            copies = ranges.len(),
+            pairs = self.pairs.len(),
+            pairs_made,
+            blocks = built.blocks.len() - 1,
+            "title memory page table"
+        );
         if built.full {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
         }
         self.generation = now;
         self.layout = Arc::new(Layout {
-            bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
+            tracked,
+            aliased,
             blocks: out.blocks,
             owner: out.owners,
         });
         stats(|s| s.tables += 1);
+        REWRITE_PROFILE[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        REWRITE_PROFILE[1].fetch_add(1, Ordering::Relaxed);
+        REWRITE_PROFILE[2].fetch_add(pairs_made, Ordering::Relaxed);
     }
 }
 
@@ -497,6 +622,27 @@ fn layout(key: usize) -> Arc<Layout> {
         .find(|(k, _)| *k == key)
         .map(|(_, s)| s.layout.clone())
         .unwrap_or_default()
+}
+
+/// Calls `add` for every copy in `l` that may need a CPU→GPU refresh:
+/// non-aliased copies whose dirty bit is not clean, plus aliased copies only
+/// if they hold a widened 3-channel RGB32 view (normal aliased copies are
+/// zero-copy and have `dirty_bit() == None`).
+fn refresh_layout(l: &Layout, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    for (c, bit) in &l.tracked {
+        if !crate::watch::clean_bit(*bit) {
+            let (start, len) = c.range();
+            add(c, start as usize, len as usize);
+        }
+    }
+    if crate::shadow::any_aliased_widened() {
+        for c in &l.aliased {
+            if c.has_widened() {
+                let (start, len) = c.range();
+                add(c, start as usize, len as usize);
+            }
+        }
+    }
 }
 
 /// At submission, for a list using title memory with view heap `key`
@@ -516,14 +662,9 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     })
     .flatten();
     // Copies the title has not written since they took it are passed by
-    // without touching them (the table names every copy, ~4,700 in the world).
+    // without touching them; zero-copy aliased regions are skipped unless widened.
     for l in layout.iter() {
-        for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
-                let (start, len) = c.range();
-                add(c, start as usize, len as usize);
-            }
-        }
+        refresh_layout(l, &mut add);
     }
 }
 
@@ -531,14 +672,9 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
 /// (`crate::host::unwaited`): those the page table of heap `key` named when
 /// it was last brought up to date. The table itself is left as it is: a
 /// submission still running may read it.
-pub(crate) fn due(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+pub(crate) fn due(key: usize, add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let l = layout(key);
-    for (c, bit) in l.copies.iter().zip(&l.bits) {
-        if !crate::watch::clean_bit(*bit) {
-            let (start, len) = c.range();
-            add(c, start as usize, len as usize);
-        }
-    }
+    refresh_layout(&l, add);
 }
 
 /// The title memory whose host copies hold shader writes kept from it
@@ -769,12 +905,28 @@ mod tests {
     }
 
     #[test]
+    fn long_copies_are_named_in_pieces() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(pieces((0x1000, 4 * MIB)).collect::<Vec<_>>(), [(0x1000, 4 * MIB, 4 * MIB)]);
+        assert_eq!(pieces((0, 512 * MIB)).collect::<Vec<_>>(), [(0, 512 * MIB, 512 * MIB)]);
+        assert_eq!(
+            pieces((64 * MIB, 700 * MIB)).collect::<Vec<_>>(),
+            [
+                (64 * MIB, 256 * MIB, 512 * MIB),
+                (320 * MIB, 256 * MIB, 444 * MIB),
+                (576 * MIB, 188 * MIB, 188 * MIB),
+            ]
+        );
+    }
+
+    #[test]
     fn has_missed_checks_block_zero_out_of_range_unowned_and_owned() {
         let mut owner = vec![None; 2 * BLOCK];
         owner[BLOCK + 5] = Some(0);
         let l = Layout {
             copies: Vec::new(),
-            bits: Vec::new(),
+            tracked: Vec::new(),
+            aliased: Vec::new(),
             blocks: vec![usize::MAX, 0],
             owner,
         };
@@ -930,12 +1082,19 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// A copy's view pair, in view heap `key`'s table.
     fn pair_of(key: usize, copy: &Arc<Shadow>) -> Option<u32> {
-        shared()
-            .iter()
-            .find(|(k, _)| *k == key)?
-            .1
-            .pairs
-            .get(&(Arc::as_ptr(copy) as usize))
+        let buf_raw = copy.buffer.as_raw() as usize;
+        let (start, len) = copy.range();
+        let guard = shared();
+        let pairs = &guard.iter().find(|(k, _)| *k == key)?.1.pairs;
+        if copy.is_aliased()
+            && let Some(&slot) = pairs.get(&PairKey::WholeBuffer(buf_raw))
+        {
+            return Some(slot);
+        }
+        let first_byte = copy.offset(start);
+        let viewed = len.min(PIECE_VIEWED).next_multiple_of(4);
+        pairs
+            .get(&PairKey::SubRange(buf_raw, first_byte, viewed))
             .copied()
     }
 
@@ -1246,5 +1405,65 @@ void main() {
         crate::shadow::unregister(memory[1], memory[1] as u64);
         crate::shadow::unregister(memory[2], memory[2] as u64);
         drop((b, c));
+    }
+
+    #[test]
+    fn aliased_chunk_suboffset_shares_single_pair_and_skips_prepare_due() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        let (Some(host), Some(_views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer((2 * PAGE) as u64).unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let list = host.new_list().unwrap();
+        let _map = bind(&list, OURS).expect("a page table");
+        // Two disjoint 64 KiB views backed by the SAME buffer at base 0 and base 64 KiB.
+        let va1 = 0x62_0000_0000u64;
+        let va2 = 0x62_0002_0000u64;
+        let v1 = Shadow::new_aliased_at(buffer.clone(), data, gpu, 0, va1, PAGE as u64);
+        // SAFETY: `data` covers `2 * PAGE`, so `data.add(PAGE)` is in bounds.
+        let v2 = Shadow::new_aliased_at(
+            buffer.clone(),
+            unsafe { data.add(PAGE) },
+            gpu + PAGE as u64,
+            PAGE as u64,
+            va2,
+            PAGE as u64,
+        );
+        crate::shadow::register_aliased(v1.clone());
+        crate::shadow::register_aliased(v2.clone());
+        let mut added_prepare = 0usize;
+        prepare(OURS, |s, _, _| {
+            if s.range().0 == va1 || s.range().0 == va2 {
+                added_prepare += 1;
+            }
+        });
+        assert_eq!(added_prepare, 0, "non-widened aliased shadows must be skipped by prepare");
+        let mut added_due = 0usize;
+        due(OURS, |s, _, _| {
+            if s.range().0 == va1 || s.range().0 == va2 {
+                added_due += 1;
+            }
+        });
+        assert_eq!(added_due, 0, "non-widened aliased shadows must be skipped by due");
+        let slot1 = pair_of(OURS, &v1).expect("v1 pair");
+        let slot2 = pair_of(OURS, &v2).expect("v2 pair");
+        assert_eq!(slot1, slot2, "both views of the same backing chunk share 1 descriptor pair");
+        // Verify the live GPU page table resolves both views to their exact offsets in `buffer`.
+        let dwords = {
+            let guard = shared();
+            let (_, s) = guard.iter().find(|(k, _)| *k == OURS).unwrap();
+            let len = LEVEL1 + s.layout.owner.len() * 2;
+            // SAFETY: `s.data` holds the written page table dwords under lock.
+            unsafe { std::slice::from_raw_parts(s.data as *const u32, len).to_vec() }
+        };
+        assert_eq!(look_up(&dwords, va1 + 0x40), (slot1, 0x40));
+        assert_eq!(look_up(&dwords, va2 + 0x80), (slot1, PAGE as u32 + 0x80));
+        crate::shadow::unregister_aliased(va1);
+        crate::shadow::unregister_aliased(va2);
+        list.close();
+        list.reset();
     }
 }

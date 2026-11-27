@@ -327,6 +327,11 @@ impl Shadow {
         address - self.start + self.base
     }
 
+    /// Byte offset where this shadow starts inside its backing `buffer`.
+    pub(crate) fn base_offset(&self) -> u64 {
+        self.base
+    }
+
     /// Where the title memory it copies starts, and its length.
     pub(crate) fn range(&self) -> (u64, u64) {
         (self.start, self.len)

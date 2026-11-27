@@ -638,7 +638,9 @@ pub(crate) fn refresh_slot(
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if (!shadow.is_aliased() || shadow.has_widened())
+        && !crate::watch::clean_bit(shadow.dirty_bit())
+    {
         add(shadow, *address as usize, *len as usize);
     }
 }

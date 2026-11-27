@@ -59,6 +59,35 @@ impl Scratch {
         null: u32,
         out: &'out mut Outputs,
     ) -> Built<'scratch, 'out> {
+        self.build_inner(copies, pairs, None, null, out)
+    }
+
+    /// Like [`Scratch::build`], but writes `lows[k]` as each copy's base low
+    /// dword instead of `copies[k].0 as u32`. When a view pair covers a whole
+    /// backing buffer from byte 0 (`FirstElement = 0`) and copy `k` lies at
+    /// `base` inside that buffer, passing `lows[k] = start.wrapping_sub(base) as u32`
+    /// makes the shader's `addr_lo.wrapping_sub(lows[k])` evaluate directly to
+    /// `base + (addr - start)`.
+    pub fn build_with_lows<'scratch, 'out>(
+        &'scratch mut self,
+        copies: &[(u64, u64)],
+        pairs: &[u32],
+        lows: &[u32],
+        null: u32,
+        out: &'out mut Outputs,
+    ) -> Built<'scratch, 'out> {
+        debug_assert_eq!(copies.len(), lows.len());
+        self.build_inner(copies, pairs, Some(lows), null, out)
+    }
+
+    fn build_inner<'scratch, 'out>(
+        &'scratch mut self,
+        copies: &[(u64, u64)],
+        pairs: &[u32],
+        lows: Option<&[u32]>,
+        null: u32,
+        out: &'out mut Outputs,
+    ) -> Built<'scratch, 'out> {
         self.order.clear();
         self.order.extend(0..copies.len());
         self.order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
@@ -124,11 +153,20 @@ impl Scratch {
         let (index, entries) = self.dwords.split_at_mut(LEVEL1);
         index.copy_from_slice(&self.level1);
         let (entries, _) = entries.as_chunks_mut::<2>();
-        for (entry, o) in entries.iter_mut().zip(owners.iter()) {
-            *entry = match *o {
-                Some(k) => [pairs[k], copies[k].0 as u32],
-                None => [null, 0],
-            };
+        if let Some(lows) = lows {
+            for (entry, o) in entries.iter_mut().zip(owners.iter()) {
+                *entry = match *o {
+                    Some(k) => [pairs[k], lows[k]],
+                    None => [null, 0],
+                };
+            }
+        } else {
+            for (entry, o) in entries.iter_mut().zip(owners.iter()) {
+                *entry = match *o {
+                    Some(k) => [pairs[k], copies[k].0 as u32],
+                    None => [null, 0],
+                };
+            }
         }
         Built {
             dwords: &self.dwords,
@@ -257,5 +295,32 @@ mod tests {
             overflowed += usize::from(full);
         }
         assert_eq!(overflowed, 8, "the rounds past the capacity overflow it");
+    }
+
+    #[test]
+    fn build_with_lows_maps_buffer_suboffsets_and_wraparound() {
+        // Two 64 KiB views sharing one 32 MiB backing buffer at distinct bases,
+        // including one where `base > start` so `start.wrapping_sub(base)` wraps.
+        let copies = [(0x0004_0000u64, 0x1_0000u64), (0x10_0020_0000u64, 0x2_0000u64)];
+        let bases = [0x0100_0000u64, 0x0040_0000u64];
+        let pairs = [42u32, 42u32];
+        let lows: Vec<u32> = copies
+            .iter()
+            .zip(&bases)
+            .map(|(&(start, _), &base)| start.wrapping_sub(base) as u32)
+            .collect();
+        let (mut scratch, mut out) = (Scratch::default(), Outputs::default());
+        let built = scratch.build_with_lows(&copies, &pairs, &lows, 7, &mut out);
+        let look_up = |address: u64| -> (u32, u32) {
+            let (lo, hi) = (address as u32, (address >> 32) as u32);
+            let l1 = hi << 4 | lo >> 28;
+            let block = built.dwords[l1 as usize];
+            let entry = block << 12 | (lo >> 16 & 0xFFF);
+            let at = LEVEL1 + 2 * entry as usize;
+            (built.dwords[at], lo.wrapping_sub(built.dwords[at + 1]))
+        };
+        assert_eq!(look_up(0x0004_0124), (42, 0x0100_0124));
+        assert_eq!(look_up(0x10_0021_8008), (42, 0x0041_8008));
+        assert_eq!(look_up(0x0008_0000).0, 7);
     }
 }
