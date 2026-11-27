@@ -4180,9 +4180,11 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
-    /// Aliased memory asked for (`crate::alias`), by copy: never copied,
-    /// counted once per submission for the frame line.
-    zero_copy: std::collections::HashMap<usize, crate::ranges::Ranges>,
+    /// Aliased memory asked for (`crate::alias`): lightweight counters instead
+    /// of building a per-region RangeSet map when tens of thousands of
+    /// physical views are active.
+    zero_copy_ranges: usize,
+    zero_copy_bytes: usize,
     /// Host copies refreshed with bytes copied, and those bytes (counted with
     /// `zero_copy`).
     copied: (usize, usize),
@@ -4213,11 +4215,18 @@ fn refresh(shadow: &crate::shadow::Shadow, address: usize, len: usize, early: bo
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        // Title memory that is the copy's own: nothing to copy, ever.
-        if shadow.is_aliased() && len > 0 {
-            self.zero_copy.entry(key).or_default().insert(address, end, JOIN);
+        // Title memory that is the copy's own: nothing to copy, ever (unless a
+        // widened 3-channel RGB32 view needs its CPU copy updated).
+        if shadow.is_aliased() {
+            if len > 0 {
+                self.zero_copy_ranges += 1;
+                self.zero_copy_bytes += len;
+            }
+            if !shadow.has_widened() {
+                return;
+            }
         }
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
@@ -4400,15 +4409,15 @@ impl Batch {
         if !crate::alias::enabled() {
             return;
         }
-        let (mut ranges, mut bytes) = (0, 0);
-        for asked in self.zero_copy.values() {
-            for (from, to) in asked.iter() {
-                ranges += 1;
-                bytes += to - from;
-            }
-        }
-        crate::alias::asked(self.zero_copy.len(), ranges, bytes, self.copied.0, self.copied.1);
-        self.zero_copy.clear();
+        crate::alias::asked(
+            self.zero_copy_ranges,
+            self.zero_copy_ranges,
+            self.zero_copy_bytes,
+            self.copied.0,
+            self.copied.1,
+        );
+        self.zero_copy_ranges = 0;
+        self.zero_copy_bytes = 0;
         self.copied = (0, 0);
     }
 

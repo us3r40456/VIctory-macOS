@@ -12,7 +12,7 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
@@ -71,6 +71,9 @@ fn class(views: &BTreeMap<usize, (usize, usize, usize)>, from: usize, to: usize)
 /// Per class: copies refreshed, bytes copied, microseconds.
 static COUNTS: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
 
+/// Top 16 MiB buckets for `elsewhere` refreshes: (copies, bytes, us).
+static ELSEWHERE: Mutex<Option<HashMap<usize, (u64, u64, u64)>>> = Mutex::new(None);
+
 /// A refresh copied `bytes` into the host copy of `[start, start + len)` in
 /// `us` microseconds.
 pub(crate) fn refreshed(start: usize, len: usize, bytes: usize, us: u64) {
@@ -81,6 +84,14 @@ pub(crate) fn refreshed(start: usize, len: usize, bytes: usize, us: u64) {
     );
     for (i, n) in [1, bytes as u64, us].into_iter().enumerate() {
         COUNTS[k][i].fetch_add(n, Relaxed);
+    }
+    if k == 2 {
+        let bucket = start & !((16 << 20) - 1);
+        let mut map = ELSEWHERE.lock().unwrap_or_else(|e| e.into_inner());
+        let e = map.get_or_insert_with(HashMap::new).entry(bucket).or_default();
+        e.0 += 1;
+        e.1 += bytes as u64;
+        e.2 += us;
     }
 }
 
@@ -94,10 +105,34 @@ pub(crate) fn log(frames: f64) {
             .map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0))
     });
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let mut top_elsewhere: Vec<(usize, (u64, u64, u64))> = ELSEWHERE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default();
+    top_elsewhere.sort_by(|a, b| b.1.2.cmp(&a.1.2));
+    let top_str = if top_elsewhere.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = top_elsewhere
+            .into_iter()
+            .take(5)
+            .map(|(b, (c, by, us))| {
+                format!(
+                    "{b:#x}({:.0}c/{:.1}MB/{:.1}ms)",
+                    c as f64 / frames.max(1.0),
+                    by as f64 / 1e6 / frames.max(1.0),
+                    us as f64 / 1e3 / frames.max(1.0),
+                )
+            })
+            .collect();
+        format!("; top elsewhere: {}", parts.join(", "))
+    };
     tracing::info!(
         "physical runs (VICTORY_PHYSICAL_RUNS), per frame: refreshes of copies in one run of one section's pages \
          {:.0} copies, {:.1} MB in {:.1} ms; in physical pages not one run {:.0} copies, {:.1} MB in {:.1} ms; \
-         elsewhere {:.0} copies, {:.1} MB in {:.1} ms; {views} views mapped",
+         elsewhere {:.0} copies, {:.1} MB in {:.1} ms; {views} views mapped{top_str}",
         run[0],
         run[1] / 1e6,
         run[2] / 1e3,

@@ -154,7 +154,7 @@ fn resolve(view: &View) -> Option<Made> {
         // `for_view` finds this copy again (the same address and length)
         // and takes it for a view that starts on one of its elements.
         Some(found) if found.offset(start).is_multiple_of(element) => (found.clone(), false),
-        _ => crate::shadow::for_view(start, len, element)?,
+        _ => crate::shadow::for_view_srv(start, len, element)?,
     };
     let first = shadow.offset(start) / element;
     if !in_buffer(&shadow.buffer, first, count, element) {

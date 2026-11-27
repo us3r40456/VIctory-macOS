@@ -22,8 +22,8 @@
 //! (`crate::alias_plan`); and the frame line counts both paths
 //! ([`frame_line`]); it needs `VICTORY_COPY_ORDER=split`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -32,6 +32,7 @@ use windows_sys::Win32::System::Memory::{
 use crate::host::host;
 use crate::watch::PAGE;
 
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 #[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -405,12 +406,22 @@ pub(crate) fn frame_line(frames: f64) -> String {
         [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|i| COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     let [made, failed, stale, again] = [0, 1, 2, 3].map(|i| TOTALS[i].load(Ordering::Relaxed));
     let (now, bytes) = crate::shadow::aliased_totals();
+    let phys = if physical_enabled() {
+        format!(
+            ", phys {} chunks ({:.0} MB, {} views aliased)",
+            PHYSICAL_CHUNKS.load(Ordering::Relaxed),
+            PHYSICAL_ALLOCATED.load(Ordering::Relaxed) as f64 / 1e6,
+            PHYSICAL_VIEWS.load(Ordering::Relaxed),
+        )
+    } else {
+        String::new()
+    };
     format!(
         "; zero-copy: {:.1} MB in {ranges:.0} ranges of {regions:.0} aliased regions asked, none copied, against \
          {copies:.0} host copies refreshed with {:.1} MB copied; shaders wrote {:.1} MB in place, marking {marked:.0} \
          tracked pages, {:.1} MB of it withheld writes; {copies_in:.0} title copies ({:.1} KB) into aliased memory, \
          {copies_cut:.0} of them after a copy-order cut; {mended:.1} commits mended; aliased now {now} regions \
-         {:.0} MB ({made} made, {failed} refused, {stale} stale dropped, {again} runs pointed back)",
+         {:.0} MB ({made} made, {failed} refused, {stale} stale dropped, {again} runs pointed back{phys})",
         asked / 1e6,
         copied / 1e6,
         written / 1e6,
@@ -457,7 +468,7 @@ pub fn committed(at: usize, len: usize, fresh: bool, eligible: bool, before: Opt
     let end = at.saturating_add(len);
     let whole = [(at, end)];
     let uncommitted = if fresh { &whole[..] } else { before.unwrap_or(&[]) };
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let aliases: Vec<(usize, usize)> = crate::shadow::aliased_between(at as u64, end as u64)
         .into_iter()
         .map(|(s, e)| (s as usize, e as usize))
@@ -479,6 +490,7 @@ pub fn committed(at: usize, len: usize, fresh: bool, eligible: bool, before: Opt
     }
     for start in plan.stale {
         if crate::shadow::unregister_aliased(start as u64) {
+            forget_virtual_aliased(&mut guard, start);
             TOTALS[2].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -488,7 +500,7 @@ pub fn committed(at: usize, len: usize, fresh: bool, eligible: bool, before: Opt
         }
     }
     if plan.new {
-        alias_locked(at, len, false);
+        alias_locked(&mut guard, at, len, false);
     }
 }
 
@@ -524,8 +536,36 @@ fn point_back(from: usize, to: usize) -> bool {
     true
 }
 
-/// Serializes aliasing and its registry changes.
-static LOCK: Mutex<()> = Mutex::new(());
+/// Serializes virtual aliasing and tracks virtual-region bytes independently
+/// of `PhysicalPool` virtual views (`VICTORY_ALIAS_BUDGET_MB` vs
+/// `VICTORY_ALIAS_PHYSICAL_BUDGET_MB`).
+static LOCK: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+static VIRTUAL_ALIASED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn note_virtual_aliased(
+    guard: &mut Option<std::collections::HashMap<usize, usize>>,
+    base: usize,
+    len: usize,
+) {
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let prev = map.insert(base, len).unwrap_or(0);
+    if len >= prev {
+        VIRTUAL_ALIASED_BYTES.fetch_add(len - prev, Ordering::Relaxed);
+    } else {
+        VIRTUAL_ALIASED_BYTES.fetch_sub(prev - len, Ordering::Relaxed);
+    }
+}
+
+fn forget_virtual_aliased(
+    guard: &mut Option<std::collections::HashMap<usize, usize>>,
+    base: usize,
+) {
+    if let Some(map) = guard.as_mut()
+        && let Some(len) = map.remove(&base)
+    {
+        VIRTUAL_ALIASED_BYTES.fetch_sub(len, Ordering::Relaxed);
+    }
+}
 
 /// Probes once whether `mach_vm_remap` onto a D3DMetal write-back L0 buffer
 /// works and whether fresh buffers arrive zero-initialized.
@@ -725,11 +765,281 @@ pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
     }
 }
 
+/// Default chunk size for lazy zero-copy physical sections (`VICTORY_ALIAS_PHYSICAL=1`):
+/// 32 MiB = 512 64-KiB pages per D3D12 write-back L0 buffer.
+const DEFAULT_PHYSICAL_CHUNK_BYTES: usize = 32 << 20;
+/// Default total budget for lazy physical chunks (6 GiB; 0 = unbounded).
+const DEFAULT_PHYSICAL_BUDGET_BYTES: usize = 6144 << 20;
+
+static PHYSICAL_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static PHYSICAL_CHUNKS: AtomicU64 = AtomicU64::new(0);
+static PHYSICAL_VIEWS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether zero-copy physical page aliasing (`VICTORY_ALIAS_PHYSICAL=1`) is active.
+pub fn physical_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_ALIAS_PHYSICAL") && enabled() && supported().is_some();
+        if on {
+            tracing::info!(
+                chunk_mb = physical_chunk_bytes() >> 20,
+                budget_mb = physical_budget_bytes().map(|b| b >> 20).unwrap_or(0),
+                "VICTORY_ALIAS_PHYSICAL=1: XMem physical sections backed by lazy write-back L0 GPU chunks \
+                 (zero-copy buffers + DirectStorage writes)"
+            );
+        }
+        on
+    })
+}
+
+fn physical_chunk_bytes() -> usize {
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("VICTORY_ALIAS_PHYSICAL_CHUNK_MB")
+            .ok()
+            .and_then(|s| crate::alias_plan::parse_mib(&s))
+            .map(|b| b.max(1 << 20).next_multiple_of(PAGE))
+            .unwrap_or(DEFAULT_PHYSICAL_CHUNK_BYTES)
+    })
+}
+
+fn physical_budget_bytes() -> Option<usize> {
+    static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
+    *BUDGET.get_or_init(|| match std::env::var("VICTORY_ALIAS_PHYSICAL_BUDGET_MB") {
+        Ok(s) => crate::alias_plan::parse_mib(&s),
+        Err(_) => Some(DEFAULT_PHYSICAL_BUDGET_BYTES),
+    })
+}
+
+/// One lazily allocated write-back L0 GPU buffer backing a slice of a physical section.
+struct PhysicalChunk {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    gpu: u64,
+    len: usize,
+}
+
+// SAFETY: `ID3D12Resource` is free-threaded and `data` stays mapped for `buffer`'s lifetime.
+unsafe impl Send for PhysicalChunk {}
+// SAFETY: as above.
+unsafe impl Sync for PhysicalChunk {}
+
+impl Drop for PhysicalChunk {
+    fn drop(&mut self) {
+        PHYSICAL_ALLOCATED.fetch_sub(self.len, Ordering::Relaxed);
+        PHYSICAL_CHUNKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Lazy chunked write-back L0 GPU backing for an `XMemAllocatePhysicalPages` section.
+///
+/// Chunks are allocated only on first map or DirectStorage write, so a 6.1 GiB
+/// physical section uses zero GPU memory for untouched slices. Each chunk is
+/// permanently either GPU-backed or file-backed (`OnceLock`), keeping DirectStorage
+/// writes and all mapped title virtual views coherent.
+pub struct PhysicalPool {
+    len: usize,
+    chunk_bytes: usize,
+    chunks: Box<[OnceLock<Option<Arc<PhysicalChunk>>>]>,
+}
+
+// SAFETY: `OnceLock<Option<Arc<PhysicalChunk>>>` is thread-safe.
+unsafe impl Send for PhysicalPool {}
+// SAFETY: as above.
+unsafe impl Sync for PhysicalPool {}
+
+impl PhysicalPool {
+    /// Creates a lazy chunked pool for a physical section of `len` bytes.
+    pub fn new(len: usize, chunk_bytes: usize) -> Option<Self> {
+        let chunk_bytes = chunk_bytes.max(PAGE).next_multiple_of(PAGE);
+        if len == 0 || !len.is_multiple_of(PAGE) || supported().is_none() {
+            return None;
+        }
+        let count = len.div_ceil(chunk_bytes);
+        let chunks = (0..count).map(|_| OnceLock::new()).collect();
+        Some(Self {
+            len,
+            chunk_bytes,
+            chunks,
+        })
+    }
+
+    /// Chunk size in bytes (always a multiple of 64 KiB).
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunk_bytes
+    }
+
+    /// Chunk size in 64 KiB pages.
+    pub fn chunk_pages(&self) -> usize {
+        self.chunk_bytes / PAGE
+    }
+
+    fn get_chunk(&self, idx: usize) -> Option<&Arc<PhysicalChunk>> {
+        let slot = self.chunks.get(idx)?;
+        slot.get_or_init(|| {
+            let chunk_start = idx * self.chunk_bytes;
+            let chunk_len = self.chunk_bytes.min(self.len - chunk_start);
+            // Reserve budget atomically before asking D3D12 for the buffer.
+            if let Some(budget) = physical_budget_bytes() {
+                let mut cur = PHYSICAL_ALLOCATED.load(Ordering::Relaxed);
+                loop {
+                    if cur.saturating_add(chunk_len) > budget {
+                        tracing::debug!(
+                            chunk = idx,
+                            chunk_len,
+                            used_mb = cur >> 20,
+                            budget_mb = budget >> 20,
+                            "VICTORY_ALIAS_PHYSICAL budget reached; leaving chunk on file section"
+                        );
+                        return None;
+                    }
+                    match PHYSICAL_ALLOCATED.compare_exchange_weak(
+                        cur,
+                        cur + chunk_len,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => cur = actual,
+                    }
+                }
+            } else {
+                PHYSICAL_ALLOCATED.fetch_add(chunk_len, Ordering::Relaxed);
+            }
+            let Some(zeroed) = supported() else {
+                PHYSICAL_ALLOCATED.fetch_sub(chunk_len, Ordering::Relaxed);
+                return None;
+            };
+            let Some(h) = host() else {
+                PHYSICAL_ALLOCATED.fetch_sub(chunk_len, Ordering::Relaxed);
+                return None;
+            };
+            let Some((buffer, data)) = h.shared_buffer(chunk_len as u64) else {
+                PHYSICAL_ALLOCATED.fetch_sub(chunk_len, Ordering::Relaxed);
+                return None;
+            };
+            if !zeroed {
+                // SAFETY: `data` is a freshly mapped writable buffer of `chunk_len` bytes.
+                unsafe { std::ptr::write_bytes(data, 0, chunk_len) };
+            }
+            crate::host::name(&buffer, || {
+                format!("aliased physical chunk #{idx} ({} MiB)", chunk_len >> 20)
+            });
+            // SAFETY: `buffer` is alive.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            PHYSICAL_CHUNKS.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::new(PhysicalChunk {
+                buffer,
+                data,
+                gpu,
+                len: chunk_len,
+            }))
+        })
+        .as_ref()
+    }
+
+    /// CPU address for DirectStorage writes into `[offset, offset + len)` of
+    /// this section (must lie within a single chunk). Returns `None` if the
+    /// chunk could not be backed on the GPU, so callers fall back to the file view.
+    pub fn cpu_slice(&self, offset: usize, len: usize) -> Option<usize> {
+        if len == 0 || offset.checked_add(len).is_none_or(|e| e > self.len) {
+            return None;
+        }
+        let idx = offset / self.chunk_bytes;
+        let off = offset % self.chunk_bytes;
+        if off.checked_add(len).is_none_or(|e| e > self.chunk_bytes) {
+            return None;
+        }
+        let chunk = self.get_chunk(idx)?;
+        if off + len > chunk.len {
+            return None;
+        }
+        Some(chunk.data as usize + off)
+    }
+
+    /// Remaps `[title_va, title_va + len)` onto the shared GPU chunk backing
+    /// `[section_offset, section_offset + len)` and registers a zero-copy
+    /// `Shadow` (coalescing with adjacent views from the same chunk).
+    ///
+    /// # Safety
+    /// `[title_va, title_va + len)` must be an owned mapped view of the section.
+    pub unsafe fn alias_view(&self, title_va: usize, section_offset: usize, len: usize) -> bool {
+        if title_va == 0
+            || len == 0
+            || !title_va.is_multiple_of(PAGE)
+            || !section_offset.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || section_offset.checked_add(len).is_none_or(|e| e > self.len)
+        {
+            return false;
+        }
+        let idx = section_offset / self.chunk_bytes;
+        let off = section_offset % self.chunk_bytes;
+        if off.checked_add(len).is_none_or(|e| e > self.chunk_bytes) {
+            return false;
+        }
+        let Some(chunk) = self.get_chunk(idx) else {
+            return false;
+        };
+        if off + len > chunk.len {
+            return false;
+        }
+        // SAFETY: `title_va` is an owned page-aligned view; `chunk.data + off`
+        // lies within the live write-back L0 buffer.
+        let r = unsafe {
+            mach::remap_shared(
+                title_va as u64,
+                (chunk.data as usize + off) as u64,
+                len as u64,
+                mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
+            )
+        };
+        if r.msg != 0 || r.kr != 0 || r.address != title_va as u64 {
+            TOTALS[1].fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                title_va = format_args!("{title_va:#x}"),
+                len,
+                ?r,
+                "mach_vm_remap of physical view failed; leaving file view"
+            );
+            return false;
+        }
+        // SAFETY: `off < chunk.len` checked above.
+        let slice_data = unsafe { chunk.data.add(off) };
+        let shadow = crate::shadow::Shadow::new_aliased_at(
+            chunk.buffer.clone(),
+            slice_data,
+            chunk.gpu + off as u64,
+            off as u64,
+            title_va as u64,
+            len as u64,
+        );
+        crate::shadow::register_aliased(shadow);
+        PHYSICAL_VIEWS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Creates a lazy zero-copy GPU pool for a physical section when
+/// `VICTORY_ALIAS_PHYSICAL=1` is enabled.
+pub fn physical_pool(len: usize) -> Option<PhysicalPool> {
+    if !physical_enabled() {
+        return None;
+    }
+    PhysicalPool::new(len, physical_chunk_bytes())
+}
+
+/// Removes `[base, base + len)` from the aliased shadow registry when a
+/// physical section view is unmapped.
+pub fn unalias_physical_view(base: usize, len: usize) {
+    crate::shadow::unregister_aliased_range(base as u64, len as u64);
+}
+
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
 /// and GPU share physical pages with zero copy.
 pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    alias_locked(base, len, preserve_contents)
+    let mut guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    alias_locked(&mut guard, base, len, preserve_contents)
 }
 
 /// Minimum allocation size (in bytes) eligible for aliasing when
@@ -766,17 +1076,22 @@ fn alias_budget_bytes() -> Option<usize> {
 }
 
 /// [`alias_region`], under [`LOCK`].
-fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
+fn alias_locked(
+    guard: &mut Option<std::collections::HashMap<usize, usize>>,
+    base: usize,
+    len: usize,
+    preserve_contents: bool,
+) -> bool {
     let Some(zeroed) = supported() else {
         return false;
     };
     if base == 0 || len < PAGE || !base.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
         return false;
     }
-    let (_, aliased_bytes) = crate::shadow::aliased_totals();
+    let aliased_bytes = VIRTUAL_ALIASED_BYTES.load(Ordering::Relaxed);
     if !crate::alias_plan::region_within_limits(
         len,
-        aliased_bytes as usize,
+        aliased_bytes,
         alias_min_bytes(),
         alias_max_bytes(),
         alias_budget_bytes(),
@@ -832,6 +1147,7 @@ fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = crate::shadow::Shadow::new_aliased(buffer, gpu_mem, gpu, base as u64, len as u64);
     crate::shadow::register_aliased(shadow);
+    note_virtual_aliased(guard, base, len);
     if len >= 16 << 20 {
         tracing::info!(
             base = format_args!("{base:#x}"),
@@ -850,8 +1166,12 @@ fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
 
 /// Removes an aliased region registered at `base`.
 pub fn unalias_region(base: usize) -> bool {
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    crate::shadow::unregister_aliased(base as u64)
+    let mut guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let removed = crate::shadow::unregister_aliased(base as u64);
+    if removed {
+        forget_virtual_aliased(&mut guard, base);
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -1414,6 +1734,85 @@ mod tests {
         // SAFETY: `ptr` was allocated by `VirtualAlloc`.
         assert_ne!(unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) }, 0);
         drop(shadow);
+        // SAFETY: querying device health.
+        assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn physical_pool_coalesces_splits_and_shares_gpu_pages() {
+        if !crate::watch::rosetta() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        let pool = PhysicalPool::new(8 * PAGE, 4 * PAGE).expect("physical pool");
+        let len = 4 * PAGE;
+        // SAFETY: allocating 4 contiguous RW pages as our test VA range.
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!ptr.is_null());
+        let base = ptr as usize;
+
+        // Map page 0 and pages 1..3 of chunk 0 separately; they must coalesce into one aliased Shadow.
+        // SAFETY: `ptr` is our owned 4-page mapping.
+        assert!(unsafe { pool.alias_view(base, PAGE, PAGE) });
+        assert!(unsafe { pool.alias_view(base + PAGE, 2 * PAGE, 2 * PAGE) });
+
+        let merged = crate::shadow::find(base as u64, (3 * PAGE) as u64).expect("coalesced shadow");
+        assert!(merged.is_aliased());
+        assert_eq!(merged.range(), (base as u64, (3 * PAGE) as u64));
+
+        // DirectStorage write via `cpu_slice` is visible at title VA and GPU buffer.
+        let ds_addr = pool.cpu_slice(2 * PAGE, PAGE).expect("cpu_slice");
+        // SAFETY: writing to chunk 0 page 2 (`base + PAGE`).
+        unsafe { (ds_addr as *mut u8).add(64).write_volatile(0xab) };
+        assert_eq!(unsafe { ptr.add(PAGE + 64).read_volatile() }, 0xab);
+        assert_eq!(
+            gpu_read(&h.device, &merged.buffer, merged.offset((base + PAGE + 64) as u64), 1),
+            vec![0xab]
+        );
+
+        // GPU write at page 2 of merged (`section offset = 3 * PAGE`) is visible at `base + 2 * PAGE`.
+        gpu_write(
+            &h.device,
+            &merged.buffer,
+            merged.offset((base + 2 * PAGE + 128) as u64),
+            &[0x5d],
+        );
+        assert_eq!(unsafe { ptr.add(2 * PAGE + 128).read_volatile() }, 0x5d);
+        assert_eq!(
+            unsafe { (pool.cpu_slice(3 * PAGE, PAGE).unwrap() as *const u8).add(128).read_volatile() },
+            0x5d
+        );
+
+        // Unalias the middle page: splits [0..3] into [0..1] and [2..3].
+        unalias_physical_view(base + PAGE, PAGE);
+        assert!(crate::shadow::find_aliased(base as u64, (base + 3 * PAGE) as u64).is_none());
+        let prefix = crate::shadow::find(base as u64, PAGE as u64).expect("prefix");
+        let suffix = crate::shadow::find((base + 2 * PAGE) as u64, PAGE as u64).expect("suffix");
+        assert!(prefix.is_aliased() && suffix.is_aliased());
+        assert_eq!(prefix.range(), (base as u64, PAGE as u64));
+        assert_eq!(suffix.range(), ((base + 2 * PAGE) as u64, PAGE as u64));
+        assert_eq!(
+            gpu_read(&h.device, &suffix.buffer, suffix.offset((base + 2 * PAGE + 128) as u64), 1),
+            vec![0x5d]
+        );
+        assert_eq!(unsafe { suffix.host_ptr((base + 2 * PAGE + 128) as u64).read_volatile() }, 0x5d);
+
+        unalias_physical_view(base, 3 * PAGE);
+        assert!(crate::shadow::find_aliased(base as u64, (base + PAGE) as u64).is_none());
+        assert!(crate::shadow::find_aliased((base + 2 * PAGE) as u64, (base + 3 * PAGE) as u64).is_none());
+        drop((merged, prefix, suffix));
+        // SAFETY: `ptr` was allocated by `VirtualAlloc`.
+        assert_ne!(unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) }, 0);
         // SAFETY: querying device health.
         assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
     }

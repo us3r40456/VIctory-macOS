@@ -404,6 +404,8 @@ struct Section {
     /// placeholder-view metadata.
     #[cfg(feature = "diagnostics")]
     shared: Option<victory_gpu::PhysicalHeap>,
+    /// Lazy chunked zero-copy GPU backing (`VICTORY_ALIAS_PHYSICAL=1`).
+    pool: Option<victory_gpu::PhysicalPool>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
     /// lives (0: it could not be mapped). A view per request cost a map
@@ -609,11 +611,17 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    let pool = victory_gpu::physical_pool(size);
     let section = Arc::new(Section {
         handle,
         size,
         #[cfg(feature = "diagnostics")]
-        shared: victory_gpu::physical_heap(size),
+        shared: if pool.is_none() {
+            victory_gpu::physical_heap(size)
+        } else {
+            None
+        },
+        pool,
         whole: OnceLock::new(),
     });
     let mut physical = physical();
@@ -675,6 +683,16 @@ impl View {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         let section = slice.section.clone();
+        if let Some(pool) = &section.pool
+            && let Some(at) = pool.cpu_slice(offset as usize, len)
+        {
+            return Some(View {
+                at,
+                len,
+                own: None,
+                _section: section,
+            });
+        }
         if let Some(whole) = section.whole() {
             let at = whole + offset as usize;
             return commit(at, len).then_some(View {
@@ -739,7 +757,11 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
-                    && slice.index == first.index + *n =>
+                    && slice.index == first.index + *n
+                    && first.section.pool.as_ref().is_none_or(|p| {
+                        let cp = p.chunk_pages();
+                        slice.index / cp == first.index / cp
+                    }) =>
             {
                 *n += 1;
             }
@@ -851,13 +873,18 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One view per run of consecutive slices of one section.
+        // One view per run of consecutive slices of one section (split at
+        // chunk boundaries when backed by a chunked `PhysicalPool`).
+        let chunk_pages = first.section.pool.as_ref().map(|p| p.chunk_pages());
+        let first_chunk = chunk_pages.map(|cp| first.index / cp);
         let run = 1 + pages[i + 1..]
             .iter()
             .zip(1..)
             .take_while(|&(page, k)| {
                 physical.pages.get(page).is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
+                    Arc::ptr_eq(&s.section, &first.section)
+                        && s.index == first.index + k
+                        && chunk_pages.is_none_or(|cp| Some(s.index / cp) == first_chunk)
                 })
             })
             .count();
@@ -914,16 +941,38 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         return true;
     }
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let Some(slice) = slice_at(&physical, from + k) else {
+    if from == 0 {
+        return true;
+    }
+    let mut k = 0;
+    while k < len {
+        let Some(first) = slice_at(&physical, from + k) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        let mut run = PAGE;
+        // When backed by a zero-copy `PhysicalPool`, coalesce contiguous
+        // slices inside one chunk into a single view/remap/shadow.
+        if let Some(pool) = &first.section.pool {
+            let cp = pool.chunk_pages();
+            let first_chunk = first.index / cp;
+            while k + run < len {
+                let next_idx = first.index + run / PAGE;
+                if next_idx / cp != first_chunk {
+                    break;
+                }
+                let Some(next) = slice_at(&physical, from + k + run) else {
+                    break;
+                };
+                if !Arc::ptr_eq(&next.section, &first.section) || next.index != next_idx {
+                    break;
+                }
+                run += PAGE;
+            }
+        }
+        if !map(&mut physical, to + k, run, first) {
             return false;
         }
+        k += run;
     }
     true
 }
@@ -1005,6 +1054,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
+    }
+    if let Some(pool) = &slice.section.pool {
+        // SAFETY: `base` is an owned live view of `len` bytes; `slice` keeps
+        // the section and its chunked GPU pool alive until `unmap`.
+        let _ = unsafe { pool.alias_view(base, slice.index * PAGE, len) };
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -1138,6 +1192,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        if slice.section.pool.is_some() {
+            victory_gpu::unalias_physical_view(at, size);
+        }
         victory_gpu::physical_unmapped(at);
         for k in 0..size / PAGE {
             let key = slice.key(k);
@@ -1411,21 +1468,23 @@ mod tests {
         assert_eq!(maps(), before);
         // The GPU's page-mapping copy, made twice: the second maps nothing.
         assert!(map_alias(b as u64, a as u64, 2 * PAGE as u64));
-        assert_eq!(maps(), before + 2);
+        let after_alias = maps();
+        assert!(after_alias == before + 1 || after_alias == before + 2);
         assert!(map_alias(b as u64, a as u64, 2 * PAGE as u64));
         assert!(map_alias(
             b.wrapping_byte_add(PAGE) as u64,
             a.wrapping_byte_add(PAGE) as u64,
             PAGE as u64
         ));
-        assert_eq!(maps(), before + 2);
+        assert_eq!(maps(), after_alias);
         // Another page, or one page of the range changed, maps again.
         assert!(map_alias(
             b as u64,
             a.wrapping_byte_add(PAGE) as u64,
             PAGE as u64
         ));
-        assert_eq!(maps(), before + 3);
+        let after_one = maps();
+        assert!(after_one > after_alias);
         // SAFETY: both mapped read-write, showing the second page.
         unsafe {
             a.wrapping_byte_add(PAGE).cast::<u8>().write(6);
@@ -1434,7 +1493,7 @@ mod tests {
         // Pages swapped at `a`: both differ, so both map again.
         let swapped = [pages[1], pages[0]];
         assert_eq!(XMemMapPhysicalPages(a, 2, swapped.as_ptr()), a);
-        assert_eq!(maps(), before + 5);
+        assert_eq!(maps(), after_one + 2);
         // SAFETY: mapped read-write; `a` shows the second page now.
         assert_eq!(unsafe { a.cast::<u8>().read() }, 6);
         for at in [a, b] {

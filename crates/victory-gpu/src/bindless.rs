@@ -37,10 +37,13 @@ pub(crate) enum Seen {
 #[cfg(feature = "diagnostics")]
 const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other"];
 
+/// Number of independent census shards when `VICTORY_CENSUS_FAST=1` (power of two).
+const CENSUS_SHARDS: usize = 32;
+
 /// A heap's slots that view title memory, and the distinct buffer ranges
 /// and textures among them (with how many slots view each).
 pub(crate) struct Viewed {
-    inner: Mutex<Inner>,
+    shards: Box<[Mutex<Inner>]>,
     /// mac: with `VICTORY_CENSUS_FAST=1` (`crate::census_fast`): the kept
     /// answer of [`unordered_writes`] and its generation.
     fast: Option<Fast<Shadow>>,
@@ -55,7 +58,23 @@ impl Default for Viewed {
 impl Viewed {
     /// A census, with the fast parts (`fast`) or as before.
     pub(crate) fn new(fast: bool) -> Self {
-        Viewed { inner: Mutex::new(Inner::new(fast)), fast: fast.then(Fast::default) }
+        let count = if fast { CENSUS_SHARDS } else { 1 };
+        let shards = (0..count).map(|_| Mutex::new(Inner::new(fast))).collect();
+        Viewed { shards, fast: fast.then(Fast::default) }
+    }
+
+    #[inline]
+    fn shard_of(&self, index: u32) -> usize {
+        if self.shards.len() == 1 {
+            0
+        } else {
+            (index.wrapping_mul(0x9E37_79B1) >> (32 - CENSUS_SHARDS.trailing_zeros())) as usize
+        }
+    }
+
+    #[inline]
+    fn shard(&self, index: u32) -> &Mutex<Inner> {
+        &self.shards[self.shard_of(index)]
     }
 }
 
@@ -70,11 +89,16 @@ struct Inner {
     slots: HashMap<u32, Seen, Hashing>,
     ranges: Counts<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
-    /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
-    /// as ranges come and go (each list running heap shaders asks for all
-    /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
-    /// run perf4).
+    /// `ranges` merged per copy and kind ([`Viewed::ranges`]) for non-aliased
+    /// host copies, kept current as ranges come and go so [`refresh`] never
+    /// has to walk tens of thousands of zero-copy aliased regions.
     hulls: HashMap<(usize, bool), Hull>,
+    /// Merged hulls for zero-copy aliased regions (kept apart from [`hulls`]
+    /// so [`refresh`] skips them unless any aliased shadow has a widened view).
+    aliased_hulls: HashMap<(usize, bool), Hull>,
+    /// Active unordered-access buffer shadows (aliased or copied) for O(UAVs)
+    /// [`written`] queries without scanning SRV hulls.
+    uav_hulls: HashMap<usize, Arc<Shadow>>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
@@ -97,6 +121,8 @@ impl Inner {
             ranges: Counts::new(quick),
             textures: BTreeMap::new(),
             hulls: HashMap::new(),
+            aliased_hulls: HashMap::new(),
+            uav_hulls: HashMap::new(),
             ends: HashMap::new(),
             unordered: fast.then(Unordered::new),
             tickets: Tickets::default(),
@@ -157,13 +183,24 @@ impl Inner {
                         (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
                         _ => None,
                     };
+                    let target = if shadow.is_aliased() {
+                        &mut self.aliased_hulls
+                    } else {
+                        &mut self.hulls
+                    };
                     match hull {
                         Some(hull) => {
-                            self.hulls.insert((key.0, key.3), hull);
+                            target.insert((key.0, key.3), hull);
+                            if key.3 {
+                                self.uav_hulls.insert(key.0, shadow.clone());
+                            }
                         }
                         None => {
                             self.ends.remove(&(key.0, key.3));
-                            self.hulls.remove(&(key.0, key.3));
+                            target.remove(&(key.0, key.3));
+                            if key.3 {
+                                self.uav_hulls.remove(&key.0);
+                            }
                         }
                     }
                 }
@@ -233,9 +270,9 @@ impl Batch<'_> {
         }
     }
 
-    /// With no slot lock held: the updates so far, under one hold of the
-    /// census lock (waits counted with `VICTORY_HEAP_LOCKS`, as
-    /// [`Viewed::set_seen`]'s).
+    /// With no slot lock held: the updates so far, under one hold per touched
+    /// census shard in ascending shard order (waits counted with
+    /// `VICTORY_HEAP_LOCKS`, as [`Viewed::set_seen`]'s).
     pub(crate) fn enter(&mut self) {
         let Some(fast) = &self.viewed.fast else {
             return;
@@ -243,9 +280,30 @@ impl Batch<'_> {
         if self.updates.is_empty() {
             return;
         }
-        let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
-        for (index, ticket, seen) in self.updates.drain(..) {
-            inner.enter(fast, index, ticket, seen);
+        if self.viewed.shards.len() == 1 {
+            let mut inner =
+                crate::descriptor::slots::locked(&self.viewed.shards[0], crate::descriptor::slots::CENSUS);
+            for (index, ticket, seen) in self.updates.drain(..) {
+                inner.enter(fast, index, ticket, seen);
+            }
+            return;
+        }
+        let viewed = self.viewed;
+        self.updates.sort_by_key(|(index, _, _)| viewed.shard_of(*index));
+        let mut iter = self.updates.drain(..).peekable();
+        while let Some(&(first_index, _, _)) = iter.peek() {
+            let shard_idx = viewed.shard_of(first_index);
+            let mut inner = crate::descriptor::slots::locked(
+                &viewed.shards[shard_idx],
+                crate::descriptor::slots::CENSUS,
+            );
+            while let Some(&(index, _, _)) = iter.peek() {
+                if viewed.shard_of(index) != shard_idx {
+                    break;
+                }
+                let (index, ticket, seen) = iter.next().unwrap();
+                inner.enter(fast, index, ticket, seen);
+            }
         }
     }
 }
@@ -272,12 +330,14 @@ impl Viewed {
         // a heap sync's batch enters them ([`Batch`]).
         if let Some(fast) = &self.fast {
             let ticket = fast.ticket();
-            let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
+            let mut inner =
+                crate::descriptor::slots::locked(self.shard(index), crate::descriptor::slots::CENSUS);
             inner.enter(fast, index, ticket, seen);
             return;
         }
         // mac: a wait for it is counted with `VICTORY_HEAP_LOCKS`.
-        let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
+        let mut inner =
+            crate::descriptor::slots::locked(self.shard(index), crate::descriptor::slots::CENSUS);
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
         }
@@ -296,7 +356,7 @@ impl Viewed {
     /// address, the bytes, unordered access), if it views one (tests).
     #[cfg(test)]
     pub(crate) fn range_at(&self, index: u32) -> Option<Range> {
-        match self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots.get(&index) {
+        match self.shard(index).lock().unwrap_or_else(|e| e.into_inner()).slots.get(&index) {
             Some(Seen::Buffer(shadow, address, len, uav)) => Some((Arc::as_ptr(shadow) as usize, *address, *len, *uav)),
             _ => None,
         }
@@ -306,7 +366,32 @@ impl Viewed {
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
+        if self.shards.len() == 1 {
+            let inner = self.shards[0].lock().unwrap_or_else(|e| e.into_inner());
+            return inner
+                .hulls
+                .values()
+                .chain(inner.aliased_hulls.values())
+                .cloned()
+                .collect();
+        }
+        let mut merged: HashMap<(usize, bool), Hull> = HashMap::new();
+        for shard in &self.shards {
+            let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for (&key, (shadow, from, len, uav, bit)) in inner.hulls.iter().chain(inner.aliased_hulls.iter()) {
+                let to = from + len;
+                merged
+                    .entry(key)
+                    .and_modify(|h| {
+                        let lo = h.1.min(*from);
+                        let hi = (h.1 + h.2).max(to);
+                        h.1 = lo;
+                        h.2 = hi - lo;
+                    })
+                    .or_insert_with(|| (shadow.clone(), *from, *len, *uav, *bit));
+            }
+        }
+        merged.into_values().collect()
     }
 }
 
@@ -403,34 +488,36 @@ pub(crate) fn uploads(
     }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
-                continue;
-            }
-            // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
-                continue;
-            };
-            // Only what shaders read lately (the eviction pass's stamps):
-            // the heaps view thousands of textures a frame never reads, and
-            // bringing each up whenever its pages change re-uploaded about
-            // 4 GB in 30-46 world frames (runs evict2, noevict1).
-            // shortcut: a texture read again after a gap is brought up after
-            // the submission that read it, which can see bytes one refresh
-            // old (a slot the title rewrites is made fresh anyway); upload on
-            // the mark itself if that shows.
-            if !texture.used_recently() {
-                continue;
-            }
-            // Its contents are the host's since a host copy wrote it.
-            if texture.host_written.load(Relaxed) {
-                continue;
-            }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
+        for shard in &viewed.shards {
+            let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for &r in inner.textures.keys() {
+                if !done.insert(r) {
+                    continue;
+                }
+                // Not made (given up, or never read): nothing to bring up.
+                let Some(texture) = crate::resource::made_copy(r as This) else {
+                    continue;
+                };
+                // Only what shaders read lately (the eviction pass's stamps):
+                // the heaps view thousands of textures a frame never reads, and
+                // bringing each up whenever its pages change re-uploaded about
+                // 4 GB in 30-46 world frames (runs evict2, noevict1).
+                // shortcut: a texture read again after a gap is brought up after
+                // the submission that read it, which can see bytes one refresh
+                // old (a slot the title rewrites is made fresh anyway); upload on
+                // the mark itself if that shows.
+                if !texture.used_recently() {
+                    continue;
+                }
+                // Its contents are the host's since a host copy wrote it.
+                if texture.host_written.load(Relaxed) {
+                    continue;
+                }
+                if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+                    && staged.insert(Arc::as_ptr(&staging))
+                {
+                    work.push((staging, texture));
+                }
             }
         }
     }
@@ -484,15 +571,25 @@ impl Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
-            let (address, len) = if *uav && shadow.marked() {
-                shadow.page_range(*address, *len)
-            } else {
-                (*address, *len)
-            };
-            add(shadow, address as usize, len as usize);
+    let check_aliased = crate::shadow::any_aliased_widened();
+    for shard in &viewed.shards {
+        let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+        for (shadow, address, len, uav, bit) in inner.hulls.values() {
+            if !crate::watch::clean_bit(*bit) {
+                let (address, len) = if *uav && shadow.marked() {
+                    shadow.page_range(*address, *len)
+                } else {
+                    (*address, *len)
+                };
+                add(shadow, address as usize, len as usize);
+            }
+        }
+        if check_aliased {
+            for (shadow, address, len, _, _) in inner.aliased_hulls.values() {
+                if shadow.has_widened() {
+                    add(shadow, *address as usize, *len as usize);
+                }
+            }
         }
     }
 }
@@ -501,10 +598,20 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
 /// views from the heap itself may write with no list declaring it
 /// (`crate::host::unwaited`, for a submission still running).
 pub(crate) fn written(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>)) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, _, _, uav, _) in inner.hulls.values() {
-        if *uav {
+    if viewed.shards.len() == 1 {
+        let inner = viewed.shards[0].lock().unwrap_or_else(|e| e.into_inner());
+        for shadow in inner.uav_hulls.values() {
             each(shadow);
+        }
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for shard in &viewed.shards {
+        let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+        for (&ptr, shadow) in &inner.uav_hulls {
+            if seen.insert(ptr) {
+                each(shadow);
+            }
         }
     }
 }
@@ -513,7 +620,7 @@ pub(crate) fn written(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>)) {
 /// `index`, changed or not (diagnostics: what a table draw reads there).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slot_range(viewed: &Viewed, index: u32) -> Option<(usize, usize)> {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let inner = viewed.shard(index).lock().unwrap_or_else(|e| e.into_inner());
     match inner.slots.get(&index) {
         Some(Seen::Buffer(_, address, len, _)) => Some((*address as usize, *len as usize)),
         _ => None,
@@ -527,7 +634,7 @@ pub(crate) fn refresh_slot(
     index: u32,
     mut add: impl FnMut(&Arc<Shadow>, usize, usize),
 ) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let inner = viewed.shard(index).lock().unwrap_or_else(|e| e.into_inner());
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
@@ -542,16 +649,30 @@ pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)
     if !crate::under_wine() {
         return Vec::new();
     }
-    viewed
-        .inner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ranges
-        .iter()
-        .filter(|((_, address, end, uav), _)| *uav && address < end)
-        .map(|((_, address, end, _), (_, shadow))| {
-            (shadow.clone(), *address as usize, (end - address) as usize)
-        })
+    if viewed.shards.len() == 1 {
+        return viewed.shards[0]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ranges
+            .iter()
+            .filter(|((_, address, end, uav), _)| *uav && address < end)
+            .map(|((_, address, end, _), (_, shadow))| {
+                (shadow.clone(), *address as usize, (end - address) as usize)
+            })
+            .collect();
+    }
+    let mut merged: BTreeMap<Range, Arc<Shadow>> = BTreeMap::new();
+    for shard in &viewed.shards {
+        let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+        for (&key, (_, shadow)) in inner.ranges.iter() {
+            if key.3 && key.1 < key.2 {
+                merged.entry(key).or_insert_with(|| shadow.clone());
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|((_, address, end, _), shadow)| (shadow, address as usize, (end - address) as usize))
         .collect()
 }
 
@@ -569,8 +690,17 @@ pub(crate) fn unordered_writes(viewed: &Viewed) -> Option<Arc<[(Arc<Shadow>, usi
     if let Some(kept) = fast.kept() {
         return Some(kept);
     }
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    inner.unordered.as_ref().map(|unordered| fast.answer(unordered))
+    // Lock all shards in ascending order so the merged snapshot matches
+    // `fast.generation` without racing any shard's `Inner::enter`.
+    let guards: Vec<_> = viewed
+        .shards
+        .iter()
+        .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    if guards.len() == 1 {
+        return guards[0].unordered.as_ref().map(|u| fast.answer(u));
+    }
+    Some(fast.answer_many(guards.iter().filter_map(|g| g.unordered.as_ref())))
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them
@@ -623,9 +753,11 @@ pub(crate) fn register(viewed: &Arc<Viewed>) {
 pub(crate) fn forget(resource: usize) {
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
-        let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+        for shard in &viewed.shards {
+            let mut inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.textures.remove(&resource).is_some() {
+                inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+            }
         }
     }
 }
@@ -638,34 +770,37 @@ pub(crate) fn log(frames: f64) {
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut left = [0u32; KINDS.len()];
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
         let mut placed = HashMap::new();
-        for seen in inner.slots.values() {
-            match seen {
-                Seen::Buffer(..) => buffers += 1,
-                Seen::Texture(_) => textures += 1,
-                Seen::Left((k, address, bytes)) => {
-                    left[*k] += 1;
-                    if *k == 2 {
-                        let b = placed.entry(*address).or_insert(0u64);
-                        *b = (*b).max(*bytes);
+        let mut range_keys: std::collections::HashSet<Range> = std::collections::HashSet::new();
+        let mut tex_keys: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for shard in &viewed.shards {
+            let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for seen in inner.slots.values() {
+                match seen {
+                    Seen::Buffer(..) => buffers += 1,
+                    Seen::Texture(_) => textures += 1,
+                    Seen::Left((k, address, bytes)) => {
+                        left[*k] += 1;
+                        if *k == 2 {
+                            let b = placed.entry(*address).or_insert(0u64);
+                            *b = (*b).max(*bytes);
+                        }
                     }
                 }
             }
+            range_keys.extend(inner.ranges.keys().copied());
+            tex_keys.extend(inner.textures.keys().copied());
         }
         let placed_mb = placed.values().sum::<u64>() as f64 / 1e6;
-        let bytes: u64 = inner.ranges.keys().map(|&(_, a, b, _)| b - a).sum();
-        drop(inner);
+        let bytes: u64 = range_keys.iter().map(|&(_, a, b, _)| b - a).sum();
         let hulls = viewed.ranges();
         let uav_hulls: u64 = hulls.iter().filter(|r| r.3).map(|r| r.2).sum();
         let all_hulls: u64 = hulls.iter().map(|r| r.2).sum();
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let copies = {
-            let mut c: Vec<usize> = inner.ranges.keys().map(|k| k.0).collect();
-            // The ranges come in order only from the B-tree form.
+            let mut c: Vec<usize> = range_keys.iter().map(|k| k.0).collect();
             c.sort_unstable();
             c.dedup();
             c.len()
@@ -679,9 +814,9 @@ pub(crate) fn log(frames: f64) {
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
              left null: {} (placed textures at {} addresses, {placed_mb:.0} MB); \
              host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
-            inner.ranges.len(),
+            range_keys.len(),
             bytes as f64 / 1e6,
-            inner.textures.len(),
+            tex_keys.len(),
             left.join(", "),
             placed.len(),
             all.len(),
@@ -791,7 +926,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let viewed = Viewed::default();
         let set = |slot: u32, range: Option<(u64, u64)>| {
-            let mut inner = viewed.inner.lock().unwrap();
+            let mut inner = viewed.shard(slot).lock().unwrap();
             if let Some(old) = inner.slots.remove(&slot) {
                 inner.count(&old, false);
             }

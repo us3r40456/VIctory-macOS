@@ -140,8 +140,8 @@ pub mod heap_reports {
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use alias::{
-    alias_region, committed as alias_committed, enabled as alias_buffers, unalias_region,
-    uncommitted as alias_uncommitted,
+    PhysicalPool, alias_region, committed as alias_committed, enabled as alias_buffers,
+    physical_pool, unalias_physical_view, unalias_region, uncommitted as alias_uncommitted,
 };
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};

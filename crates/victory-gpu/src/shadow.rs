@@ -403,8 +403,16 @@ impl Shadow {
         }
         ranges.push((address, len, Arc::downgrade(&widened)));
         WIDENED_ANY.store(true, Ordering::Release);
+        if self.aliased {
+            ALIASED_WIDENED.store(true, Ordering::Release);
+        }
         self.has_widened.store(true, Ordering::Release);
         Some(widened)
+    }
+
+    /// Whether this copy currently has any widened 3-channel RGB32 views.
+    pub(crate) fn has_widened(&self) -> bool {
+        self.has_widened.load(Ordering::Acquire)
     }
 
     fn refresh_widened(&self, from: usize, to: usize) {
@@ -509,7 +517,22 @@ impl Shadow {
     /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
     /// `gpu` are the run's).
     fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
-        let tracked = crate::watch::track_copy(start as usize, len as usize, true);
+        Self::new_at_tracked(buffer, data, gpu, start, len, slice, true)
+    }
+
+    /// [`Shadow::new_at`] with optional page-guard tracking (`track = false`
+    /// avoids placing `VirtualProtect` guards on hot aliased heaps for small
+    /// unaligned read-only views).
+    fn new_at_tracked(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        slice: Option<Slice>,
+        track: bool,
+    ) -> Arc<Shadow> {
+        let tracked = track.then(|| crate::watch::track_copy(start as usize, len as usize, true)).flatten();
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -536,11 +559,13 @@ impl Shadow {
     }
 
     /// A zero-copy shadow whose title range `[start, start + len)` shares
-    /// physical pages with `buffer` (`mach_vm_remap`).
-    pub(crate) fn new_aliased(
+    /// physical pages with `buffer` at byte offset `base` (`mach_vm_remap`).
+    /// `data` and `gpu` already point to `base` within `buffer`.
+    pub(crate) fn new_aliased_at(
         buffer: ID3D12Resource,
         data: *mut u8,
         gpu: u64,
+        base: u64,
         start: u64,
         len: u64,
     ) -> Arc<Shadow> {
@@ -558,7 +583,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             used: AtomicU64::new(crate::queue::presented()),
@@ -569,6 +594,18 @@ impl Shadow {
         shadow
     }
 
+    /// A zero-copy shadow whose title range `[start, start + len)` shares
+    /// physical pages with `buffer` (`mach_vm_remap`).
+    pub(crate) fn new_aliased(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+    ) -> Arc<Shadow> {
+        Self::new_aliased_at(buffer, data, gpu, 0, start, len)
+    }
+
     /// Whether the title's memory is this copy's own (`crate::alias`): it is
     /// never copied, nor copied back.
     pub(crate) fn is_aliased(&self) -> bool {
@@ -577,8 +614,8 @@ impl Shadow {
 
     /// Where title address `address` is in the copy's mapping.
     pub(crate) fn host_ptr(&self, address: u64) -> *mut u8 {
-        // SAFETY: the caller asks about an address inside the copy.
-        unsafe { self.data.add(self.offset(address) as usize) }
+        // SAFETY: `self.data` already points to `self.start` within the backing buffer.
+        unsafe { self.data.add((address - self.start) as usize) }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -1882,6 +1919,13 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 static ALIASED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
 static ALIASED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALIASED_WIDENED: AtomicBool = AtomicBool::new(false);
+
+/// Whether any aliased shadow has a widened 3-channel RGB32 view that needs
+/// CPU refresh on submission.
+pub(crate) fn any_aliased_widened() -> bool {
+    ALIASED_WIDENED.load(Ordering::Acquire)
+}
 
 pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
     if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
@@ -1900,12 +1944,52 @@ pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
     map.range(start..end).next().is_some()
 }
 
-pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
-    ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
+pub(crate) fn register_aliased(mut shadow: Arc<Shadow>) {
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
-    if map.insert(shadow.start, shadow).is_none() {
-        ALIASED_COUNT.fetch_add(1, Ordering::Release);
+    let buf_raw = windows::core::Interface::as_raw(&shadow.buffer);
+    // Coalesce with an immediately preceding view backed by the same buffer at
+    // the contiguous offset so adjacent physical mappings act as one run.
+    let prev_key = map
+        .range(..shadow.start)
+        .next_back()
+        .filter(|&(s, prev)| {
+            *s + prev.len == shadow.start
+                && windows::core::Interface::as_raw(&prev.buffer) == buf_raw
+                && prev.base + prev.len == shadow.base
+        })
+        .map(|(&s, _)| s);
+    if let Some(pk) = prev_key
+        && let Some(prev) = map.remove(&pk)
+    {
+        shadow = Shadow::new_aliased_at(
+            prev.buffer.clone(),
+            prev.data,
+            prev.gpu,
+            prev.base,
+            prev.start,
+            prev.len + shadow.len,
+        );
     }
+    // Coalesce with an immediately following view backed by the same buffer at
+    // the contiguous offset.
+    let next_start = shadow.start + shadow.len;
+    let merge_next = map.get(&next_start).is_some_and(|next| {
+        windows::core::Interface::as_raw(&next.buffer) == buf_raw
+            && shadow.base + shadow.len == next.base
+    });
+    if merge_next && let Some(next) = map.remove(&next_start) {
+        shadow = Shadow::new_aliased_at(
+            shadow.buffer.clone(),
+            shadow.data,
+            shadow.gpu,
+            shadow.base,
+            shadow.start,
+            shadow.len + next.len,
+        );
+    }
+    ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
+    map.insert(shadow.start, shadow);
+    ALIASED_COUNT.store(map.len(), Ordering::Release);
     changed();
 }
 
@@ -1913,10 +1997,64 @@ pub(crate) fn unregister_aliased(start: u64) -> bool {
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
     let removed = map.remove(&start).is_some();
     if removed {
-        ALIASED_COUNT.fetch_sub(1, Ordering::Release);
+        ALIASED_COUNT.store(map.len(), Ordering::Release);
         changed();
     }
     removed
+}
+
+/// Removes `[start, start + len)` from the aliased registry, splitting any
+/// coalesced aliased shadow that extends outside the unmapped range.
+pub(crate) fn unregister_aliased_range(start: u64, len: u64) -> bool {
+    if len == 0 || ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let end = start.saturating_add(len);
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    let span = ALIASED_SPAN.load(Ordering::Relaxed);
+    let lowest = start.saturating_sub(span);
+    let keys: Vec<u64> = map
+        .range(lowest..end)
+        .filter(|&(s, sh)| *s + sh.len > start)
+        .map(|(&s, _)| s)
+        .collect();
+    if keys.is_empty() {
+        return false;
+    }
+    for key in keys {
+        let Some(sh) = map.remove(&key) else {
+            continue;
+        };
+        let sh_end = sh.start + sh.len;
+        if sh.start < start {
+            let prefix = Shadow::new_aliased_at(
+                sh.buffer.clone(),
+                sh.data,
+                sh.gpu,
+                sh.base,
+                sh.start,
+                start - sh.start,
+            );
+            map.insert(prefix.start, prefix);
+        }
+        if sh_end > end {
+            let skip = end - sh.start;
+            // SAFETY: `end < sh_end`, so `skip < sh.len` lies inside the backing mapping.
+            let suffix_data = unsafe { sh.data.add(skip as usize) };
+            let suffix = Shadow::new_aliased_at(
+                sh.buffer.clone(),
+                suffix_data,
+                sh.gpu + skip,
+                sh.base + skip,
+                end,
+                sh_end - end,
+            );
+            map.insert(suffix.start, suffix);
+        }
+    }
+    ALIASED_COUNT.store(map.len(), Ordering::Release);
+    changed();
+    true
 }
 
 /// The aliased regions `(start, end)` overlapping `[start, end)`, in order.
@@ -1942,22 +2080,18 @@ pub(crate) fn aliased_totals() -> (usize, u64) {
 }
 
 /// The aliased region holding all of `[address, end)`.
+///
+/// Entries in [`ALIASED`] never overlap, so the sole candidate starting at or
+/// before `address` is `map.range(..=address).next_back()` — O(log N) even when
+/// tens of thousands of physical views are registered.
 pub(crate) fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
         return None;
     }
     let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
-    if map.is_empty() {
-        return None;
-    }
-    let span = ALIASED_SPAN.load(Ordering::Relaxed);
-    let lowest = end.saturating_sub(span);
-    if lowest > address {
-        return None;
-    }
-    map.range(lowest..=address)
-        .rev()
-        .find(|(_, s)| s.start + s.len >= end)
+    map.range(..=address)
+        .next_back()
+        .filter(|(_, s)| s.start + s.len >= end)
         .map(|(_, s)| s.clone())
 }
 
@@ -2290,6 +2424,24 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
 /// view or a list holds it.
+/// Maximum byte size of an unaligned read-only SRV (`exact()`) inside an
+/// aliased region that skips `watch::track_copy` page guards in favor of a
+/// direct SSE2 copy on submission (`VICTORY_EXACT_UNTRACKED_KB`, default 16 KiB
+/// when `VICTORY_ALIAS_BUFFERS=1`, 0 disables).
+fn exact_untracked_bytes() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| match std::env::var("VICTORY_EXACT_UNTRACKED_KB") {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(0).saturating_mul(1024),
+        Err(_) => {
+            if crate::alias::enabled() {
+                16 * 1024
+            } else {
+                0
+            }
+        }
+    })
+}
+
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
@@ -2297,7 +2449,21 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
     }
     #[cfg(feature = "diagnostics")]
     VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    exact(address, len, element).map(|s| (s, true))
+    exact(address, len, element, true).map(|s| (s, true))
+}
+
+/// [`for_view`] for a read-only shader resource view: small unaligned views
+/// inside zero-copy aliased regions can skip `VirtualProtect` page guards so
+/// they do not trigger write faults on hot GPU heaps.
+pub(crate) fn for_view_srv(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
+    let shadow = find(address, len)?;
+    if element == 0 || shadow.offset(address).is_multiple_of(element) {
+        return Some((shadow, false));
+    }
+    #[cfg(feature = "diagnostics")]
+    VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let track = !(shadow.is_aliased() && len <= exact_untracked_bytes());
+    exact(address, len, element, track).map(|s| (s, true))
 }
 
 /// Asks for, and copies made of, views off their copy's elements, the
@@ -2342,12 +2508,16 @@ pub(crate) fn log_views(frames: f64) {
 /// new copy of the same bytes took the refreshes). With the size the map
 /// is next pruned of dead entries at.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64, bool), std::sync::Weak<Shadow>>)> =
+    Mutex::new((0, BTreeMap::new()));
 
-fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+fn exact(address: u64, len: u64, element: u64, track: bool) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (prune_at, map) = &mut *guard;
-    if let Some(shadow) = map.get(&(address, len, element)).and_then(std::sync::Weak::upgrade) {
+    if let Some(shadow) = map
+        .get(&(address, len, element, track))
+        .and_then(std::sync::Weak::upgrade)
+    {
         return Some(shadow);
     }
     // Ring positions change every frame: entries die by the hundred.
@@ -2357,8 +2527,8 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     }
     // A run of a shared buffer, its start a whole number of elements in.
     let (buffer, data, gpu, slice) = arena().take(len, element)?;
-    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
-    map.insert((address, len, element), Arc::downgrade(&shadow));
+    let shadow = Shadow::new_at_tracked(buffer, data, gpu, address, len, Some(slice), track);
+    map.insert((address, len, element, track), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;

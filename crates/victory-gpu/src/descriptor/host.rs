@@ -1670,7 +1670,12 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let element = u64::from(view_stride(view));
+    let (shadow, _) = if matches!(view, View::Unordered(..)) {
+        crate::shadow::for_view(address, len, element)?
+    } else {
+        crate::shadow::for_view_srv(address, len, element)?
+    };
     Some((shadow, address, len))
 }
 
@@ -1727,7 +1732,7 @@ fn buffer_srv(
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view_srv(start, u64::from(buffer.NumElements) * element, element)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {

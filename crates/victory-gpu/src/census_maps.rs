@@ -149,6 +149,7 @@ impl<K: Ord + Hash + Copy, V> Counts<K, V> {
     }
 
     #[cfg(any(test, feature = "diagnostics"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         match self {
             Counts::Tree(map) => map.len(),

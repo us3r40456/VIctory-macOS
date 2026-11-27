@@ -33,10 +33,10 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{
-    AtomicU64,
-    Ordering::{Acquire, Relaxed, Release},
+    AtomicBool, AtomicU64,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
 use std::sync::{Arc, Mutex};
 
@@ -85,6 +85,25 @@ impl<S> Unordered<S> {
             .collect()
     }
 
+    /// Merged, deduplicated unordered writes across multiple census shards.
+    pub(crate) fn writes_many<'a>(shards: impl IntoIterator<Item = &'a Self>) -> Vec<Write<S>>
+    where
+        S: 'a,
+    {
+        let mut merged: BTreeMap<Range, &Arc<S>> = BTreeMap::new();
+        for shard in shards {
+            for (&key, copy) in &shard.ranges {
+                if key.1 < key.2 {
+                    merged.entry(key).or_insert(copy);
+                }
+            }
+        }
+        merged
+            .into_iter()
+            .map(|((_, address, end, _), copy)| (copy.clone(), address as usize, (end - address) as usize))
+            .collect()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.ranges.len()
@@ -96,6 +115,8 @@ pub(crate) struct Fast<S> {
     /// Counted up, under the census lock, at every change of the census's
     /// unordered ranges ([`Unordered`]).
     generation: AtomicU64,
+    /// Fast flag avoiding `kept` lock acquisition on repeated invalidations.
+    has_kept: AtomicBool,
     /// The last answer of [`Fast::answer`] and the generation it is of;
     /// none since the last change.
     kept: Mutex<Option<(u64, Arc<[Write<S>]>)>>,
@@ -105,7 +126,12 @@ pub(crate) struct Fast<S> {
 
 impl<S> Default for Fast<S> {
     fn default() -> Self {
-        Fast { generation: AtomicU64::new(0), kept: Mutex::new(None), tickets: AtomicU64::new(0) }
+        Fast {
+            generation: AtomicU64::new(0),
+            has_kept: AtomicBool::new(false),
+            kept: Mutex::new(None),
+            tickets: AtomicU64::new(0),
+        }
     }
 }
 
@@ -117,7 +143,9 @@ impl<S> Fast<S> {
     /// is given back when its last holder goes, `crate::shadow`).
     pub(crate) fn changed(&self) {
         self.generation.fetch_add(1, Release);
-        *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if self.has_kept.swap(false, AcqRel) {
+            *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     /// The last answer, if the census's unordered ranges are still what it
@@ -125,6 +153,9 @@ impl<S> Fast<S> {
     /// and the answer kept for it is what the census held at it (a change
     /// told after the read is one this query came before).
     pub(crate) fn kept(&self) -> Option<Arc<[Write<S>]>> {
+        if !self.has_kept.load(Acquire) {
+            return None;
+        }
         let now = self.generation.load(Acquire);
         match &*self.kept.lock().unwrap_or_else(|e| e.into_inner()) {
             Some((of, writes)) if *of == now => Some(writes.clone()),
@@ -136,6 +167,7 @@ impl<S> Fast<S> {
     /// answer, kept for the queries after. (All changes are told under the
     /// lock, so the generation read here is exact, and a kept answer is of
     /// it or older.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn answer(&self, unordered: &Unordered<S>) -> Arc<[Write<S>]> {
         let now = self.generation.load(Relaxed);
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,6 +178,25 @@ impl<S> Fast<S> {
         }
         let writes: Arc<[Write<S>]> = unordered.writes().into();
         *kept = Some((now, writes.clone()));
+        self.has_kept.store(true, Release);
+        writes
+    }
+
+    /// Under all census shard locks, rebuilds and caches the merged answer.
+    pub(crate) fn answer_many<'a>(&self, shards: impl IntoIterator<Item = &'a Unordered<S>>) -> Arc<[Write<S>]>
+    where
+        S: 'a,
+    {
+        let now = self.generation.load(Relaxed);
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((of, writes)) = &*kept
+            && *of == now
+        {
+            return writes.clone();
+        }
+        let writes: Arc<[Write<S>]> = Unordered::writes_many(shards).into();
+        *kept = Some((now, writes.clone()));
+        self.has_kept.store(true, Release);
         writes
     }
 
@@ -159,9 +210,15 @@ impl<S> Fast<S> {
 }
 
 /// Per slot, the ticket of the update its census entry is from (0: none
-/// yet). Kept under the census lock.
-#[derive(Default)]
-pub(crate) struct Tickets(Vec<u64>);
+/// yet). Kept under the census shard lock (sparse hash map so sharded
+/// censuses never allocate a dense vector per shard).
+pub(crate) struct Tickets(HashMap<u32, u64, crate::census_maps::Hashing>);
+
+impl Default for Tickets {
+    fn default() -> Self {
+        Tickets(HashMap::with_hasher(crate::census_maps::Hashing::new(true)))
+    }
+}
 
 impl Tickets {
     /// Whether an update of slot `index` with `ticket` is later than the one
@@ -169,14 +226,11 @@ impl Tickets {
     /// that is not is dropped by the caller: the slot was made again since,
     /// and that making's update is in or on its way.
     pub(crate) fn newer(&mut self, index: u32, ticket: u64) -> bool {
-        let i = index as usize;
-        if self.0.len() <= i {
-            self.0.resize(i + 1, 0);
-        }
-        if ticket <= self.0[i] {
+        let entry = self.0.entry(index).or_insert(0);
+        if ticket <= *entry {
             return false;
         }
-        self.0[i] = ticket;
+        *entry = ticket;
         true
     }
 }
