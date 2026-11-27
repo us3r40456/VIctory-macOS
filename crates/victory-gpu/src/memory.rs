@@ -89,7 +89,7 @@ pub(crate) fn take_rewrite_profile() -> (u64, u64, u64, u64) {
 
 /// Maximum incremental aliased ops applied before running a compacting full
 /// rewrite (bounds `Layout::copies` growth and frees pairs of unmapped chunks).
-const PATCH_COMPACT_OPS: usize = 4096;
+const PATCH_COMPACT_OPS: usize = 512;
 /// Cap on `Layout::copies.len()` during incremental patching.
 const PATCH_MAX_COPIES: usize = 32_768;
 
@@ -155,8 +155,6 @@ struct Layout {
     copies: Vec<Arc<Shadow>>,
     /// Non-aliased copies and their dirty bit in the change tracker.
     tracked: Vec<(Arc<Shadow>, Option<u32>)>,
-    /// Aliased copies (zero-copy; skipped unless `any_aliased_widened()`).
-    aliased: Vec<Arc<Shadow>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
 }
@@ -528,13 +526,11 @@ impl Shared {
         let mut planned: Vec<(usize, PairKey, u64, u64, u64, u64, u32)> =
             Vec::with_capacity(copies.len());
         let mut tracked: Vec<(Arc<Shadow>, Option<u32>)> = Vec::new();
-        let mut aliased: Vec<Arc<Shadow>> = Vec::new();
         for (idx, c) in copies.iter().enumerate() {
             let buf_raw = c.buffer.as_raw() as usize;
             let (start, len) = c.range();
             let base = c.base_offset();
             if c.is_aliased() {
-                aliased.push(c.clone());
                 self.live_bufs.insert(buf_raw);
                 let buf_width = *self.buf_widths.entry(buf_raw).or_insert_with(|| {
                     // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
@@ -628,7 +624,6 @@ impl Shared {
         self.layout = Arc::new(Layout {
             copies: named,
             tracked,
-            aliased,
             blocks: out.blocks,
             owner: out.owners,
         });
@@ -643,21 +638,22 @@ impl Shared {
     /// `true` on success, or `false` if a full [`Self::rewrite`] is needed.
     fn patch_aliased(&mut self, heap: &HostHeap, na_now: u64) -> bool {
         let started = std::time::Instant::now();
-        let Some((a_now, ops)) = crate::shadow::aliased_delta(self.aliased_gen) else {
+        let Some((a_now, dirty, live)) = crate::shadow::aliased_delta_snapshot(self.aliased_gen)
+        else {
             return false;
         };
-        if ops.is_empty() {
+        if dirty.is_empty() && live.is_empty() {
             self.aliased_gen = a_now;
             return true;
         }
-        let op_count = ops.len();
+        let op_count = dirty.len().saturating_add(live.len());
         if self.patches_since_rewrite.saturating_add(op_count) > PATCH_COMPACT_OPS {
             return false;
         }
         let Some(layout) = Arc::get_mut(&mut self.layout) else {
             return false;
         };
-        if layout.copies.len().saturating_add(op_count) > PATCH_MAX_COPIES {
+        if layout.copies.len().saturating_add(live.len()) > PATCH_MAX_COPIES {
             return false;
         }
         // SAFETY: `self.data` is the persistent mapping of `self.table` sized for
@@ -669,119 +665,116 @@ impl Shared {
                 LEVEL1 + (CAPACITY + 1) * BLOCK * 2,
             )
         };
+        // Step 1: clear all dirty 64 KiB pages to null.
+        for (start, len) in dirty {
+            let Some(end) = start.checked_add(len) else {
+                return false;
+            };
+            if len == 0
+                || (start & 0xFFFF) != 0
+                || (len & 0xFFFF) != 0
+                || end > 1 << 40
+                || crate::shadow::has_non_aliased_overlap(start, end)
+            {
+                return false;
+            }
+            let (first, last) = (start >> 16, (end - 1) >> 16);
+            let mut page = first;
+            while page <= last {
+                let l1 = (page >> 12) as usize;
+                let upto = last.min(page | 0xFFF);
+                let block = self.l1_table[l1] as usize;
+                if block != 0 {
+                    let base = block * BLOCK;
+                    let from = (page & 0xFFF) as usize;
+                    let to = (upto & 0xFFF) as usize;
+                    layout.owner[base + from..=base + to].fill(None);
+                    let dw_from = LEVEL1 + (base + from) * 2;
+                    let dw_to = LEVEL1 + (base + to + 1) * 2;
+                    for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
+                        entry[0] = self.null;
+                        entry[1] = 0;
+                    }
+                }
+                page = upto + 1;
+            }
+        }
+        // Step 2: stamp every live aliased shadow overlapping the dirty ranges.
         let mut pairs_made = 0u64;
-        for op in ops {
-            match op {
-                crate::shadow::AliasedOp::Remove(start, len) => {
-                    let Some(end) = start.checked_add(len) else {
+        for c in live {
+            if !c.is_aliased() {
+                return false;
+            }
+            let (start, len) = c.range();
+            let Some(end) = start.checked_add(len) else {
+                return false;
+            };
+            let base_off = c.base_offset();
+            if len == 0
+                || (start & 0xFFFF) != 0
+                || (len & 0xFFFF) != 0
+                || end > 1 << 40
+                || !base_off.is_multiple_of(4)
+                || crate::shadow::has_non_aliased_overlap(start, end)
+            {
+                return false;
+            }
+            let buf_raw = c.buffer.as_raw() as usize;
+            let buf_width = *self.buf_widths.entry(buf_raw).or_insert_with(|| {
+                // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
+                unsafe { c.buffer.GetDesc() }.Width
+            });
+            if buf_width > PIECE_VIEWED {
+                return false;
+            }
+            let key = PairKey::WholeBuffer(buf_raw);
+            let slot = match self.pairs.get(&key) {
+                Some(&slot) => slot,
+                None => {
+                    let Some(slot) = heap.pair() else {
                         return false;
                     };
-                    if len == 0
-                        || (start & 0xFFFF) != 0
-                        || (len & 0xFFFF) != 0
-                        || end > 1 << 40
-                        || crate::shadow::has_non_aliased_overlap(start, end)
-                    {
-                        return false;
-                    }
-                    let (first, last) = (start >> 16, (end - 1) >> 16);
-                    let mut page = first;
-                    while page <= last {
-                        let l1 = (page >> 12) as usize;
-                        let upto = last.min(page | 0xFFF);
-                        let block = self.l1_table[l1] as usize;
-                        if block != 0 {
-                            let base = block * BLOCK;
-                            let from = (page & 0xFFF) as usize;
-                            let to = (upto & 0xFFF) as usize;
-                            layout.owner[base + from..=base + to].fill(None);
-                            let dw_from = LEVEL1 + (base + from) * 2;
-                            let dw_to = LEVEL1 + (base + to + 1) * 2;
-                            for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
-                                entry[0] = self.null;
-                                entry[1] = 0;
-                            }
-                        }
-                        page = upto + 1;
-                    }
+                    let viewed = buf_width.next_multiple_of(4);
+                    heap.raw_pair_at(slot, Some(&c.buffer), 0, viewed);
+                    self.pairs.insert(key, slot);
+                    pairs_made += 1;
+                    slot
                 }
-                crate::shadow::AliasedOp::Add(c) => {
-                    if !c.is_aliased() {
+            };
+            let low = start.wrapping_sub(base_off) as u32;
+            let new_k = layout.copies.len();
+            layout.copies.push(c);
+            let (first, last) = (start >> 16, (end - 1) >> 16);
+            let mut page = first;
+            while page <= last {
+                let l1 = (page >> 12) as usize;
+                let upto = last.min(page | 0xFFF);
+                if self.l1_table[l1] == 0 {
+                    if layout.blocks.len() > CAPACITY {
                         return false;
                     }
-                    let (start, len) = c.range();
-                    let Some(end) = start.checked_add(len) else {
-                        return false;
-                    };
-                    let base_off = c.base_offset();
-                    if len == 0
-                        || (start & 0xFFFF) != 0
-                        || (len & 0xFFFF) != 0
-                        || end > 1 << 40
-                        || !base_off.is_multiple_of(4)
-                        || crate::shadow::has_non_aliased_overlap(start, end)
-                    {
-                        return false;
+                    let new_block = layout.blocks.len();
+                    layout.blocks.push(l1);
+                    layout.owner.resize(layout.owner.len() + BLOCK, None);
+                    let blk_dw = LEVEL1 + new_block * BLOCK * 2;
+                    for entry in dwords[blk_dw..blk_dw + BLOCK * 2].chunks_exact_mut(2) {
+                        entry[0] = self.null;
+                        entry[1] = 0;
                     }
-                    let buf_raw = c.buffer.as_raw() as usize;
-                    let buf_width = *self.buf_widths.entry(buf_raw).or_insert_with(|| {
-                        // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
-                        unsafe { c.buffer.GetDesc() }.Width
-                    });
-                    if buf_width > PIECE_VIEWED {
-                        return false;
-                    }
-                    let key = PairKey::WholeBuffer(buf_raw);
-                    let slot = match self.pairs.get(&key) {
-                        Some(&slot) => slot,
-                        None => {
-                            let Some(slot) = heap.pair() else {
-                                return false;
-                            };
-                            let viewed = buf_width.next_multiple_of(4);
-                            heap.raw_pair_at(slot, Some(&c.buffer), 0, viewed);
-                            self.pairs.insert(key, slot);
-                            pairs_made += 1;
-                            slot
-                        }
-                    };
-                    let low = start.wrapping_sub(base_off) as u32;
-                    let new_k = layout.copies.len();
-                    layout.copies.push(c.clone());
-                    layout.aliased.push(c);
-                    let (first, last) = (start >> 16, (end - 1) >> 16);
-                    let mut page = first;
-                    while page <= last {
-                        let l1 = (page >> 12) as usize;
-                        let upto = last.min(page | 0xFFF);
-                        if self.l1_table[l1] == 0 {
-                            if layout.blocks.len() > CAPACITY {
-                                return false;
-                            }
-                            let new_block = layout.blocks.len();
-                            layout.blocks.push(l1);
-                            layout.owner.resize(layout.owner.len() + BLOCK, None);
-                            let blk_dw = LEVEL1 + new_block * BLOCK * 2;
-                            for entry in dwords[blk_dw..blk_dw + BLOCK * 2].chunks_exact_mut(2) {
-                                entry[0] = self.null;
-                                entry[1] = 0;
-                            }
-                            self.l1_table[l1] = new_block as u32;
-                            dwords[l1] = new_block as u32;
-                        }
-                        let base = self.l1_table[l1] as usize * BLOCK;
-                        let from = (page & 0xFFF) as usize;
-                        let to = (upto & 0xFFF) as usize;
-                        layout.owner[base + from..=base + to].fill(Some(new_k));
-                        let dw_from = LEVEL1 + (base + from) * 2;
-                        let dw_to = LEVEL1 + (base + to + 1) * 2;
-                        for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
-                            entry[0] = slot;
-                            entry[1] = low;
-                        }
-                        page = upto + 1;
-                    }
+                    self.l1_table[l1] = new_block as u32;
+                    dwords[l1] = new_block as u32;
                 }
+                let base = self.l1_table[l1] as usize * BLOCK;
+                let from = (page & 0xFFF) as usize;
+                let to = (upto & 0xFFF) as usize;
+                layout.owner[base + from..=base + to].fill(Some(new_k));
+                let dw_from = LEVEL1 + (base + from) * 2;
+                let dw_to = LEVEL1 + (base + to + 1) * 2;
+                for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
+                    entry[0] = slot;
+                    entry[1] = low;
+                }
+                page = upto + 1;
             }
         }
         // If a non-aliased copy arrived concurrently, fall back to a full rewrite
@@ -810,9 +803,8 @@ fn layout(key: usize) -> Arc<Layout> {
 }
 
 /// Calls `add` for every copy in `l` that may need a CPU→GPU refresh:
-/// non-aliased copies whose dirty bit is not clean, plus aliased copies only
-/// if they hold a widened 3-channel RGB32 view (normal aliased copies are
-/// zero-copy and have `dirty_bit() == None`).
+/// non-aliased copies whose dirty bit is not clean, plus only the active
+/// aliased widened 3-channel RGB32 views (normal aliased copies are zero-copy).
 fn refresh_layout(l: &Layout, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     for (c, bit) in &l.tracked {
         if !crate::watch::clean_bit(*bit) {
@@ -820,14 +812,7 @@ fn refresh_layout(l: &Layout, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
             add(c, start as usize, len as usize);
         }
     }
-    if crate::shadow::any_aliased_widened() {
-        for c in &l.aliased {
-            if c.has_widened() {
-                let (start, len) = c.range();
-                add(c, start as usize, len as usize);
-            }
-        }
-    }
+    crate::shadow::for_each_aliased_widened(&mut add);
 }
 
 /// At submission, for a list using title memory with view heap `key`
@@ -1113,7 +1098,6 @@ mod tests {
         let l = Layout {
             copies: Vec::new(),
             tracked: Vec::new(),
-            aliased: Vec::new(),
             blocks: vec![usize::MAX, 0],
             owner,
         };

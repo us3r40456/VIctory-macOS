@@ -103,6 +103,8 @@ pub(crate) struct Shadow {
     /// the mutex is not reentrant.
     widened_source: Mutex<()>,
     has_widened: AtomicBool,
+    widened_min: AtomicU64,
+    widened_max: AtomicU64,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
     /// goes.
@@ -407,8 +409,19 @@ impl Shadow {
             ranges.retain(|(_, _, view)| view.strong_count() > 0);
         }
         ranges.push((address, len, Arc::downgrade(&widened)));
+        drop(ranges);
         WIDENED_ANY.store(true, Ordering::Release);
+        self.widened_min.fetch_min(address, Ordering::Relaxed);
+        self.widened_max
+            .fetch_max(address.saturating_add(len), Ordering::Relaxed);
         if self.aliased {
+            let mut ar = WIDENED_ALIASED_RANGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if ar.len().is_power_of_two() {
+                ar.retain(|(_, _, view)| view.strong_count() > 0);
+            }
+            ar.push((address, len, Arc::downgrade(&widened)));
             ALIASED_WIDENED.store(true, Ordering::Release);
         }
         self.has_widened.store(true, Ordering::Release);
@@ -418,6 +431,13 @@ impl Shadow {
     /// Whether this copy currently has any widened 3-channel RGB32 views.
     pub(crate) fn has_widened(&self) -> bool {
         self.has_widened.load(Ordering::Acquire)
+    }
+
+    /// Whether `[address, end)` overlaps any widened 3-channel RGB32 view on this copy.
+    pub(crate) fn has_widened_in(&self, address: u64, end: u64) -> bool {
+        self.has_widened.load(Ordering::Acquire)
+            && address < self.widened_max.load(Ordering::Relaxed)
+            && end > self.widened_min.load(Ordering::Relaxed)
     }
 
     fn refresh_widened(&self, from: usize, to: usize) {
@@ -552,6 +572,8 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
+            widened_min: AtomicU64::new(u64::MAX),
+            widened_max: AtomicU64::new(0),
             base: slice.map_or(0, |s| s.offset),
             slice,
             aliased: false,
@@ -588,6 +610,8 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
+            widened_min: AtomicU64::new(u64::MAX),
+            widened_max: AtomicU64::new(0),
             base,
             slice: None,
             aliased: true,
@@ -1382,8 +1406,11 @@ fn pages(start: u64, len: u64) -> u32 {
 struct Marks {
     /// Free runs below `end`, by first bit: their length.
     free: BTreeMap<u32, u32>,
-    /// Bits handed out at some time: those past it are clear.
+    /// Live upper bound of allocated bits (shrunk on tail `give_back`).
     end: u32,
+    /// Highest `end` reached since the last `copy_back_marks` sweep, so bits
+    /// freed before a sweep are still cleared before reuse.
+    high_water: u32,
     /// The copy holding each run, by its first bit.
     owners: BTreeMap<u32, std::sync::Weak<Shadow>>,
 }
@@ -1391,6 +1418,7 @@ struct Marks {
 static MARKS: Mutex<Marks> = Mutex::new(Marks {
     free: BTreeMap::new(),
     end: 0,
+    high_water: 0,
     owners: BTreeMap::new(),
 });
 
@@ -1410,15 +1438,19 @@ impl Marks {
             return Some(at);
         }
         if self.end + n < victory_shader::emit::VIEW_WRITE_BITS {
+            let at = self.end;
             self.end += n;
-            return Some(self.end - n);
+            self.high_water = self.high_water.max(self.end);
+            return Some(at);
         }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!("no bits left in the views' written-pages bitmap: copies made now declare their shaders' writes"));
         None
     }
 
-    /// The run of `n` bits at `at` is free again (joined to its neighbours).
+    /// The run of `n` bits at `at` is free again (joined to its neighbours,
+    /// shrinking `end` when adjacent to the tail so coalescing never marches
+    /// `end` monotonically toward `VIEW_WRITE_BITS`).
     fn give_back(&mut self, mut at: u32, mut n: u32) {
         if let Some((&before, &len)) = self.free.range(..at).next_back()
             && before + len == at
@@ -1429,7 +1461,11 @@ impl Marks {
         if let Some(len) = self.free.remove(&(at + n)) {
             n += len;
         }
-        self.free.insert(at, n);
+        if at + n == self.end {
+            self.end = at;
+        } else {
+            self.free.insert(at, n);
+        }
     }
 }
 
@@ -1724,6 +1760,12 @@ thread_local! {
 
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
+    let scan_bits = {
+        let mut m = marks();
+        let hw = m.high_water.max(m.end);
+        m.high_water = m.end;
+        hw
+    };
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
             continue;
@@ -1734,7 +1776,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
         // Marks of offsets past the bitmap land in its last bit, no copy's.
         bits[words - 1] = 0;
-        let used = (marks().end as usize).div_ceil(32).min(words);
+        let used = (scan_bits as usize).div_ceil(32).min(words);
         for (w, word) in bits[..used].iter_mut().enumerate() {
             let mut x = std::mem::take(word);
             let into = if memory && memory_withheld { &mut held } else { &mut marked };
@@ -1851,20 +1893,15 @@ static NON_ALIASED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Counts aliased regions added, coalesced, split, or removed.
 static ALIASED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Incremental delta operation on the aliased shadow registry, consumed by
-/// `memory.rs` to patch only changed 64 KiB page-table entries in place.
-#[derive(Clone)]
-pub(crate) enum AliasedOp {
-    Add(Arc<Shadow>),
-    Remove(u64, u64),
-}
-
+/// Bounded log of dirty `(start, len)` ranges on `ALIASED` (holding zero
+/// `Arc<Shadow>` references so coalesced/split shadows drop immediately and
+/// return their `VIEW_WRITE_BITS` runs without fragmentation).
 struct AliasedLog {
     /// Generation of `ops[0]`; any consumer older than `base` runs a full rewrite.
     base: u64,
     /// Current aliased generation (`base + ops.len()`).
     head: u64,
-    ops: Vec<AliasedOp>,
+    ops: Vec<(u64, u64)>,
 }
 
 const ALIASED_LOG_CAP: usize = 4096;
@@ -1882,28 +1919,66 @@ pub(crate) fn generations() -> (u64, u64) {
     (na, a)
 }
 
-/// Returns `(current_aliased_gen, ops)` since `since`, or `None` if `since`
-/// has fallen behind the bounded delta log (requiring a full page-table rewrite).
-pub(crate) fn aliased_delta(since: u64) -> Option<(u64, Vec<AliasedOp>)> {
-    let log = ALIASED_LOG.lock().unwrap_or_else(|e| e.into_inner());
-    if since < log.base || since > log.head {
-        return None;
+/// Returns `(current_aliased_gen, dirty_ranges, live_shadows)` atomically under
+/// `ALIASED.read()`, or `None` if `since` fell behind the bounded delta log.
+pub(crate) fn aliased_delta_snapshot(
+    since: u64,
+) -> Option<(u64, Vec<(u64, u64)>, Vec<Arc<Shadow>>)> {
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    let (head, ranges) = {
+        let log = ALIASED_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        if since < log.base || since > log.head {
+            return None;
+        }
+        let start = (since - log.base) as usize;
+        (log.head, log.ops[start..].to_vec())
+    };
+    if ranges.is_empty() {
+        return Some((head, Vec::new(), Vec::new()));
     }
-    let start = (since - log.base) as usize;
-    Some((log.head, log.ops[start..].to_vec()))
+    let mut intervals: Vec<(u64, u64)> = ranges
+        .into_iter()
+        .filter(|&(_, l)| l > 0)
+        .map(|(s, l)| (s, s.saturating_add(l)))
+        .collect();
+    intervals.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for (s, e) in intervals {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+        } else {
+            merged.push((s, e));
+        }
+    }
+    let span = ALIASED_SPAN.load(Ordering::Relaxed);
+    let mut live: Vec<Arc<Shadow>> = Vec::new();
+    let mut last_start: Option<u64> = None;
+    for &(ds, de) in &merged {
+        let lowest = ds.saturating_sub(span);
+        for (&s, sh) in map.range(lowest..de) {
+            if s + sh.len > ds && last_start != Some(s) {
+                live.push(sh.clone());
+                last_start = Some(s);
+            }
+        }
+    }
+    let dirty = merged.into_iter().map(|(s, e)| (s, e - s)).collect();
+    Some((head, dirty, live))
 }
 
-fn record_aliased_ops(ops: &[AliasedOp]) {
-    if ops.is_empty() {
+fn record_aliased_range(start: u64, len: u64) {
+    if len == 0 {
         return;
     }
     let mut log = ALIASED_LOG.lock().unwrap_or_else(|e| e.into_inner());
-    if log.ops.len() + ops.len() > ALIASED_LOG_CAP {
-        let drop_n = (log.ops.len() / 2).max(ops.len()).min(log.ops.len());
+    if log.ops.len() + 1 > ALIASED_LOG_CAP {
+        let drop_n = (log.ops.len() / 2).max(1).min(log.ops.len());
         log.ops.drain(..drop_n);
         log.base += drop_n as u64;
     }
-    log.ops.extend_from_slice(ops);
+    log.ops.push((start, len));
     log.head = log.base + log.ops.len() as u64;
     ALIASED_GEN.store(log.head, Ordering::Release);
 }
@@ -1911,12 +1986,14 @@ fn record_aliased_ops(ops: &[AliasedOp]) {
 /// Number of address stripes for [`find`]'s per-thread lookup cache epochs
 /// (16 MiB per stripe = 1 GiB full period). Changes in one address region only
 /// invalidate cached lookups in that region rather than flushing every thread's
-/// entire 16,384-set cache.
+/// entire 16,384-set cache. Lookups wider than one stripe use
+/// [`LOOKUP_GLOBAL_EPOCH`] (tagged with bit 0 = 1) so large buffers still cache.
 const LOOKUP_EPOCH_STRIPES: usize = 64;
 const LOOKUP_STRIPE_SHIFT: u32 = 24;
 
 static LOOKUP_EPOCHS: [AtomicU64; LOOKUP_EPOCH_STRIPES] =
     [const { AtomicU64::new(1) }; LOOKUP_EPOCH_STRIPES];
+static LOOKUP_GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[inline]
 fn lookup_stripe(addr: u64) -> usize {
@@ -1924,6 +2001,7 @@ fn lookup_stripe(addr: u64) -> usize {
 }
 
 fn lookup_changed_all() {
+    LOOKUP_GLOBAL_EPOCH.fetch_add(1, Ordering::Release);
     for e in &LOOKUP_EPOCHS {
         e.fetch_add(1, Ordering::Release);
     }
@@ -1938,6 +2016,7 @@ fn lookup_changed_range(start: u64, end: u64) {
         lookup_changed_all();
         return;
     }
+    LOOKUP_GLOBAL_EPOCH.fetch_add(1, Ordering::Release);
     let mut mask = 0u64;
     let mut a = start & !(span - 1);
     while a < end {
@@ -2047,11 +2126,38 @@ static ALIASED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new()
 static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
 static ALIASED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ALIASED_WIDENED: AtomicBool = AtomicBool::new(false);
+static WIDENED_ALIASED_RANGES: Mutex<Vec<(u64, u64, std::sync::Weak<Widened>)>> =
+    Mutex::new(Vec::new());
 
-/// Whether any aliased shadow has a widened 3-channel RGB32 view that needs
-/// CPU refresh on submission.
-pub(crate) fn any_aliased_widened() -> bool {
-    ALIASED_WIDENED.load(Ordering::Acquire)
+/// Calls `add` only for live aliased shadows holding an active widened
+/// 3-channel RGB32 view, passing each widened view's exact `[address, len)`.
+pub(crate) fn for_each_aliased_widened(mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    if !ALIASED_WIDENED.load(Ordering::Acquire) {
+        return;
+    }
+    let active: Vec<(u64, u64)> = {
+        let mut list = WIDENED_ALIASED_RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        list.retain(|(_, _, w)| w.strong_count() > 0);
+        if list.is_empty() {
+            ALIASED_WIDENED.store(false, Ordering::Release);
+            return;
+        }
+        list.iter().map(|&(a, l, _)| (a, l)).collect()
+    };
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    for (addr, len) in active {
+        let end = addr.saturating_add(len);
+        if let Some((_, s)) = map
+            .range(..=addr)
+            .next_back()
+            .filter(|(_, s)| s.start + s.len >= end)
+            && s.has_widened()
+        {
+            add(s, addr as usize, len as usize);
+        }
+    }
 }
 
 pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
@@ -2071,11 +2177,63 @@ pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
     map.range(start..end).next().is_some()
 }
 
-pub(crate) fn register_aliased(mut shadow: Arc<Shadow>) {
+/// Registers an aliased zero-copy slice directly, coalescing with contiguous
+/// neighbours BEFORE allocating its `VIEW_WRITE_BITS` run so page-by-page
+/// physical mappings never leak or fragment bitmap runs.
+pub(crate) fn register_aliased_at(
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    gpu: u64,
+    base: u64,
+    start: u64,
+    len: u64,
+) {
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    let buf_raw = windows::core::Interface::as_raw(&buffer);
+    let (mut cur_buf, mut cur_data, mut cur_gpu, mut cur_base, mut cur_start, mut cur_len) =
+        (buffer, data, gpu, base, start, len);
+    let prev_key = map
+        .range(..cur_start)
+        .next_back()
+        .filter(|&(s, prev)| {
+            *s + prev.len == cur_start
+                && windows::core::Interface::as_raw(&prev.buffer) == buf_raw
+                && prev.base + prev.len == cur_base
+        })
+        .map(|(&s, _)| s);
+    if let Some(pk) = prev_key
+        && let Some(prev) = map.remove(&pk)
+    {
+        cur_buf = prev.buffer.clone();
+        cur_data = prev.data;
+        cur_gpu = prev.gpu;
+        cur_base = prev.base;
+        cur_start = prev.start;
+        cur_len += prev.len;
+        // Release `prev`'s `marks` run before allocating the coalesced run.
+        drop(prev);
+    }
+    let next_start = cur_start + cur_len;
+    let merge_next = map.get(&next_start).is_some_and(|next| {
+        windows::core::Interface::as_raw(&next.buffer) == buf_raw
+            && cur_base + cur_len == next.base
+    });
+    if merge_next && let Some(next) = map.remove(&next_start) {
+        cur_len += next.len;
+        drop(next);
+    }
+    let shadow = Shadow::new_aliased_at(cur_buf, cur_data, cur_gpu, cur_base, cur_start, cur_len);
+    ALIASED_SPAN.fetch_max(cur_len, Ordering::Relaxed);
+    let replaced = map.insert(cur_start, shadow);
+    ALIASED_COUNT.store(map.len(), Ordering::Release);
+    let dirty_len = replaced.map_or(cur_len, |old| old.len.max(cur_len));
+    record_aliased_range(cur_start, dirty_len);
+    lookup_changed_range(cur_start, cur_start.saturating_add(dirty_len));
+}
+
+pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
     let buf_raw = windows::core::Interface::as_raw(&shadow.buffer);
-    // Coalesce with an immediately preceding view backed by the same buffer at
-    // the contiguous offset so adjacent physical mappings act as one run.
     let prev_key = map
         .range(..shadow.start)
         .next_back()
@@ -2085,58 +2243,58 @@ pub(crate) fn register_aliased(mut shadow: Arc<Shadow>) {
                 && prev.base + prev.len == shadow.base
         })
         .map(|(&s, _)| s);
-    if let Some(pk) = prev_key
-        && let Some(prev) = map.remove(&pk)
-    {
-        shadow = Shadow::new_aliased_at(
-            prev.buffer.clone(),
-            prev.data,
-            prev.gpu,
-            prev.base,
-            prev.start,
-            prev.len + shadow.len,
-        );
-    }
-    // Coalesce with an immediately following view backed by the same buffer at
-    // the contiguous offset.
     let next_start = shadow.start + shadow.len;
     let merge_next = map.get(&next_start).is_some_and(|next| {
         windows::core::Interface::as_raw(&next.buffer) == buf_raw
             && shadow.base + shadow.len == next.base
     });
-    if merge_next && let Some(next) = map.remove(&next_start) {
-        shadow = Shadow::new_aliased_at(
+    let shadow = if prev_key.is_some() || merge_next {
+        let (mut cur_buf, mut cur_data, mut cur_gpu, mut cur_base, mut cur_start, mut cur_len) = (
             shadow.buffer.clone(),
             shadow.data,
             shadow.gpu,
             shadow.base,
             shadow.start,
-            shadow.len + next.len,
+            shadow.len,
         );
-    }
-    let range_start = shadow.start;
-    let range_end = shadow.start.saturating_add(shadow.len);
-    ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
-    let added = shadow.clone();
-    let replaced = map.insert(shadow.start, shadow);
-    ALIASED_COUNT.store(map.len(), Ordering::Release);
-    if let Some(old) = replaced
-        && old.len > added.len
-    {
-        record_aliased_ops(&[AliasedOp::Remove(old.start, old.len), AliasedOp::Add(added)]);
-        lookup_changed_range(range_start, old.start.saturating_add(old.len));
+        drop(shadow);
+        if let Some(pk) = prev_key
+            && let Some(prev) = map.remove(&pk)
+        {
+            cur_buf = prev.buffer.clone();
+            cur_data = prev.data;
+            cur_gpu = prev.gpu;
+            cur_base = prev.base;
+            cur_start = prev.start;
+            cur_len += prev.len;
+            drop(prev);
+        }
+        if merge_next && let Some(next) = map.remove(&next_start) {
+            cur_len += next.len;
+            drop(next);
+        }
+        Shadow::new_aliased_at(cur_buf, cur_data, cur_gpu, cur_base, cur_start, cur_len)
     } else {
-        record_aliased_ops(&[AliasedOp::Add(added)]);
-        lookup_changed_range(range_start, range_end);
-    }
+        shadow
+    };
+    let range_start = shadow.start;
+    let range_len = shadow.len;
+    ALIASED_SPAN.fetch_max(range_len, Ordering::Relaxed);
+    let replaced = map.insert(range_start, shadow);
+    ALIASED_COUNT.store(map.len(), Ordering::Release);
+    let dirty_len = replaced.map_or(range_len, |old| old.len.max(range_len));
+    record_aliased_range(range_start, dirty_len);
+    lookup_changed_range(range_start, range_start.saturating_add(dirty_len));
 }
 
 pub(crate) fn unregister_aliased(start: u64) -> bool {
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
     if let Some(sh) = map.remove(&start) {
+        let (s, l) = (sh.start, sh.len);
+        drop(sh);
         ALIASED_COUNT.store(map.len(), Ordering::Release);
-        record_aliased_ops(&[AliasedOp::Remove(sh.start, sh.len)]);
-        lookup_changed_range(sh.start, sh.start.saturating_add(sh.len));
+        record_aliased_range(s, l);
+        lookup_changed_range(s, s.saturating_add(l));
         return true;
     }
     false
@@ -2160,46 +2318,52 @@ pub(crate) fn unregister_aliased_range(start: u64, len: u64) -> bool {
     if keys.is_empty() {
         return false;
     }
-    let mut ops = Vec::with_capacity(keys.len() + 2);
     let (mut inv_start, mut inv_end) = (start, end);
-    ops.push(AliasedOp::Remove(start, len));
     for key in keys {
         let Some(sh) = map.remove(&key) else {
             continue;
         };
-        let sh_end = sh.start + sh.len;
-        inv_start = inv_start.min(sh.start);
+        let (sh_buf, sh_data, sh_gpu, sh_base, sh_start, sh_len) = (
+            sh.buffer.clone(),
+            sh.data,
+            sh.gpu,
+            sh.base,
+            sh.start,
+            sh.len,
+        );
+        // Drop `sh` before allocating split prefix/suffix `marks` runs.
+        drop(sh);
+        let sh_end = sh_start + sh_len;
+        inv_start = inv_start.min(sh_start);
         inv_end = inv_end.max(sh_end);
-        if sh.start < start {
+        if sh_start < start {
             let prefix = Shadow::new_aliased_at(
-                sh.buffer.clone(),
-                sh.data,
-                sh.gpu,
-                sh.base,
-                sh.start,
-                start - sh.start,
+                sh_buf.clone(),
+                sh_data,
+                sh_gpu,
+                sh_base,
+                sh_start,
+                start - sh_start,
             );
-            ops.push(AliasedOp::Add(prefix.clone()));
             map.insert(prefix.start, prefix);
         }
         if sh_end > end {
-            let skip = end - sh.start;
-            // SAFETY: `end < sh_end`, so `skip < sh.len` lies inside the backing mapping.
-            let suffix_data = unsafe { sh.data.add(skip as usize) };
+            let skip = end - sh_start;
+            // SAFETY: `end < sh_end`, so `skip < sh_len` lies inside the backing mapping.
+            let suffix_data = unsafe { sh_data.add(skip as usize) };
             let suffix = Shadow::new_aliased_at(
-                sh.buffer.clone(),
+                sh_buf,
                 suffix_data,
-                sh.gpu + skip,
-                sh.base + skip,
+                sh_gpu + skip,
+                sh_base + skip,
                 end,
                 sh_end - end,
             );
-            ops.push(AliasedOp::Add(suffix.clone()));
             map.insert(suffix.start, suffix);
         }
     }
     ALIASED_COUNT.store(map.len(), Ordering::Release);
-    record_aliased_ops(&ops);
+    record_aliased_range(inv_start, inv_end - inv_start);
     lookup_changed_range(inv_start, inv_end);
     true
 }
@@ -2397,14 +2561,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let stripe = lookup_stripe(address);
     let single_stripe = stripe == lookup_stripe(end.saturating_sub(1))
         && end.saturating_sub(address) <= (1u64 << LOOKUP_STRIPE_SHIFT);
-    if !single_stripe {
-        #[cfg(feature = "diagnostics")]
-        LOOKUP_STATS[1].fetch_add(1, Ordering::Relaxed);
-        let shadow = find_uncached(address, end)?;
-        shadow.touch();
-        return Some(shadow);
-    }
-    let epoch = LOOKUP_EPOCHS[stripe].load(Ordering::Acquire);
+    let epoch = if single_stripe {
+        LOOKUP_EPOCHS[stripe].load(Ordering::Acquire) << 1
+    } else {
+        (LOOKUP_GLOBAL_EPOCH.load(Ordering::Acquire) << 1) | 1
+    };
     let hit = LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
         guard.as_mut().and_then(|cache| cache.get(epoch, address, end))
@@ -3932,11 +4093,12 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
-    /// Mark bits are handed out in runs and come back joined.
+    /// Mark bits are handed out in runs, join interior neighbours, and shrink
+    /// `end` when tail runs are returned.
     #[test]
     fn mark_runs_are_reused_and_joined() {
         let mut m = Marks::default();
-        assert_eq!((m.take(3), m.take(2)), (Some(0), Some(3)));
+        assert_eq!((m.take(3), m.take(2), m.take(1)), (Some(0), Some(3), Some(5)));
         m.give_back(0, 3);
         assert_eq!(m.take(1), Some(0), "first fit");
         m.give_back(3, 2);
@@ -3944,6 +4106,11 @@ pub(crate) mod tests {
         m.give_back(0, 1);
         assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&0, &5)], "and 0 joins them");
         assert_eq!(m.take(5), Some(0));
+        m.give_back(5, 1);
+        assert_eq!(m.end, 5, "returning tail shrinks end");
+        m.give_back(0, 5);
+        assert_eq!(m.end, 0, "returning everything shrinks end to 0");
+        assert!(m.free.is_empty());
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
@@ -4254,5 +4421,47 @@ pub(crate) mod tests {
         assert!(ranges_disjoint(&[(0x1000, 0x1000), (0x2000, 0x1000)]));
         assert!(ranges_disjoint(&[(0x2000, 0x1000), (0x1000, 0x1000)]));
         assert!(!ranges_disjoint(&[(0x1000, 0x1500), (0x2000, 0x1000)]));
+    }
+
+    #[test]
+    fn aliased_coalescing_reuses_marks_without_quadratic_growth() {
+        let Some(host) = host() else {
+            return;
+        };
+        const N: usize = 512;
+        let total = (N * PAGE) as u64;
+        let Some((buf, data)) = host.shared_buffer(total) else {
+            return;
+        };
+        // SAFETY: live buffer.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let start_end = marks().end;
+        let base_va = 0x64_0000_0000u64;
+        for i in 0..N {
+            let off = (i * PAGE) as u64;
+            // SAFETY: `data` covers `N * PAGE`.
+            register_aliased_at(
+                buf.clone(),
+                unsafe { data.add(off as usize) },
+                gpu + off,
+                off,
+                base_va + off,
+                PAGE as u64,
+            );
+        }
+        let peak_end = marks().end;
+        let final_sh = find_aliased(base_va, base_va + total).expect("coalesced shadow");
+        assert!(final_sh.marked(), "coalesced aliased shadow must keep marks");
+        assert!(
+            peak_end <= start_end + N as u32 + 64,
+            "marks().end must stay O(N), not O(N^2): start={start_end}, peak={peak_end}"
+        );
+        drop(final_sh);
+        assert!(unregister_aliased_range(base_va, total));
+        assert!(
+            marks().end <= start_end + 64,
+            "tail give_back must shrink marks().end back down: start={start_end}, after={}",
+            marks().end
+        );
     }
 }

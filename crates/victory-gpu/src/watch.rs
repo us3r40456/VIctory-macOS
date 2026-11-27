@@ -411,9 +411,7 @@ pub(crate) fn frame_line(frames: f64) -> String {
 const STRIPES: usize = 64;
 
 /// Shift in 64 KiB pages per stripe (`VICTORY_WATCH_STRIPE_SHIFT`, clamped to
-/// `4..=12`, default `8` = 256 pages = 16 MiB/stripe, 1 GiB full period).
-/// Keeps multi-megabyte buffers inside a few stripes so a 174 MiB buffer does
-/// not degenerate into acquiring all 64 stripes (`u64::MAX`).
+/// `4..=12`, default `4` = 16 pages = 1 MiB/stripe, 64 MiB full period).
 #[inline]
 fn stripe_shift() -> u32 {
     static SHIFT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -422,7 +420,7 @@ fn stripe_shift() -> u32 {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|s| s.clamp(4, 12))
-            .unwrap_or(8)
+            .unwrap_or(4)
     })
 }
 

@@ -571,7 +571,6 @@ impl Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let check_aliased = crate::shadow::any_aliased_widened();
     for shard in &viewed.shards {
         let inner = shard.lock().unwrap_or_else(|e| e.into_inner());
         for (shadow, address, len, uav, bit) in inner.hulls.values() {
@@ -584,14 +583,8 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
                 add(shadow, address as usize, len as usize);
             }
         }
-        if check_aliased {
-            for (shadow, address, len, _, _) in inner.aliased_hulls.values() {
-                if shadow.has_widened() {
-                    add(shadow, *address as usize, *len as usize);
-                }
-            }
-        }
     }
+    crate::shadow::for_each_aliased_widened(&mut add);
 }
 
 /// The copies the heap views for unordered access: what shaders that take
@@ -638,7 +631,7 @@ pub(crate) fn refresh_slot(
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if (!shadow.is_aliased() || shadow.has_widened())
+    if (!shadow.is_aliased() || shadow.has_widened_in(*address, address.saturating_add(*len)))
         && !crate::watch::clean_bit(shadow.dirty_bit())
     {
         add(shadow, *address as usize, *len as usize);

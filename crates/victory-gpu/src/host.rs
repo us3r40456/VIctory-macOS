@@ -4323,7 +4323,7 @@ impl Batch {
                 self.zero_copy_ranges += 1;
                 self.zero_copy_bytes += len;
             }
-            if !shadow.has_widened() {
+            if !shadow.has_widened_in(address as u64, (address + len) as u64) {
                 return;
             }
         }

@@ -1006,7 +1006,7 @@ impl PhysicalPool {
         }
         // SAFETY: `off < chunk.len` checked above.
         let slice_data = unsafe { chunk.data.add(off) };
-        let shadow = crate::shadow::Shadow::new_aliased_at(
+        crate::shadow::register_aliased_at(
             chunk.buffer.clone(),
             slice_data,
             chunk.gpu + off as u64,
@@ -1014,7 +1014,6 @@ impl PhysicalPool {
             title_va as u64,
             len as u64,
         );
-        crate::shadow::register_aliased(shadow);
         PHYSICAL_VIEWS.fetch_add(1, Ordering::Relaxed);
         true
     }
