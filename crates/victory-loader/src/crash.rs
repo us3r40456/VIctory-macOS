@@ -857,6 +857,224 @@ pub fn patch_clzero_loops(base: u64, info: &victory_pe::ImageInfo) -> usize {
     patched
 }
 
+/// One SSE4a immediate `insertq xmm_dst, xmm_src, len, idx` site in executable code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InsertqSite {
+    offset: usize,
+    /// Instruction length in bytes (6 without REX, 7 with REX).
+    len: usize,
+    dst: u8,
+    src: u8,
+    bits: u8,
+    idx: u8,
+}
+
+/// Scans `code` for genuine SSE4a immediate `insertq` instructions
+/// (`f2 [40..=4f] 0f 78 modrm len idx`, mod=11) with byte/word-aligned bitfields
+/// followed by a VEX-encoded AVX instruction (`0xc4` / `0xc5`).
+fn insertq_sites(code: &[u8]) -> Vec<InsertqSite> {
+    let mut sites = Vec::new();
+    let mut i = 0;
+    while i + 7 <= code.len() {
+        if code[i] != 0xf2 {
+            i += 1;
+            continue;
+        }
+        let (rex, at) = if code[i + 1] & 0xf0 == 0x40 {
+            (code[i + 1], i + 2)
+        } else {
+            (0u8, i + 1)
+        };
+        let end = at + 5;
+        if end < code.len()
+            && code[at] == 0x0f
+            && code[at + 1] == 0x78
+            && (code[at + 2] >> 6) == 3
+        {
+            let modrm = code[at + 2];
+            let bits = code[at + 3];
+            let idx = code[at + 4];
+            let next = code[end];
+            if matches!(bits, 8 | 16 | 24 | 32)
+                && idx.is_multiple_of(8)
+                && u16::from(bits) + u16::from(idx) <= 64
+                && matches!(next, 0xc4 | 0xc5)
+            {
+                let dst = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+                let src = (modrm & 7) | ((rex & 1) << 3);
+                sites.push(InsertqSite {
+                    offset: i,
+                    len: end - i,
+                    dst,
+                    src,
+                    bits,
+                    idx,
+                });
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    sites
+}
+
+/// Emits a native SSE2/GPR trampoline for `insertq xmm_dst, xmm_src, bits, idx`
+/// preserving all GPRs, EFLAGS, and the upper 64 bits of `xmm_dst`.
+fn insertq_trampoline(site: &InsertqSite) -> Vec<u8> {
+    let mut c = Vec::with_capacity(64);
+    let field_mask: u64 = if site.bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << site.bits) - 1
+    };
+    let clear_mask: u64 = !(field_mask << site.idx);
+
+    c.push(0x9c); // pushfq
+    c.extend_from_slice(&[0x50, 0x51, 0x52]); // push rax; push rcx; push rdx
+    c.extend_from_slice(&[0x48, 0x83, 0xec, 0x10]); // sub rsp, 16
+    // movq rax, xmm_dst: 66 REX(0x48 | dst_hi<<2) 0f 7e (0xc0 | dst_lo<<3 | 0)
+    c.extend_from_slice(&[
+        0x66,
+        0x48 | ((site.dst >> 3) << 2),
+        0x0f,
+        0x7e,
+        0xc0 | ((site.dst & 7) << 3),
+    ]);
+    // movq rcx, xmm_src: 66 REX(0x48 | src_hi<<2) 0f 7e (0xc0 | src_lo<<3 | 1)
+    c.extend_from_slice(&[
+        0x66,
+        0x48 | ((site.src >> 3) << 2),
+        0x0f,
+        0x7e,
+        0xc1 | ((site.src & 7) << 3),
+    ]);
+    // movabs rdx, clear_mask; and rax, rdx
+    c.extend_from_slice(&[0x48, 0xba]);
+    c.extend_from_slice(&clear_mask.to_le_bytes());
+    c.extend_from_slice(&[0x48, 0x21, 0xd0]);
+    // movabs rdx, field_mask; and rcx, rdx
+    c.extend_from_slice(&[0x48, 0xba]);
+    c.extend_from_slice(&field_mask.to_le_bytes());
+    c.extend_from_slice(&[0x48, 0x21, 0xd1]);
+    // shl rcx, idx (if idx > 0)
+    if site.idx > 0 {
+        c.extend_from_slice(&[0x48, 0xc1, 0xe1, site.idx]);
+    }
+    // or rax, rcx; mov [rsp], rax
+    c.extend_from_slice(&[0x48, 0x09, 0xc8, 0x48, 0x89, 0x04, 0x24]);
+    // movlps xmm_dst, [rsp] (writes low 64 bits only, preserves high 64 bits!)
+    if site.dst >= 8 {
+        c.push(0x44);
+    }
+    c.extend_from_slice(&[0x0f, 0x12, 0x04 | ((site.dst & 7) << 3), 0x24]);
+    c.extend_from_slice(&[0x48, 0x83, 0xc4, 0x10]); // add rsp, 16
+    c.extend_from_slice(&[0x5a, 0x59, 0x58]); // pop rdx; pop rcx; pop rax
+    c.push(0x9d); // popfq
+    c.push(0xc3); // ret
+    c
+}
+
+/// Replaces SSE4a immediate `insertq` instructions in the executable sections
+/// of the image mapped at `base` with `call rel32` to native trampolines.
+/// Eliminates remaining `STATUS_ILLEGAL_INSTRUCTION` traps under Rosetta 2.
+pub fn patch_insertq_sites(base: u64, info: &victory_pe::ImageInfo) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+        VirtualAlloc, VirtualProtect,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let mut sites: Vec<(u64, InsertqSite)> = Vec::new();
+    for s in info
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+    {
+        let start = base + u64::from(s.rva);
+        let len = s.virtual_size.min(s.file_size) as usize;
+        // SAFETY: mapped executable section of the loaded image.
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+        for site in insertq_sites(code) {
+            sites.push((start, site));
+        }
+    }
+    if sites.is_empty() {
+        return 0;
+    }
+    const POOL_SIZE: usize = 64 << 10;
+    let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
+    for step in 1i64..=1024 {
+        let try_addr = base.wrapping_sub((step as u64) * 0x10_0000);
+        if try_addr < 0x1000_0000 {
+            break;
+        }
+        // SAFETY: probe-allocating a 64 KiB trampoline page within +/-2 GiB of image.
+        pool = unsafe {
+            VirtualAlloc(
+                try_addr as *const _,
+                POOL_SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if !pool.is_null() {
+            break;
+        }
+    }
+    if pool.is_null() {
+        tracing::warn!("no memory near image for insertq trampolines");
+        return 0;
+    }
+    let mut used = 0usize;
+    let mut patched = 0usize;
+    for (sec_start, site) in &sites {
+        let tramp = insertq_trampoline(site);
+        if used + tramp.len() > POOL_SIZE {
+            break;
+        }
+        let site_va = sec_start + site.offset as u64;
+        let tramp_va = pool as u64 + used as u64;
+        let Ok(rel32) = i32::try_from(tramp_va as i128 - (site_va as i128 + 5)) else {
+            continue;
+        };
+        let mut call = [0x90u8; 7];
+        call[0] = 0xe8;
+        call[1..5].copy_from_slice(&rel32.to_le_bytes());
+        if site.len == 7 {
+            call[5] = 0x66;
+            call[6] = 0x90;
+        }
+        let mut old = 0;
+        // SAFETY: writing generated trampoline and patching image code before title runs.
+        unsafe {
+            std::ptr::copy_nonoverlapping(tramp.as_ptr(), tramp_va as *mut u8, tramp.len());
+            if VirtualProtect(
+                site_va as *const _,
+                site.len,
+                PAGE_EXECUTE_READWRITE,
+                &mut old,
+            ) == 0
+            {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(call.as_ptr(), site_va as *mut u8, site.len);
+            VirtualProtect(site_va as *const _, site.len, old, &mut old);
+        }
+        used = (used + tramp.len() + 15) & !15;
+        patched += 1;
+    }
+    let mut old = 0;
+    // SAFETY: mark trampoline pool RX and flush instruction cache.
+    unsafe {
+        VirtualProtect(pool, POOL_SIZE, PAGE_EXECUTE_READ, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), std::ptr::null(), 0);
+    }
+    patched
+}
+
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
 /// titles clear tens of kilobytes at a time, a line per pass, so the two
 /// loops compilers build around the instruction are done whole in one
@@ -2488,6 +2706,93 @@ mod tests {
             assert!(buf2.0[0..64].iter().all(|&b| b == 0xBB));
             assert!(buf2.0[64..256].iter().all(|&b| b == 0));
             assert!(buf2.0[256..320].iter().all(|&b| b == 0xBB));
+
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn insertq_sites_scanner_and_native_trampoline() {
+        // Real title patterns: xmm0/xmm1 (6 bytes), xmm14/xmm13 (7 bytes), xmm0/xmm0 (6 bytes).
+        let sample = [
+            0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10, 0xc5, 0xf8, 0x28, // insertq xmm0, xmm1, 16, 16; vmovaps...
+            0xf2, 0x45, 0x0f, 0x78, 0xf5, 0x10, 0x10, 0xc5, 0x79, // insertq xmm14, xmm13, 16, 16; vmovd...
+            0xf2, 0x0f, 0x78, 0xc0, 0x08, 0x18, 0xc4, 0xe2, 0x79, // insertq xmm0, xmm0, 8, 24; vpmovsxbd...
+        ];
+        let found = insertq_sites(&sample);
+        assert_eq!(found.len(), 3);
+        assert_eq!((found[0].len, found[0].dst, found[0].src, found[0].bits, found[0].idx), (6, 0, 1, 16, 16));
+        assert_eq!((found[1].len, found[1].dst, found[1].src, found[1].bits, found[1].idx), (7, 14, 13, 16, 16));
+        assert_eq!((found[2].len, found[2].dst, found[2].src, found[2].bits, found[2].idx), (6, 0, 0, 8, 24));
+
+        // Execute trampolines natively on host CPU and compare against `sse4a()` oracle,
+        // verifying high 64 bits of dst XMM are preserved!
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            ) as *mut u8;
+            assert!(!page.is_null());
+
+            // Test case 1: xmm0 = dst, xmm1 = src (both Win64 volatile + argument regs).
+            let t0 = insertq_trampoline(&found[0]);
+            page.copy_from_nonoverlapping(t0.as_ptr(), t0.len());
+            // Wrapper: rcx = *mut [u64; 2] (dst), rdx = *const [u64; 2] (src).
+            // movdqu xmm0, [rcx]; movdqu xmm1, [rdx]; call t0; movdqu [rcx], xmm0; ret
+            let w0_off = 0x100usize;
+            let rel0 = (0isize - (w0_off as isize + 8 + 5)) as i32;
+            let mut w0 = vec![
+                0xf3, 0x0f, 0x6f, 0x01, // movdqu xmm0, [rcx]
+                0xf3, 0x0f, 0x6f, 0x0a, // movdqu xmm1, [rdx]
+                0xe8,
+            ];
+            w0.extend_from_slice(&rel0.to_le_bytes());
+            w0.extend_from_slice(&[0xf3, 0x0f, 0x7f, 0x01, 0xc3]); // movdqu [rcx], xmm0; ret
+            page.add(w0_off).copy_from_nonoverlapping(w0.as_ptr(), w0.len());
+            let run0: extern "win64" fn(*mut [u64; 2], *const [u64; 2]) =
+                std::mem::transmute(page.add(w0_off));
+            let mut dst = [0x1122_3344_5566_7788u64, 0xDEAD_BEEF_CAFE_BABEu64];
+            let src = [0xAAAA_BBBB_CCCC_DDDDu64, 0x9999_8888_7777_6666u64];
+            run0(&mut dst, &src);
+            assert_eq!(dst[0], 0x1122_3344_DDDD_7788u64);
+            assert_eq!(dst[1], 0xDEAD_BEEF_CAFE_BABEu64, "xmm0 high 64 bits preserved");
+
+            // Test case 2: high registers xmm14 / xmm13 (save/restore non-volatile xmm13/xmm14!).
+            let t1_off = 0x200usize;
+            let t1 = insertq_trampoline(&found[1]);
+            page.add(t1_off).copy_from_nonoverlapping(t1.as_ptr(), t1.len());
+            let w1_off = 0x300usize;
+            let mut w1 = vec![
+                0x48, 0x83, 0xec, 0x28, // sub rsp, 40
+                0xf3, 0x44, 0x0f, 0x7f, 0x34, 0x24, // movdqu [rsp], xmm14
+                0xf3, 0x44, 0x0f, 0x7f, 0x6c, 0x24, 0x10, // movdqu [rsp+16], xmm13
+                0xf3, 0x44, 0x0f, 0x6f, 0x31, // movdqu xmm14, [rcx]
+                0xf3, 0x44, 0x0f, 0x6f, 0x2a, // movdqu xmm13, [rdx]
+            ];
+            let call_at = w1_off + w1.len();
+            let rel1 = (t1_off as isize - (call_at as isize + 5)) as i32;
+            w1.push(0xe8);
+            w1.extend_from_slice(&rel1.to_le_bytes());
+            w1.extend_from_slice(&[
+                0xf3, 0x44, 0x0f, 0x7f, 0x31, // movdqu [rcx], xmm14
+                0xf3, 0x44, 0x0f, 0x6f, 0x6c, 0x24, 0x10, // movdqu xmm13, [rsp+16]
+                0xf3, 0x44, 0x0f, 0x6f, 0x34, 0x24, // movdqu xmm14, [rsp]
+                0x48, 0x83, 0xc4, 0x28, // add rsp, 40
+                0xc3,
+            ]);
+            page.add(w1_off).copy_from_nonoverlapping(w1.as_ptr(), w1.len());
+            let run1: extern "win64" fn(*mut [u64; 2], *const [u64; 2]) =
+                std::mem::transmute(page.add(w1_off));
+            let mut dst2 = [0x0102_0304_0506_0708u64, 0xFEED_FACE_1234_5678u64];
+            let src2 = [0xFFFF_FFFF_FFFF_BEEFu64, 0x0];
+            run1(&mut dst2, &src2);
+            assert_eq!(dst2[0], 0x0102_0304_BEEF_0708u64);
+            assert_eq!(dst2[1], 0xFEED_FACE_1234_5678u64, "xmm14 high 64 bits preserved");
 
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }

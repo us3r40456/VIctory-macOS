@@ -228,6 +228,16 @@ fn submission_profile_on() -> bool {
 
 static SUB_PROFILE: Mutex<Vec<(f64, usize, String)>> = Mutex::new(Vec::new());
 
+/// Per-phase preparing microseconds when `VICTORY_SUBMISSION_PROFILE=1`:
+/// [0]=evict, [1]=sync_heaps, [2]=uploads, [3]=deferred+prelude, [4]=flush.
+static PREP_PROFILE: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 fn note_submission_profile(gpu: Duration, runs: &[&HostList]) {
     if !submission_profile_on() {
         return;
@@ -258,6 +268,14 @@ fn log_submission_profile(frames: f64) {
     if !submission_profile_on() {
         return;
     }
+    let denom = frames.max(1.0);
+    let [evict, sync_heaps, uploads, deferred, flush] =
+        PREP_PROFILE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / denom);
+    tracing::info!(
+        "preparing profile (VICTORY_SUBMISSION_PROFILE): evict {evict:.1} ms, sync_heaps {sync_heaps:.1} ms, \
+         uploads {uploads:.1} ms, deferred+prelude {deferred:.1} ms, flush {flush:.1} ms (sum {:.1} ms)",
+        evict + sync_heaps + uploads + deferred + flush
+    );
     let mut entries = std::mem::take(&mut *SUB_PROFILE.lock().unwrap_or_else(|e| e.into_inner()));
     if entries.is_empty() {
         return;
@@ -267,7 +285,7 @@ fn log_submission_profile(frames: f64) {
     entries.sort_by(|a, b| b.0.total_cmp(&a.0));
     tracing::info!(
         "submission profile (VICTORY_SUBMISSION_PROFILE): {count} subs >=1ms, {:.1} ms/frame total (top 10):",
-        total_ms / frames.max(1.0)
+        total_ms / denom
     );
     for (ms, lists, sample) in entries.into_iter().take(10) {
         tracing::info!("  sub {ms:.1} ms ({lists} lists): [{sample}]");
@@ -1959,6 +1977,7 @@ impl Host {
         };
         let _holding = Holding::enter();
         let started = std::time::Instant::now();
+        let prof_prep = submission_profile_on();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
@@ -1970,7 +1989,11 @@ impl Host {
         if beside.is_some() && crate::resource::evict_due() {
             self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Evict);
         }
+        let t_evict = prof_prep.then(std::time::Instant::now);
         crate::resource::evict_unused();
+        if let Some(t) = t_evict {
+            PREP_PROFILE[0].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
         if crate::bindless::take_remake() {
@@ -1986,7 +2009,11 @@ impl Host {
         if !crate::descriptor::ahead::on() {
             self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Heaps);
         }
+        let t_sync = prof_prep.then(std::time::Instant::now);
         crate::descriptor::sync_heaps();
+        if let Some(t) = t_sync {
+            PREP_PROFILE[1].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
@@ -2024,9 +2051,13 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let t_up = prof_prep.then(std::time::Instant::now);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
             .then(|| crate::bindless::uploads(&heaps, &textures))
             .flatten();
+        if let Some(t) = t_up {
+            PREP_PROFILE[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -2067,6 +2098,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let t_def = prof_prep.then(std::time::Instant::now);
         for list in runs {
             // Its first title copy opens a list the copy-order split cut.
             batch.cut = list.after_copy();
@@ -2088,9 +2120,13 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        if let Some(t) = t_def {
+            PREP_PROFILE[3].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // mac: with flights, while the submission left still runs, the
         // refreshes of copies it can neither write nor land in are made
         // early; then it is finished, and the others are made.
+        let t_flush = prof_prep.then(std::time::Instant::now);
         if let Some(held) = self.beside_refreshes(&mut beside, &mut batch.refreshes) {
             batch.early = true;
             batch.flush();
@@ -2101,6 +2137,9 @@ impl Host {
             }
         }
         batch.flush();
+        if let Some(t) = t_flush {
+            PREP_PROFILE[4].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         batch.count_zero_copy();
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
@@ -4301,12 +4340,82 @@ impl Batch {
             .map(|(from, to)| to - from)
             .sum();
         let mut total = 0;
+        if work.is_empty() {
+            return 0;
+        }
+        let per_copy_timing = cfg!(feature = "diagnostics") || crate::physical_runs::on();
         #[cfg(feature = "diagnostics")]
         let mut counted = crate::copystat::hold();
-        if crate::shadow::parallel_copies_enabled()
+        let parallel = crate::shadow::parallel_copies_enabled()
             && work.len() >= 2
-            && total_requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES
-        {
+            && total_requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES;
+        if !per_copy_timing {
+            let started = std::time::Instant::now();
+            let early = self.early;
+            if parallel {
+                let copied_each: Vec<std::sync::atomic::AtomicUsize> = (0..work.len())
+                    .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                    .collect();
+                crate::texture::in_parallel(work.len(), |i| {
+                    let (shadow, ranges) = &work[i];
+                    let mut sum = 0;
+                    for (from, to) in ranges.iter() {
+                        sum += refresh(shadow, from, to - from, early);
+                    }
+                    copied_each[i].store(sum, Ordering::Relaxed);
+                });
+                for ((shadow, ranges), copied) in work.into_iter().zip(copied_each) {
+                    let copied = copied.into_inner();
+                    let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                    let (start, len) = shadow.range();
+                    for (from, to) in ranges.iter() {
+                        let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
+                        let (_, have) = match self.current.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(vacant) => {
+                                self.extents
+                                    .flushed(key, start as usize, (start + len) as usize);
+                                vacant.insert((shadow.clone(), Default::default()))
+                            }
+                            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+                        };
+                        have.insert(from, to, 0);
+                    }
+                    if copied > 0 {
+                        total += copied;
+                        self.copied.0 += 1;
+                        self.copied.1 += copied;
+                    }
+                }
+            } else {
+                for (shadow, ranges) in work {
+                    let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                    let (start, len) = shadow.range();
+                    let mut copied = 0;
+                    for (from, to) in ranges.iter() {
+                        copied += refresh(&shadow, from, to - from, early);
+                        let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
+                        let (_, have) = match self.current.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(vacant) => {
+                                self.extents
+                                    .flushed(key, start as usize, (start + len) as usize);
+                                vacant.insert((shadow.clone(), Default::default()))
+                            }
+                            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+                        };
+                        have.insert(from, to, 0);
+                    }
+                    if copied > 0 {
+                        total += copied;
+                        self.copied.0 += 1;
+                        self.copied.1 += copied;
+                    }
+                }
+            }
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[1].fetch_add(total as u64, Ordering::Relaxed);
+            return total;
+        }
+        if parallel {
             type RefreshOut = Vec<(usize, usize, usize, u64)>;
             let results: Vec<Mutex<RefreshOut>> =
                 (0..work.len()).map(|_| Mutex::default()).collect();

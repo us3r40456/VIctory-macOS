@@ -163,6 +163,19 @@ pub fn run(
     } else {
         println!("clzero loops   left as they are");
     }
+    #[cfg(windows)]
+    if match std::env::var("VICTORY_PATCH_INSERTQ").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => victory_gpu::rosetta(),
+    } {
+        println!(
+            "insertq sites  {} patched to native",
+            victory_loader::patch_insertq_sites(image.base() as u64, image.info())
+        );
+    } else {
+        println!("insertq sites  left as they are");
+    }
     // The title's hang watchdog off, for world loads from slow storage.
     #[cfg(windows)]
     if std::env::var_os("VICTORY_NO_HANG_WATCHDOG").is_some_and(|v| v != "0") {

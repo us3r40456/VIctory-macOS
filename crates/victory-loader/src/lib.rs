@@ -55,7 +55,7 @@ pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, nop_clwb_loops, note_title_output, patch_clzero_loops,
-    report_crashes, report_unhandled,
+    patch_insertq_sites, report_crashes, report_unhandled,
 };
 #[cfg(windows)]
 pub use patch::patch_code;
