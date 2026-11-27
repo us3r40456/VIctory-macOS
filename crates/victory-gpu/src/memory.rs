@@ -89,9 +89,57 @@ pub(crate) fn take_rewrite_profile() -> (u64, u64, u64, u64) {
 
 /// Maximum incremental aliased ops applied before running a compacting full
 /// rewrite (bounds `Layout::copies` growth and frees pairs of unmapped chunks).
-const PATCH_COMPACT_OPS: usize = 512;
+const PATCH_COMPACT_OPS: usize = 2048;
 /// Cap on `Layout::copies.len()` during incremental patching.
 const PATCH_MAX_COPIES: usize = 32_768;
+
+/// Computes the raw descriptor view window(s) for an aliased shadow covering
+/// title range `[start, start + len)` at offset `base_off` inside a backing
+/// buffer of total width `buf_width` bytes (`buf_raw = buffer.as_raw() as usize`).
+///
+/// - When `buf_width <= PIECE_VIEWED` (512 MiB), every view of the buffer shares
+///   a single [`PairKey::WholeBuffer`] pair (`first_byte = 0`, `viewed = buf_width`).
+/// - When `buf_width > PIECE_VIEWED` (e.g. 2048 MiB physical chunks), views share
+///   256 MiB-strided 512 MiB [`PairKey::SubRange`] windows (`window_start = w * 256 MiB`),
+///   so coalescing/splitting any shadows inside a multi-GiB chunk reuses at most
+///   `ceil(buf_width / 256 MiB)` fixed pairs and supports incremental patching.
+///
+/// Returns `None` if `base_off` is not 4-byte aligned or `base_off + len > buf_width`.
+fn aliased_windows(
+    buf_raw: usize,
+    buf_width: u64,
+    start: u64,
+    len: u64,
+    base_off: u64,
+) -> Option<Vec<(PairKey, u64, u64, u64, u64, u32)>> {
+    if !base_off.is_multiple_of(4) || base_off.checked_add(len).is_none_or(|end| end > buf_width) {
+        return None;
+    }
+    if buf_width <= PIECE_VIEWED {
+        let key = PairKey::WholeBuffer(buf_raw);
+        let viewed = buf_width.next_multiple_of(4);
+        let low = start.wrapping_sub(base_off) as u32;
+        return Some(vec![(key, start, len, 0, viewed, low)]);
+    }
+    let mut out = Vec::with_capacity(1);
+    let mut cur = 0u64;
+    while cur < len {
+        let b = base_off + cur;
+        let window_start = (b / PIECE) * PIECE;
+        let window_len = PIECE_VIEWED.min(buf_width - window_start).next_multiple_of(4);
+        let next_slice = window_start + PIECE;
+        // Keep sub-pieces 64 KiB aligned so every page-table entry stays whole-page;
+        // since each window views 512 MiB (256 MiB past `next_slice`), rounding up to
+        // a 64 KiB boundary always stays well within `[window_start, window_start + window_len]`.
+        let step = (next_slice - b).next_multiple_of(1 << 16).min(len - cur);
+        let p_start = start + cur;
+        let key = PairKey::SubRange(buf_raw, window_start, window_len);
+        let low = p_start.wrapping_sub(b - window_start) as u32;
+        out.push((key, p_start, step, window_start, window_len, low));
+        cur += step;
+    }
+    Some(out)
+}
 
 /// Key for a raw SRV+UAV descriptor pair held by a page table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -536,12 +584,11 @@ impl Shared {
                     // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
                     unsafe { c.buffer.GetDesc() }.Width
                 });
-                if buf_width <= PIECE_VIEWED && base.is_multiple_of(4) {
-                    let key = PairKey::WholeBuffer(buf_raw);
-                    self.live_keys.insert(key);
-                    let viewed = buf_width.next_multiple_of(4);
-                    let low = start.wrapping_sub(base) as u32;
-                    planned.push((idx, key, start, len, 0, viewed, low));
+                if let Some(windows) = aliased_windows(buf_raw, buf_width, start, len, base) {
+                    for (key, p_start, p_len, first_byte, viewed, low) in windows {
+                        self.live_keys.insert(key);
+                        planned.push((idx, key, p_start, p_len, first_byte, viewed, low));
+                    }
                     continue;
                 }
             } else {
@@ -724,57 +771,60 @@ impl Shared {
                 // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
                 unsafe { c.buffer.GetDesc() }.Width
             });
-            if buf_width > PIECE_VIEWED {
+            let Some(windows) = aliased_windows(buf_raw, buf_width, start, len, base_off) else {
                 return false;
-            }
-            let key = PairKey::WholeBuffer(buf_raw);
-            let slot = match self.pairs.get(&key) {
-                Some(&slot) => slot,
-                None => {
-                    let Some(slot) = heap.pair() else {
-                        return false;
-                    };
-                    let viewed = buf_width.next_multiple_of(4);
-                    heap.raw_pair_at(slot, Some(&c.buffer), 0, viewed);
-                    self.pairs.insert(key, slot);
-                    pairs_made += 1;
-                    slot
-                }
             };
-            let low = start.wrapping_sub(base_off) as u32;
             let new_k = layout.copies.len();
-            layout.copies.push(c);
-            let (first, last) = (start >> 16, (end - 1) >> 16);
-            let mut page = first;
-            while page <= last {
-                let l1 = (page >> 12) as usize;
-                let upto = last.min(page | 0xFFF);
-                if self.l1_table[l1] == 0 {
-                    if layout.blocks.len() > CAPACITY {
-                        return false;
-                    }
-                    let new_block = layout.blocks.len();
-                    layout.blocks.push(l1);
-                    layout.owner.resize(layout.owner.len() + BLOCK, None);
-                    let blk_dw = LEVEL1 + new_block * BLOCK * 2;
-                    for entry in dwords[blk_dw..blk_dw + BLOCK * 2].chunks_exact_mut(2) {
-                        entry[0] = self.null;
-                        entry[1] = 0;
-                    }
-                    self.l1_table[l1] = new_block as u32;
-                    dwords[l1] = new_block as u32;
+            layout.copies.push(c.clone());
+            for (key, p_start, p_len, first_byte, viewed, low) in windows {
+                if p_len == 0 || (p_start & 0xFFFF) != 0 || (p_len & 0xFFFF) != 0 {
+                    return false;
                 }
-                let base = self.l1_table[l1] as usize * BLOCK;
-                let from = (page & 0xFFF) as usize;
-                let to = (upto & 0xFFF) as usize;
-                layout.owner[base + from..=base + to].fill(Some(new_k));
-                let dw_from = LEVEL1 + (base + from) * 2;
-                let dw_to = LEVEL1 + (base + to + 1) * 2;
-                for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
-                    entry[0] = slot;
-                    entry[1] = low;
+                let slot = match self.pairs.get(&key) {
+                    Some(&slot) => slot,
+                    None => {
+                        let Some(slot) = heap.pair() else {
+                            return false;
+                        };
+                        heap.raw_pair_at(slot, Some(&c.buffer), first_byte, viewed);
+                        self.pairs.insert(key, slot);
+                        pairs_made += 1;
+                        slot
+                    }
+                };
+                let p_end = p_start + p_len;
+                let (first, last) = (p_start >> 16, (p_end - 1) >> 16);
+                let mut page = first;
+                while page <= last {
+                    let l1 = (page >> 12) as usize;
+                    let upto = last.min(page | 0xFFF);
+                    if self.l1_table[l1] == 0 {
+                        if layout.blocks.len() > CAPACITY {
+                            return false;
+                        }
+                        let new_block = layout.blocks.len();
+                        layout.blocks.push(l1);
+                        layout.owner.resize(layout.owner.len() + BLOCK, None);
+                        let blk_dw = LEVEL1 + new_block * BLOCK * 2;
+                        for entry in dwords[blk_dw..blk_dw + BLOCK * 2].chunks_exact_mut(2) {
+                            entry[0] = self.null;
+                            entry[1] = 0;
+                        }
+                        self.l1_table[l1] = new_block as u32;
+                        dwords[l1] = new_block as u32;
+                    }
+                    let base = self.l1_table[l1] as usize * BLOCK;
+                    let from = (page & 0xFFF) as usize;
+                    let to = (upto & 0xFFF) as usize;
+                    layout.owner[base + from..=base + to].fill(Some(new_k));
+                    let dw_from = LEVEL1 + (base + from) * 2;
+                    let dw_to = LEVEL1 + (base + to + 1) * 2;
+                    for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
+                        entry[0] = slot;
+                        entry[1] = low;
+                    }
+                    page = upto + 1;
                 }
-                page = upto + 1;
             }
         }
         // If a non-aliased copy arrived concurrently, fall back to a full rewrite
@@ -1740,5 +1790,65 @@ void main() {
         assert_eq!(look_up(&cleaned, base_va + 2 * PAGE as u64 + 0x30).0, null);
         list.close();
         list.reset();
+    }
+
+    #[test]
+    fn aliased_windows_cover_large_buffers_with_valid_offsets() {
+        let buf = 0x1234usize;
+        // <= 512 MiB stays WholeBuffer.
+        let small = aliased_windows(buf, 512 << 20, 0x10a4_0000, 174 << 20, 100 << 20).unwrap();
+        assert_eq!(small.len(), 1);
+        assert_eq!(small[0].0, PairKey::WholeBuffer(buf));
+        assert_eq!(small[0].3, 0);
+        assert_eq!(small[0].4, 512 << 20);
+        assert_eq!((0x10a4_0000u32).wrapping_sub(small[0].5), 100 << 20);
+
+        // 2048 MiB physical chunk with a 300 MiB shadow crossing a 256 MiB boundary
+        // (from offset 672 MiB to 972 MiB: crosses 768 MiB).
+        let big_w = 2048u64 << 20;
+        let va = 0x10a4_0000u64;
+        let base_off = 672u64 << 20;
+        let len = 300u64 << 20;
+        let wins = aliased_windows(buf, big_w, va, len, base_off).unwrap();
+        assert_eq!(wins.len(), 2, "expected 2 windows across 768 MiB boundary");
+        let mut covered = 0u64;
+        for (key, p_start, p_len, first_byte, viewed, low) in &wins {
+            assert_eq!(*p_start, va + covered);
+            assert_eq!(*p_start & 0xFFFF, 0);
+            assert_eq!(*p_len & 0xFFFF, 0);
+            assert_eq!(*first_byte % PIECE, 0);
+            assert!(*viewed <= PIECE_VIEWED);
+            assert_eq!(*key, PairKey::SubRange(buf, *first_byte, *viewed));
+            // Verify start and end title addresses resolve to exact buffer offsets in-bounds.
+            for rel in [0u64, *p_len - 4] {
+                let addr = *p_start + rel;
+                let off_in_view = (addr as u32).wrapping_sub(*low) as u64;
+                assert!(off_in_view + 4 <= *viewed, "out of view bounds: {off_in_view} vs {viewed}");
+                assert_eq!(*first_byte + off_in_view, base_off + (addr - va));
+            }
+            covered += *p_len;
+        }
+        assert_eq!(covered, len);
+
+        // Non-64KiB-aligned (4-byte-aligned) base_off near a 256 MiB boundary stays valid.
+        let tricky_off = (256u64 << 20) - 0x4000;
+        let tricky = aliased_windows(buf, 6144u64 << 20, 0x2000_0000, 128 << 16, tricky_off).unwrap();
+        let mut covered = 0u64;
+        for (_, p_start, p_len, first_byte, viewed, low) in &tricky {
+            assert_eq!(*p_start & 0xFFFF, 0);
+            assert_eq!(*p_len & 0xFFFF, 0);
+            for rel in [0u64, *p_len - 4] {
+                let addr = *p_start + rel;
+                let off_in_view = (addr as u32).wrapping_sub(*low) as u64;
+                assert!(off_in_view + 4 <= *viewed);
+                assert_eq!(*first_byte + off_in_view, tricky_off + (addr - 0x2000_0000));
+            }
+            covered += *p_len;
+        }
+        assert_eq!(covered, 128 << 16);
+
+        // Unaligned base_off or out-of-bounds rejected.
+        assert!(aliased_windows(buf, big_w, va, 65536, 2).is_none());
+        assert!(aliased_windows(buf, big_w, va, 65536, big_w).is_none());
     }
 }

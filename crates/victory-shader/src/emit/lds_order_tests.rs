@@ -26,6 +26,7 @@ const ORDER: Mac = Mac {
     uav_level0: false,
     walk: false,
     across: false,
+    relax: crate::emit::Relax::NONE,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.

@@ -145,6 +145,8 @@ pub(crate) struct Mac {
     /// and only elsewhere answered from the reader's own half. Without
     /// half-local reads that hand-over is made whatever this says.
     pub across: bool,
+    /// Console float rules left to the host's (`emit::Options::relax`).
+    pub relax: crate::emit::Relax,
 }
 
 thread_local! {

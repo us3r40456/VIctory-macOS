@@ -1926,3 +1926,96 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
     assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
 }
+
+/// Each kind of [`Relax`](crate::emit::Relax) leaves out the instructions
+/// of its own rule and no others: a program with the operation is shorter
+/// under the kinds named, the same under the rest.
+#[test]
+fn relaxed_float_rules_leave_out_their_instructions_only() {
+    use crate::emit::Relax;
+    const DS_WRITE_V1_V0: [u32; 2] = [0xD834_0000, 0x0000_0100];
+    let lower_relaxed = |words: &[u32], relax: Relax| -> Vec<u8> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            host_wave32: false,
+            narrow_waves: false,
+            halves_local: Default::default(),
+            mac: super::Mac {
+                relax,
+                ..Default::default()
+            },
+            view_marks: false,
+        })
+        .expect("lower")
+        .dxil
+    };
+    // VOP3 `op v1, v0, v0, v0`, its result stored to LDS.
+    let program = |op: u32| {
+        let mut w = vec![0x35 << 26 | op << 16 | 1, 0x100 | 0x100 << 9 | 0x100 << 18];
+        w.extend(DS_WRITE_V1_V0);
+        w.push(S_ENDPGM);
+        w
+    };
+    let none = Relax::default();
+    let kinds: [(&str, Relax); 6] = [
+        ("denormals", Relax { denormals: true, ..none }),
+        ("signed_zeros", Relax { signed_zeros: true, ..none }),
+        ("legacy_mul", Relax { legacy_mul: true, ..none }),
+        ("legacy_mul_nan", Relax { legacy_mul_nan: true, ..none }),
+        ("half_rounding", Relax { half_rounding: true, ..none }),
+        ("nan", Relax { nan: true, ..none }),
+    ];
+    let cases: [(&str, u32, &[&str]); 5] = [
+        ("v_max_f32", 0x110, &["denormals", "signed_zeros"]),
+        ("v_mul_legacy_f32", 0x107, &["legacy_mul", "legacy_mul_nan"]),
+        ("v_mul_f16", 0x135, &["half_rounding"]),
+        ("v_med3_f32", 0x157, &["denormals", "signed_zeros", "nan"]),
+        ("v_cvt_flr_i32_f32", 0x18D, &["denormals", "nan"]),
+    ];
+    for (name, op, shorter) in cases {
+        let w = program(op);
+        let exact = lower_relaxed(&w, none);
+        for (kind, relax) in kinds {
+            let relaxed = lower_relaxed(&w, relax);
+            if shorter.contains(&kind) {
+                assert!(
+                    relaxed.len() < exact.len(),
+                    "{name} under {kind}: {} against {}",
+                    relaxed.len(),
+                    exact.len()
+                );
+            } else {
+                assert!(relaxed == exact, "{name} changed under {kind}");
+            }
+        }
+    }
+}

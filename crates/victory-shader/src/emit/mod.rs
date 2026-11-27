@@ -591,6 +591,60 @@ pub struct Options {
     /// reader's own half. Without half-local reads that hand-over is always
     /// made, as in VIctory-macOS. The shader cache keys on it.
     pub halves_across: bool,
+    /// Console float rules left to the host's (all off: the console's).
+    pub relax: Relax,
+}
+
+/// The console's float rules a translation may leave to the host's instead
+/// ([`Options::relax`]), one kind each: the instructions that reproduce
+/// them cost GPU time, and what differs is noted per kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Relax {
+    /// Denormal operands of minimum, maximum and median, of the floor
+    /// conversions and of the output modifiers (x2, x4, /2) are no longer
+    /// read as zeros of their sign (the console's float mode; four integer
+    /// instructions an operand): the host's own treatment applies, so a
+    /// result may be a denormal (below 1.2e-38 in size) where the console
+    /// gives a zero.
+    pub denormals: bool,
+    /// Minimum and maximum of two zeros of different signs are the host's
+    /// (unspecified) instead of ordering -0 below +0 as on the console
+    /// (seven integer instructions an operation).
+    pub signed_zeros: bool,
+    /// Legacy multiplies (`v_mul_legacy_f32`, `v_mac_legacy_f32`) become
+    /// plain multiplies instead of forcing 0 x infinity and 0 x NaN to 0
+    /// (two compares and a select a multiply).
+    pub legacy_mul: bool,
+    /// The same multiplies as plain multiplies whose NaN and zero results
+    /// are +0 (a compare and a select): 0 x infinity and 0 x NaN stay 0 as
+    /// on the console, so no NaN is made that the console does not make,
+    /// and a zero product keeps the console's sign; a NaN operand times a
+    /// non-zero number gives 0 where the console gives NaN, and a product
+    /// of non-zero operands that underflows to -0 gives +0.
+    /// [`Relax::legacy_mul`] takes precedence.
+    pub legacy_mul_nan: bool,
+    /// 16-bit float results are rounded by the host's conversion
+    /// (`legacyF32ToF16`) instead of on the bits (about fifty integer
+    /// instructions a result): the host's rounding (toward zero on some)
+    /// and its denormal, overflow and NaN payload handling apply, so a
+    /// result may differ in the last place of an f16.
+    pub half_rounding: bool,
+    /// The median of three with a NaN among them is the host's (the console
+    /// gives the smallest number), and floor-to-integer of a NaN is the
+    /// host's (0) instead of saturating by the NaN's sign.
+    pub nan: bool,
+}
+
+impl Relax {
+    /// No console float rules relaxed (all exact).
+    pub const NONE: Self = Self {
+        denormals: false,
+        signed_zeros: false,
+        legacy_mul: false,
+        legacy_mul_nan: false,
+        half_rounding: false,
+        nan: false,
+    };
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1066,6 +1120,7 @@ fn emit_form(
             uav_level0: options.uav_size_level0,
             walk: options.halves_walk,
             across: options.halves_across,
+            relax: options.relax,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

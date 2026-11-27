@@ -225,6 +225,55 @@ pub fn halves_across() -> bool {
     crate::mac_switches::across()
 }
 
+/// The console float rules translations leave to the host's
+/// (`victory_shader::emit::Options::relax`): `exact` (none) while
+/// `VICTORY_RELAX_FLOAT` is unset, otherwise those it names as a
+/// comma-separated list of `denormals`, `signed_zeros`, `legacy_mul`,
+/// `legacy_mul_nan`, `half_rounding` and `nan`, or `safe` (`denormals` and
+/// `signed_zeros`, which change a result only between a zero of either
+/// sign and a denormal) or `all`. Each combination has its own cache
+/// entries ([`translation_build`]).
+pub fn relax() -> victory_shader::emit::Relax {
+    static RELAX: OnceLock<victory_shader::emit::Relax> = OnceLock::new();
+    *RELAX.get_or_init(|| {
+        let named = std::env::var("VICTORY_RELAX_FLOAT").unwrap_or_default();
+        let relax = relax_named(&named);
+        if relax != victory_shader::emit::Relax::default() {
+            tracing::info!(
+                ?relax,
+                "VICTORY_RELAX_FLOAT: console float rules left to the host's"
+            );
+        }
+        relax
+    })
+}
+
+/// [`relax`] for the variable's text; names it does not know are ignored.
+fn relax_named(named: &str) -> victory_shader::emit::Relax {
+    let on = |kind: &str, safe: bool| {
+        named
+            .split(',')
+            .map(str::trim)
+            .any(|n| n == kind || n == "all" || (safe && n == "safe"))
+    };
+    victory_shader::emit::Relax {
+        denormals: on("denormals", true),
+        signed_zeros: on("signed_zeros", true),
+        legacy_mul: on("legacy_mul", false),
+        legacy_mul_nan: on("legacy_mul_nan", false),
+        half_rounding: on("half_rounding", false),
+        nan: on("nan", false),
+    }
+}
+
+/// `build` for translations with console float rules relaxed.
+fn relaxed_build(build: &[u8; 32], relax: &victory_shader::emit::Relax) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(format!("relaxed float rules\n{relax:?}").as_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// Whether programs run in either of those ways here: asked for, on a host
 /// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
@@ -345,6 +394,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    let key = if options.relax != victory_shader::emit::Relax::default() {
+        relaxed_build(&key, &options.relax)
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -390,6 +444,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         uav_size_level0: crate::mac_switches::uav_size_level0(),
         halves_walk: crate::mac_switches::walk(),
         halves_across: crate::mac_switches::across(),
+        relax: relax(),
     }
 }
 
@@ -885,5 +940,60 @@ mod tests {
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+
+    #[test]
+    fn relaxed_float_rules_have_their_own_entries() {
+        use victory_shader::emit::Relax;
+        let none = Relax::default();
+        assert_eq!(relax_named("exact"), none);
+        assert_eq!(relax_named(""), none);
+        assert_eq!(relax_named("0"), none);
+        let safe = relax_named("safe");
+        assert_eq!(
+            safe,
+            Relax {
+                denormals: true,
+                signed_zeros: true,
+                ..none
+            }
+        );
+        assert_eq!(relax_named("signed_zeros, denormals"), safe);
+        assert_eq!(
+            relax_named("safe,half_rounding"),
+            Relax {
+                half_rounding: true,
+                ..safe
+            }
+        );
+        let all = relax_named("all");
+        assert_eq!(
+            all,
+            Relax {
+                denormals: true,
+                signed_zeros: true,
+                legacy_mul: true,
+                legacy_mul_nan: true,
+                half_rounding: true,
+                nan: true,
+            }
+        );
+        let one = relax_named("half_rounding");
+        assert_eq!(
+            one,
+            Relax {
+                half_rounding: true,
+                ..none
+            }
+        );
+        let base = [7u8; 32];
+        let keys = [
+            relaxed_build(&base, &safe),
+            relaxed_build(&base, &all),
+            relaxed_build(&base, &one),
+        ];
+        assert!(keys.iter().all(|k| *k != base));
+        assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2]);
+        assert_ne!(relaxed_build(&[8u8; 32], &safe), keys[0]);
     }
 }
