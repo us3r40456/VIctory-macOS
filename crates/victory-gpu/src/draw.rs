@@ -75,6 +75,11 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Raw COM pointers of the host descriptor heaps currently bound on the
+    /// host list (`None` before first bind or after `host_state_lost`): a
+    /// title heap change resolving to the exact same host heaps skips a
+    /// redundant `SetDescriptorHeaps` and avoids clearing root bindings.
+    host_heap_objs: Option<[usize; 2]>,
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -442,6 +447,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.host_heap_objs = None;
         self.host_targets = None;
     }
 
@@ -1184,12 +1190,33 @@ impl State {
                     }
                 }
             }
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            let objs = [
+                heaps
+                    .first()
+                    .and_then(|h| h.as_ref())
+                    .map_or(0, |h| h.as_raw() as usize),
+                heaps
+                    .get(1)
+                    .and_then(|h| h.as_ref())
+                    .map_or(0, |h| h.as_raw() as usize),
+            ];
+            if !(Self::same_host_heaps() && self.host_heap_objs == Some(objs)) {
+                heaps.iter().flatten().for_each(|h| list.keep(h));
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { list.list.SetDescriptorHeaps(&heaps) };
+                self.host_heap_objs = Some(objs);
+                self.host_roots = [0; 2];
+            }
             self.host_heaps = want;
-            self.host_roots = [0; 2];
         }
+    }
+
+    /// Whether switching title heaps that resolve to the same host descriptor
+    /// heaps skips `SetDescriptorHeaps` and avoids clearing root bindings
+    /// (on by default; `VICTORY_SAME_HOST_HEAPS=0` restores the old behaviour).
+    fn same_host_heaps() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !crate::switch::off("VICTORY_SAME_HOST_HEAPS"))
     }
 
     /// `ClearUnorderedAccessViewUint` or `...Float` (`float`): the view the
