@@ -69,6 +69,8 @@ pub(crate) struct Staging {
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
     copied: std::sync::atomic::AtomicU64,
+    /// Precomputed GPU compute detiling metadata (`VICTORY_GPU_DETILE`).
+    gpu: Option<(crate::gpudetile::Raw, Vec<crate::gpudetile::Job>)>,
 }
 
 /// What was last detiled. Memory not tracked keeps the bytes (compared to
@@ -148,6 +150,75 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
 const KEPT_BYTES: u64 = 64 << 20;
 const KEPT_BYTES_MAX: u64 = 256 << 20;
 
+/// Pooled DEFAULT-heap UAV buffers holding linear GPU-detiled subresources
+/// (`VICTORY_GPU_DETILE`), recycled on each submission alongside `BUFFERS`.
+struct LinearBuffers {
+    free: std::collections::VecDeque<(u64, ID3D12Resource)>,
+    free_bytes: u64,
+    used: Vec<(u64, ID3D12Resource)>,
+    lately: crate::recent::Peak,
+}
+
+static LINEAR_BUFFERS: Mutex<LinearBuffers> = Mutex::new(LinearBuffers {
+    free: std::collections::VecDeque::new(),
+    free_bytes: 0,
+    used: Vec::new(),
+    lately: crate::recent::Peak::new(),
+});
+
+/// Returns a pooled DEFAULT-heap UAV buffer of at least `size` bytes.
+fn linear_buffer(size: u64) -> Option<ID3D12Resource> {
+    let class = size.max(1 << 16).next_power_of_two();
+    let taken = {
+        let mut l = LINEAR_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = l.free.iter().position(|e| e.0 == class);
+        i.and_then(|i| l.free.remove(i)).inspect(|_| l.free_bytes -= class)
+    };
+    let e = match taken {
+        Some(e) => e,
+        None => {
+            let h = host()?;
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: class,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: valid D3D12 buffer creation.
+            let ok = unsafe {
+                h.device.CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut out,
+                )
+            }
+            .is_ok();
+            let buffer = ok.then_some(out).flatten()?;
+            crate::host::name(&buffer, || "texture gpu-detile linear".into());
+            (class, buffer)
+        }
+    };
+    let made = e.1.clone();
+    LINEAR_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
+    Some(made)
+}
+
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past what any submission needed lately,
 /// `KEPT_BYTES` to `KEPT_BYTES_MAX`), and so are its chunks, of which the
@@ -170,18 +241,33 @@ pub(crate) fn recycle() {
         (c.current, c.used) = (0, 0);
         c.all.truncate(kept);
     }
-    let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
-    let b = &mut *b;
-    let needed: u64 = b.used.iter().map(|e| e.0).sum();
-    let kept = (b.lately.begin(now, needed as usize) as u64).clamp(KEPT_BYTES, KEPT_BYTES_MAX);
-    for e in b.used.drain(..) {
-        b.free_bytes += e.0;
-        b.free.push_back(e);
-    }
-    while b.free_bytes > kept
-        && let Some((n, ..)) = b.free.pop_front()
     {
-        b.free_bytes -= n;
+        let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let b = &mut *b;
+        let needed: u64 = b.used.iter().map(|e| e.0).sum();
+        let kept = (b.lately.begin(now, needed as usize) as u64).clamp(KEPT_BYTES, KEPT_BYTES_MAX);
+        for e in b.used.drain(..) {
+            b.free_bytes += e.0;
+            b.free.push_back(e);
+        }
+        while b.free_bytes > kept
+            && let Some((n, ..)) = b.free.pop_front()
+        {
+            b.free_bytes -= n;
+        }
+    }
+    let mut l = LINEAR_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let l = &mut *l;
+    let l_needed: u64 = l.used.iter().map(|e| e.0).sum();
+    let l_kept = (l.lately.begin(now, l_needed as usize) as u64).min(KEPT_BYTES_MAX);
+    for e in l.used.drain(..) {
+        l.free_bytes += e.0;
+        l.free.push_back(e);
+    }
+    while l.free_bytes > l_kept
+        && let Some((n, _)) = l.free.pop_front()
+    {
+        l.free_bytes -= n;
     }
 }
 
@@ -448,18 +534,38 @@ pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
-    (buffer, at, subresources): &Upload,
+    upload: &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    if let Some((raw_buf, raw_at)) = &upload.gpu_detile
+        && let (Some((_, jobs)), Some(detiler)) = (&staging.gpu, crate::gpudetile::detiler())
+    {
+        crate::gpudetile::record_subset(
+            &list.list,
+            detiler,
+            raw_buf,
+            *raw_at,
+            &upload.buffer,
+            jobs,
+            &upload.subresources,
+        );
+        list.keep(raw_buf);
+    }
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources);
-    list.keep(buffer);
+    copies(
+        list,
+        &copy.texture,
+        staging,
+        (&upload.buffer, upload.at),
+        &upload.subresources,
+    );
+    list.keep(&upload.buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(upload.subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
@@ -542,9 +648,16 @@ fn copies(
     }
 }
 
-/// What a refresh gives: a staging buffer, where its space starts in it,
-/// and the subresources detiled into it.
-pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
+/// What a refresh gives: a buffer carrying the linear subresources (`buffer`
+/// at offset `at`), the subresources to copy, and an optional raw staging
+/// slice `(raw, raw_offset)` to detile on the GPU before `CopyTextureRegion`.
+#[derive(Clone)]
+pub(crate) struct Upload {
+    buffer: ID3D12Resource,
+    at: u64,
+    subresources: Vec<u32>,
+    gpu_detile: Option<(ID3D12Resource, u64)>,
+}
 
 /// The texture workers: up to a quarter of the CPUs (four at most), none
 /// where that is fewer than two.
@@ -710,7 +823,15 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
+            return (
+                bytes,
+                buffer.map(|(buffer, at, gpu_detile)| Upload {
+                    buffer,
+                    at,
+                    subresources: fresh,
+                    gpu_detile,
+                }),
+            );
         }
         // Compared with the bytes last detiled, which tracked memory does
         // not keep. Hashing them instead ran at 0.45 GB/s under Wine on
@@ -764,7 +885,15 @@ impl Staging {
             let every = all();
             let buffer = self.detile(&zeros, &every);
             last.uploaded = buffer.is_some();
-            return (0, buffer.map(|(b, at)| (b, at, every)));
+            return (
+                0,
+                buffer.map(|(buffer, at, gpu_detile)| Upload {
+                    buffer,
+                    at,
+                    subresources: every,
+                    gpu_detile,
+                }),
+            );
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -796,13 +925,53 @@ impl Staging {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, fresh)))
+        (
+            size,
+            buffer.map(|(buffer, at, gpu_detile)| Upload {
+                buffer,
+                at,
+                subresources: fresh,
+                gpu_detile,
+            }),
+        )
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
-    /// staging buffer (`None` if none could be had or a subresource could
-    /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+    /// staging buffer, or copies raw tiled bytes into staging for GPU compute
+    /// detiling (`VICTORY_GPU_DETILE`) when enabled.
+    fn detile(
+        &self,
+        tiled: &[u8],
+        subresources: &[u32],
+    ) -> Option<(ID3D12Resource, u64, Option<(ID3D12Resource, u64)>)> {
+        if let Some((raw, _)) = &self.gpu
+            && crate::gpudetile::on()
+            && crate::gpudetile::detiler().is_some()
+        {
+            let started = std::time::Instant::now();
+            let (raw_buf, raw_at, raw_data) = staging_space(raw.bytes)?;
+            let linear = linear_buffer(self.size.next_multiple_of(4))?;
+            let copy_len = (self.layout.size as usize).min(tiled.len());
+            // SAFETY: `raw_data` has `raw.bytes >= layout.size` writable bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(tiled.as_ptr(), raw_data, copy_len);
+                if copy_len < self.layout.size as usize {
+                    std::ptr::write_bytes(
+                        raw_data.add(copy_len),
+                        0,
+                        self.layout.size as usize - copy_len,
+                    );
+                }
+                crate::gpudetile::write_metadata(&self.layout, raw, raw_data, u32::MAX);
+            }
+            crate::gpudetile::STATS[2]
+                .fetch_add(copy_len as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::gpudetile::STATS[3].fetch_add(
+                started.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return Some((linear, 0, Some((raw_buf, raw_at))));
+        }
         let (buffer, at, data) = staging_space(self.size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
@@ -836,7 +1005,7 @@ impl Staging {
                 return None;
             }
         }
-        Some((buffer, at))
+        Some((buffer, at, None))
     }
 }
 
@@ -1134,6 +1303,21 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let gpu = if crate::gpudetile::on() && crate::gpudetile::detiler().is_some() {
+        let raw = crate::gpudetile::raw_layout(&layout);
+        match crate::gpudetile::jobs(&layout, &footprints, &rows, u32::from(d.MipLevels), &raw) {
+            Some(jobs) => {
+                crate::gpudetile::STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some((raw, jobs))
+            }
+            None => {
+                crate::gpudetile::STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let s = Arc::new(Staging {
         size: total,
         footprints,
@@ -1148,6 +1332,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         last: Mutex::default(),
         uploads: Default::default(),
         copied: Default::default(),
+        gpu,
     });
     *held = Some(s.clone());
     Some(s)

@@ -79,6 +79,30 @@ impl Swizzle {
     pub fn xor(self) -> bool {
         self.0 >= 16
     }
+
+    /// The mode's name as addrlib writes it, without `ADDR_SW_` (`"?"` for
+    /// a number GFX10 has no mode for).
+    pub fn name(self) -> &'static str {
+        match self.0 {
+            0 => "LINEAR",
+            1 => "256B_S",
+            2 => "256B_D",
+            5 => "4KB_S",
+            6 => "4KB_D",
+            9 => "64KB_S",
+            10 => "64KB_D",
+            17 => "64KB_S_T",
+            18 => "64KB_D_T",
+            21 => "4KB_S_X",
+            22 => "4KB_D_X",
+            23 => "4KB_R_X",
+            24 => "64KB_Z_X",
+            25 => "64KB_S_X",
+            26 => "64KB_D_X",
+            27 => "64KB_R_X",
+            _ => "?",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -577,6 +601,51 @@ impl Layout {
         Ok(base + self.row(m, y, z) + self.column(m, x))
     }
 
+    /// What a shader needs to detile one subresource exactly as
+    /// [`Layout::detile`] does (`victory-gpu`'s card detiling,
+    /// `VICTORY_GPU_DETILE`): the same checks, and the numbers its address
+    /// arithmetic takes. The pattern tables it reads are
+    /// [`Layout::pattern_tables`]. `None` where `detile` would fail, and for
+    /// layouts whose offsets do not fit 32 bits (the shader's arithmetic).
+    pub fn detile_params(&self, mip: u32, slice: u32) -> Option<DetileParams> {
+        let m = self.mips.get(mip as usize)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return None;
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices || !self.addressable() || self.size > u64::from(u32::MAX >> 1) {
+            return None;
+        }
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        Some(DetileParams {
+            linear,
+            element_bytes: self.desc.element_bytes,
+            width: m.width,
+            height: m.height,
+            depth: m.depth,
+            first,
+            slab: if self.thick { self.block[2] } else { 1 },
+            slice_size: self.slice_size as u32,
+            mip_offset: m.offset as u32,
+            pitch: m.pitch,
+            block_w: self.block[0],
+            block_h: self.block[1],
+            block_log2: self.alignment.trailing_zeros(),
+            tail_x: m.tail.map_or(0, |t| t.x),
+            tail_y: m.tail.map_or(0, |t| t.y),
+        })
+    }
+
+    /// The byte offsets inside a block of each element coordinate along x,
+    /// y and z (block width, height and depth entries; empty for linear).
+    pub fn pattern_tables(&self) -> [&[u32]; 3] {
+        [&self.pattern[0], &self.pattern[1], &self.pattern[2]]
+    }
+
     /// The part of an address that depends on the row (and depth in a
     /// thick block).
     fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
@@ -822,6 +891,53 @@ pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(us
         end -= BLOCK;
     }
     walk_changed(at + start, &mut kept[start..end], &fresh[start..end], runs);
+}
+
+/// One subresource's detiling as a shader does it ([`Layout::detile_params`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetileParams {
+    pub linear: bool,
+    pub element_bytes: u32,
+    /// The subresource in elements.
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    /// The array slice (0 for 3D).
+    pub first: u32,
+    /// Depth slices a slice of the layout holds (thick 3D: the block's
+    /// depth; else 1).
+    pub slab: u32,
+    pub slice_size: u32,
+    pub mip_offset: u32,
+    /// The mip's padded width in elements.
+    pub pitch: u32,
+    pub block_w: u32,
+    pub block_h: u32,
+    pub block_log2: u32,
+    pub tail_x: u32,
+    pub tail_y: u32,
+}
+
+impl DetileParams {
+    /// The tiled byte offset of element (`x`, `y`, `z`) of the subresource,
+    /// by the arithmetic the shader does, with the tables of
+    /// [`Layout::pattern_tables`].
+    pub fn address(&self, tables: [&[u32]; 3], x: u32, y: u32, z: u32) -> u64 {
+        let z = self.first + z;
+        let (slice, inner) = (z / self.slab, z % self.slab);
+        let base = u64::from(slice) * u64::from(self.slice_size) + u64::from(self.mip_offset);
+        let n = u64::from(self.element_bytes);
+        if self.linear {
+            return base + (u64::from(y) * u64::from(self.pitch) + u64::from(x)) * n;
+        }
+        let (x, y) = (x + self.tail_x, y + self.tail_y);
+        let row = (u64::from(y / self.block_h) * u64::from(self.pitch / self.block_w)) << self.block_log2;
+        let column = u64::from(x / self.block_w) << self.block_log2;
+        base + row
+            + column
+            + u64::from(tables[1][(y % self.block_h) as usize] | tables[2][inner as usize])
+            + u64::from(tables[0][(x % self.block_w) as usize])
+    }
 }
 
 enum Buffers<'a> {
@@ -1451,6 +1567,57 @@ mod tests {
             let at = l.offset(mip, x, y, z);
             assert_eq!(at, Ok(address), "mip {mip} ({x},{y},{z})");
         }
+    }
+
+    /// The shader's arithmetic ([`DetileParams::address`]) lands every
+    /// element where [`Layout::offset`] does, in every addressable mode,
+    /// mip tails, arrays and thick 3D included.
+    #[test]
+    fn detile_params_address_every_element_as_offset_does() {
+        let mut cases = vec![
+            Desc { block: 4, ..desc(4096, 4096, 13, 16, Swizzle::SW_64KB_S) },
+            Desc { block: 4, ..desc(1000, 600, 10, 8, Swizzle::SW_64KB_D) },
+            Desc { block: 4, ..desc(256, 256, 9, 16, Swizzle::SW_4KB_S) },
+            desc(300, 200, 9, 4, Swizzle::SW_4KB_D),
+            desc(129, 65, 8, 1, Swizzle::SW_64KB_S),
+            desc(77, 33, 7, 2, Swizzle::SW_256B_S),
+            desc(64, 64, 7, 8, Swizzle::SW_256B_D),
+            desc(30, 20, 5, 4, Swizzle::LINEAR),
+            Desc { depth: 6, ..desc(128, 128, 8, 4, Swizzle::SW_4KB_S) },
+            Desc { dimension: Dimension::Tex3d, depth: 16, ..desc(64, 32, 7, 4, Swizzle::SW_4KB_S) },
+            Desc { dimension: Dimension::Tex3d, depth: 40, ..desc(33, 20, 6, 2, Swizzle::SW_64KB_S) },
+            Desc { dimension: Dimension::Tex3d, depth: 5, ..desc(20, 12, 3, 4, Swizzle::LINEAR) },
+        ];
+        for e in 0..5 {
+            cases.push(desc(97, 61, 7, 1 << e, Swizzle::SW_64KB_S));
+        }
+        for d in cases {
+            let l = Layout::new(&d).unwrap();
+            let tables = l.pattern_tables();
+            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            for slice in 0..slices {
+                for mip in 0..l.mips.len() as u32 {
+                    let p = l.detile_params(mip, slice).unwrap();
+                    let step = (p.width / 64).max(1);
+                    for z in 0..p.depth {
+                        for y in (0..p.height).step_by(step as usize) {
+                            for x in 0..p.width {
+                                assert_eq!(
+                                    p.address(tables, x, y, z),
+                                    l.offset(mip, x, y, slice + z).unwrap(),
+                                    "{d:?} mip {mip} slice {slice} ({x},{y},{z})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let xor = Layout::new(&desc(64, 64, 1, 4, Swizzle::SW_64KB_S_X)).unwrap();
+        assert_eq!(xor.detile_params(0, 0), None);
+        let l = Layout::new(&desc(64, 64, 3, 4, Swizzle::SW_4KB_S)).unwrap();
+        assert_eq!(l.detile_params(3, 0), None);
+        assert_eq!(l.detile_params(0, 1), None);
     }
 
     /// Layouts as AMD's addrlib computes them (Mesa `src/amd/addrlib` at ed09d38,

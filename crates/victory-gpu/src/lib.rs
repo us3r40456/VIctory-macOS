@@ -63,6 +63,8 @@ pub mod fence;
 #[cfg(any(windows, test))]
 mod flights;
 pub mod frame;
+#[cfg(windows)]
+mod gpudetile;
 mod hold;
 #[cfg(windows)]
 mod host;
