@@ -39,7 +39,7 @@ if [ -z "${VICTORY_HELPER_DXC:-}" ] && [ -f "$DXC_LIB" ]; then
         export DXC_LIB VICTORY_HELPER_DXC="$helper"
     fi
 fi
-if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ]; then
+if [ "${VICTORY_DIAGNOSTICS:-0}" = 1 ] || { [ -n "${VICTORY_TRACE_INIT:-}" ] && [ "${VICTORY_TRACE_INIT}" != 0 ]; }; then
     cargo build --quiet --release -p victory --features diagnostics --target "$TARGET"
 else
     cargo build --quiet --release -p victory --target "$TARGET"

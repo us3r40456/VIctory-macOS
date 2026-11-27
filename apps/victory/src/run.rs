@@ -275,6 +275,15 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
+    // SAFETY: `image` is the mapped main image for `hash` and no title thread has started.
+    unsafe {
+        victory_loader::init_gate::start(
+            &hash,
+            image.base(),
+            image.info().size_of_image as usize,
+        )?;
+    }
+    #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
@@ -292,6 +301,8 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    #[cfg(feature = "diagnostics")]
+    victory_loader::init_gate::on_title_exit();
     println!("title exited with {code}");
     Ok(code)
 }

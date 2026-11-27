@@ -23,6 +23,8 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod init_gate;
 pub mod masked;
 pub mod wide;
 #[cfg(windows)]
