@@ -93,6 +93,15 @@ pub(crate) fn note(p: &Arc<Pending>) {
 /// The frame [`runs`] last decided for, and its decision.
 static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
 
+/// Opt-in (`VICTORY_BVH_SKIP=1`): hold back the acceleration-structure
+/// builder even when all of its pipelines translate (e.g. when indirect
+/// lighting is provided by `VICTORY_AMBIENT=estimate` and ray passes are
+/// skipped by `VICTORY_RAY_SKIP`).
+fn force_hold_back() -> bool {
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| crate::switch::on("VICTORY_BVH_SKIP"))
+}
+
 /// Whether the builder's dispatches run in the current frame: decided once
 /// per frame, so that a frame never runs part of the builder.
 pub(crate) fn runs() -> bool {
@@ -112,7 +121,8 @@ pub(crate) fn runs() -> bool {
             .collect()
     };
     let halves = crate::shader_cache::halves_local_here();
-    let open = opens(&states, halves);
+    let forced = force_hold_back();
+    let open = !forced && opens(&states, halves);
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -126,6 +136,8 @@ pub(crate) fn runs() -> bool {
             "BVH builder {}",
             if open {
                 "runs"
+            } else if forced {
+                "held back (VICTORY_BVH_SKIP=1)"
             } else if halves {
                 "held back: its 64-lane programs would run as 32-lane halves on their own (VICTORY_HALVES_LOCAL, VICTORY_HALVES_SHARED_LDS)"
             } else {

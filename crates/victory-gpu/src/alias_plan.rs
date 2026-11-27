@@ -82,20 +82,24 @@ pub(crate) fn plan(
 }
 
 /// Whether a fresh commit of `len` bytes should be aliased under optional
-/// per-region minimum size (`min_bytes`) and total wired-memory budget
-/// (`budget_bytes`) caps.
+/// per-region minimum (`min_bytes`), per-region maximum (`max_bytes`), and
+/// total wired-memory budget (`budget_bytes`) caps.
 ///
-/// Used on 24 GB unified-memory Macs (`VICTORY_ALIAS_MIN_MB`,
-/// `VICTORY_ALIAS_BUDGET_MB`) to alias only the largest hot heaps (such as
-/// the 174 MiB constants heap) without letting total wired memory grow out
-/// of bounds.
+/// Used on unified-memory Macs (`VICTORY_ALIAS_MIN_MB`,
+/// `VICTORY_ALIAS_MAX_MB`, `VICTORY_ALIAS_BUDGET_MB`) to alias CPU-written
+/// heaps while optionally keeping giant GPU-written UAV heaps (> max) in
+/// private compressed host GPU memory.
 pub(crate) fn region_within_limits(
     len: usize,
     current_aliased: usize,
     min_bytes: Option<usize>,
+    max_bytes: Option<usize>,
     budget_bytes: Option<usize>,
 ) -> bool {
     if min_bytes.is_some_and(|min| len < min) {
+        return false;
+    }
+    if max_bytes.is_some_and(|max| len > max) {
         return false;
     }
     if budget_bytes.is_some_and(|budget| current_aliased.saturating_add(len) > budget) {
@@ -217,24 +221,30 @@ mod tests {
         assert_eq!(parse_mib("abc"), None);
 
         // No limits: everything passes.
-        assert!(region_within_limits(PAGE, 0, None, None));
+        assert!(region_within_limits(PAGE, 0, None, None, None));
 
         // Min size filters out small heaps while allowing the 174 MiB constants heap.
-        assert!(!region_within_limits(4 * MB, 0, Some(32 * MB), None));
-        assert!(region_within_limits(32 * MB, 0, Some(32 * MB), None));
-        assert!(region_within_limits(174 * MB, 0, Some(32 * MB), None));
+        assert!(!region_within_limits(4 * MB, 0, Some(32 * MB), None, None));
+        assert!(region_within_limits(32 * MB, 0, Some(32 * MB), None, None));
+        assert!(region_within_limits(174 * MB, 0, Some(32 * MB), None, None));
+
+        // Max size excludes giant GPU-written UAV heaps (> 512 MiB) while allowing CPU heaps.
+        assert!(region_within_limits(258 * MB, 0, None, Some(512 * MB), None));
+        assert!(!region_within_limits(1162 * MB, 0, None, Some(512 * MB), None));
 
         // Total budget caps cumulative aliased bytes.
         assert!(region_within_limits(
             174 * MB,
             300 * MB,
             Some(32 * MB),
+            Some(512 * MB),
             Some(512 * MB)
         ));
         assert!(!region_within_limits(
             174 * MB,
             400 * MB,
             Some(32 * MB),
+            Some(512 * MB),
             Some(512 * MB)
         ));
     }

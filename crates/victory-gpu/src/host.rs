@@ -218,6 +218,62 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Opt-in lightweight submission GPU profiler (`VICTORY_SUBMISSION_PROFILE=1`):
+/// records each submission's GPU wait time by pipeline summary in pure release
+/// builds so GPU hotspots are visible without diagnostics overhead.
+fn submission_profile_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SUBMISSION_PROFILE"))
+}
+
+static SUB_PROFILE: Mutex<Vec<(f64, usize, String)>> = Mutex::new(Vec::new());
+
+fn note_submission_profile(gpu: Duration, runs: &[&HostList]) {
+    if !submission_profile_on() {
+        return;
+    }
+    let ms = gpu.as_secs_f64() * 1e3;
+    if ms < 1.0 {
+        return;
+    }
+    let mut pipes: Vec<String> = runs
+        .iter()
+        .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .collect();
+    pipes.sort();
+    pipes.dedup();
+    let count = pipes.len();
+    let sample = if pipes.len() > 6 {
+        format!("{}, ... ({count} total)", pipes[..6].join(", "))
+    } else {
+        pipes.join(", ")
+    };
+    SUB_PROFILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((ms, runs.len(), sample));
+}
+
+fn log_submission_profile(frames: f64) {
+    if !submission_profile_on() {
+        return;
+    }
+    let mut entries = std::mem::take(&mut *SUB_PROFILE.lock().unwrap_or_else(|e| e.into_inner()));
+    if entries.is_empty() {
+        return;
+    }
+    let total_ms: f64 = entries.iter().map(|e| e.0).sum();
+    let count = entries.len();
+    entries.sort_by(|a, b| b.0.total_cmp(&a.0));
+    tracing::info!(
+        "submission profile (VICTORY_SUBMISSION_PROFILE): {count} subs >=1ms, {:.1} ms/frame total (top 10):",
+        total_ms / frames.max(1.0)
+    );
+    for (ms, lists, sample) in entries.into_iter().take(10) {
+        tracing::info!("  sub {ms:.1} ms ({lists} lists): [{sample}]");
+    }
+}
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -2253,6 +2309,7 @@ impl Host {
     /// submission finished later ([`unwaited`]), whose finisher keeps it.
     fn finish(&self, submitted: Option<std::sync::MutexGuard<'_, u64>>, runs: &[&HostList], ran: Ran) {
         let Ran { gpu, removed_in, batch, heaps, traced } = ran;
+        note_submission_profile(gpu, runs);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -5074,6 +5131,7 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);
+            log_submission_profile(report_frames);
             crate::ray_skip::log(report_frames);
             crate::texback::log(report_frames);
             crate::physical_runs::log(report_frames);

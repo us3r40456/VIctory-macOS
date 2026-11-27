@@ -279,6 +279,7 @@ pub fn enabled() -> bool {
         if on {
             tracing::info!(
                 min_mb = alias_min_bytes().map(|b| b >> 20).unwrap_or(0),
+                max_mb = alias_max_bytes().map(|b| b >> 20).unwrap_or(0),
                 budget_mb = alias_budget_bytes().map(|b| b >> 20).unwrap_or(0),
                 "VICTORY_ALIAS_BUFFERS: read-write title memory committed in 64 KiB pages shares its pages with host \
                  buffers (mach_vm_remap, VIctory-macOS #207, #322): title buffers there are neither copied nor copied \
@@ -742,6 +743,17 @@ fn alias_min_bytes() -> Option<usize> {
     })
 }
 
+/// Maximum single-allocation size (in bytes) eligible for aliasing when
+/// `VICTORY_ALIAS_MAX_MB` is set (unset or 0 = no maximum).
+fn alias_max_bytes() -> Option<usize> {
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_ALIAS_MAX_MB")
+            .ok()
+            .and_then(|s| crate::alias_plan::parse_mib(&s))
+    })
+}
+
 /// Cumulative aliased-memory cap (in bytes) when `VICTORY_ALIAS_BUDGET_MB` is
 /// set (unset or 0 = unbounded).
 fn alias_budget_bytes() -> Option<usize> {
@@ -766,6 +778,7 @@ fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
         len,
         aliased_bytes as usize,
         alias_min_bytes(),
+        alias_max_bytes(),
         alias_budget_bytes(),
     ) {
         return false;

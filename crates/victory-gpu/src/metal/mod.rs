@@ -524,7 +524,7 @@ pub fn note_committed(base: usize, len: usize, backing: registry::BackingKey) {
         return;
     };
     let current = b.stats().map_or(0, |s| s.active_bytes as usize);
-    if !crate::alias_plan::region_within_limits(len, current, min_bytes(), budget_bytes()) {
+    if !crate::alias_plan::region_within_limits(len, current, min_bytes(), None, budget_bytes()) {
         return;
     }
     if let Some((buf, reused)) = b.register_buffer(base as u64, len as u64, backing, false)

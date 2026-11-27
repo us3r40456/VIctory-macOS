@@ -73,12 +73,21 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) const RESOLVE: u8 = 1;
 /// The screen probes' ray activation.
 pub(crate) const ACTIVATE: u8 = 2;
+/// Pure BVH ray-tracing compute passes (`VICTORY_RAY_SKIP=full` or `trace`),
+/// skipped only when the BVH builder is held back (`VICTORY_BVH_SKIP=1`).
+pub(crate) const TRACE: u8 = 4;
 
 /// The programs' names, as their shader containers hold them (followed by
 /// a part of their own and `_Wrapped`).
-const NAMES: [(u8, &[u8]); 2] = [
+const NAMES: [(u8, &[u8]); 8] = [
     (RESOLVE, b"CS_RaytracingResolve"),
     (ACTIVATE, b"CS_ScreenProbes_ActivateRays"),
+    (TRACE, b"CS_RaytraceVBuffer"),
+    (TRACE, b"CS_ScreenProbes_TraceRays"),
+    (TRACE, b"CS_RTShadowTrace"),
+    (TRACE, b"CS_LaserLightShadowRaytracing"),
+    (TRACE, b"CS_RayBudgeting"),
+    (TRACE, b"CS_RayPrePass"),
 ];
 
 /// The parts `value` of `VICTORY_RAY_SKIP` turns on, and whether it was
@@ -92,8 +101,10 @@ fn parts(value: Option<&str>) -> (u8, bool) {
     for part in value.split(',').map(str::trim) {
         parts |= match part.to_ascii_lowercase().as_str() {
             "1" | "on" | "all" => RESOLVE | ACTIVATE,
+            "full" => RESOLVE | ACTIVATE | TRACE,
             "resolve" => RESOLVE,
             "activate" => ACTIVATE,
+            "trace" => TRACE,
             _ => return (0, false),
         };
     }
@@ -118,7 +129,13 @@ pub(crate) fn on() -> u8 {
 
 /// The line said at start when something is left out.
 fn start_line(parts: u8) -> Option<String> {
+    let trace_extra = if parts & TRACE != 0 {
+        " + BVH ray-trace passes (trace)"
+    } else {
+        ""
+    };
     let what = match parts & (RESOLVE | ACTIVATE) {
+        0 if parts & TRACE != 0 => "BVH ray-trace passes (trace)",
         0 => return None,
         RESOLVE => {
             "CS_RaytracingResolve (the shading of reflection hits, one program per material)"
@@ -129,8 +146,13 @@ fn start_line(parts: u8) -> Option<String> {
              and CS_ScreenProbes_ActivateRays (the screen probes' choice of rays)"
         }
     };
+    let suffix = if parts & (RESOLVE | ACTIVATE) != 0 {
+        trace_extra
+    } else {
+        ""
+    };
     Some(format!(
-        "VICTORY_RAY_SKIP: in frames where the BVH builder is held back, dispatches of {what} \
+        "VICTORY_RAY_SKIP: in frames where the BVH builder is held back, dispatches of {what}{suffix} \
          are left out (their pipelines are still made)"
     ))
 }
@@ -155,8 +177,8 @@ fn kind_of(container: &[u8]) -> u8 {
 /// hash as logged.
 static PROGRAMS: Mutex<Option<HashMap<String, u8>>> = Mutex::new(None);
 
-/// Programs known so far, by part (resolves, activation).
-static KNOWN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Programs known so far, by part (resolves, activation, trace).
+static KNOWN: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// The title passed the shader container `container` of `stage` for the
 /// first time, `hash` as logged: remembered if a part that is on leaves
@@ -170,7 +192,7 @@ pub(crate) fn note_program(stage: &str, hash: &str, container: &[u8]) {
     if kind == 0 {
         return;
     }
-    for (i, part) in [RESOLVE, ACTIVATE].into_iter().enumerate() {
+    for (i, part) in [RESOLVE, ACTIVATE, TRACE].into_iter().enumerate() {
         if kind & part != 0 && KNOWN[i].fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::info!(
                 hash,
@@ -189,6 +211,8 @@ pub(crate) fn note_program(stage: &str, hash: &str, container: &[u8]) {
 fn name(part: u8) -> &'static str {
     if part == ACTIVATE {
         "CS_ScreenProbes_ActivateRays"
+    } else if part == TRACE {
+        "BVH ray-trace compute"
     } else {
         "CS_RaytracingResolve"
     }
@@ -210,11 +234,17 @@ pub(crate) fn kind<'a>(hashes: impl Iterator<Item = &'a str>) -> u8 {
 }
 
 /// Dispatches left out since the last [`log`], by part.
-static LEFT_OUT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static LEFT_OUT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// A dispatch of a pipeline of `kind` was left out.
 pub(crate) fn left_out(kind: u8) {
-    let i = usize::from(kind & RESOLVE == 0);
+    let i = if kind & RESOLVE != 0 {
+        0
+    } else if kind & ACTIVATE != 0 {
+        1
+    } else {
+        2
+    };
     LEFT_OUT[i].fetch_add(1, Ordering::Relaxed);
 }
 
@@ -238,7 +268,13 @@ pub(crate) fn log(frames: f64) {
     }
     let left = LEFT_OUT.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
     let known = KNOWN.each_ref().map(|n| n.load(Ordering::Relaxed));
-    tracing::info!("{}", frame_line(left, frames, known));
+    let base = frame_line([left[0], left[1]], frames, [known[0], known[1]]);
+    if on() & TRACE != 0 {
+        let trace = left[2] as f64 / frames.max(1.0);
+        tracing::info!("{base}; +{trace:.1} ray-trace dispatches/frame (known {})", known[2]);
+    } else {
+        tracing::info!("{base}");
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +292,8 @@ mod tests {
         assert_eq!(parts(Some("resolve")), (RESOLVE, true));
         assert_eq!(parts(Some(" Activate ")), (ACTIVATE, true));
         assert_eq!(parts(Some("resolve, activate")), (RESOLVE | ACTIVATE, true));
+        assert_eq!(parts(Some("full")), (RESOLVE | ACTIVATE | TRACE, true));
+        assert_eq!(parts(Some("trace")), (TRACE, true));
         assert_eq!(parts(Some("yes")), (0, false));
         assert_eq!(parts(Some("resolve,x")), (0, false));
     }
@@ -284,9 +322,13 @@ mod tests {
         );
         assert_eq!(
             kind_of(&container("CS_ScreenProbes_TraceRays_RayBinning_BVH")),
+            TRACE
+        );
+        assert_eq!(kind_of(&container("CS_RaytraceVBuffer")), TRACE);
+        assert_eq!(
+            kind_of(&container("CS_RaytraceVBuffer")) & (RESOLVE | ACTIVATE),
             0
         );
-        assert_eq!(kind_of(&container("CS_RaytraceVBuffer")), 0);
         assert_eq!(kind_of(&container("CS_RaytracingResolv")), 0);
         assert_eq!(kind_of(b""), 0);
     }
