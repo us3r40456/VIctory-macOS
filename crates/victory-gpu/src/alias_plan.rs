@@ -81,6 +81,36 @@ pub(crate) fn plan(
     }
 }
 
+/// Whether a fresh commit of `len` bytes should be aliased under optional
+/// per-region minimum size (`min_bytes`) and total wired-memory budget
+/// (`budget_bytes`) caps.
+///
+/// Used on 24 GB unified-memory Macs (`VICTORY_ALIAS_MIN_MB`,
+/// `VICTORY_ALIAS_BUDGET_MB`) to alias only the largest hot heaps (such as
+/// the 174 MiB constants heap) without letting total wired memory grow out
+/// of bounds.
+pub(crate) fn region_within_limits(
+    len: usize,
+    current_aliased: usize,
+    min_bytes: Option<usize>,
+    budget_bytes: Option<usize>,
+) -> bool {
+    if min_bytes.is_some_and(|min| len < min) {
+        return false;
+    }
+    if budget_bytes.is_some_and(|budget| current_aliased.saturating_add(len) > budget) {
+        return false;
+    }
+    true
+}
+
+/// Parses an integer MiB threshold from an environment variable string.
+/// Values of `0` or invalid strings return `None` (no limit).
+pub(crate) fn parse_mib(raw: &str) -> Option<usize> {
+    let mb: usize = raw.trim().parse().ok()?;
+    (mb > 0).then(|| mb.saturating_mul(1 << 20))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +206,36 @@ mod tests {
             &alias,
         );
         assert_eq!(p.again, vec![(A + PAGE, A + 2 * PAGE)]);
+    }
+
+    #[test]
+    fn selective_alias_limits_respect_min_and_budget() {
+        const MB: usize = 1 << 20;
+        assert_eq!(parse_mib("64"), Some(64 * MB));
+        assert_eq!(parse_mib(" 512 "), Some(512 * MB));
+        assert_eq!(parse_mib("0"), None);
+        assert_eq!(parse_mib("abc"), None);
+
+        // No limits: everything passes.
+        assert!(region_within_limits(PAGE, 0, None, None));
+
+        // Min size filters out small heaps while allowing the 174 MiB constants heap.
+        assert!(!region_within_limits(4 * MB, 0, Some(32 * MB), None));
+        assert!(region_within_limits(32 * MB, 0, Some(32 * MB), None));
+        assert!(region_within_limits(174 * MB, 0, Some(32 * MB), None));
+
+        // Total budget caps cumulative aliased bytes.
+        assert!(region_within_limits(
+            174 * MB,
+            300 * MB,
+            Some(32 * MB),
+            Some(512 * MB)
+        ));
+        assert!(!region_within_limits(
+            174 * MB,
+            400 * MB,
+            Some(32 * MB),
+            Some(512 * MB)
+        ));
     }
 }

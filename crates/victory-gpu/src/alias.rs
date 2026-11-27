@@ -278,6 +278,8 @@ pub fn enabled() -> bool {
         let on = decide_enabled(asked, rosetta, warp) && split.is_some() && !flights;
         if on {
             tracing::info!(
+                min_mb = alias_min_bytes().map(|b| b >> 20).unwrap_or(0),
+                budget_mb = alias_budget_bytes().map(|b| b >> 20).unwrap_or(0),
                 "VICTORY_ALIAS_BUFFERS: read-write title memory committed in 64 KiB pages shares its pages with host \
                  buffers (mach_vm_remap, VIctory-macOS #207, #322): title buffers there are neither copied nor copied \
                  back; shaders' writes there mark the other trackers without opening guards (fault tracking {}); \
@@ -729,12 +731,43 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
     alias_locked(base, len, preserve_contents)
 }
 
+/// Minimum allocation size (in bytes) eligible for aliasing when
+/// `VICTORY_ALIAS_MIN_MB` is set (unset or 0 = no minimum).
+fn alias_min_bytes() -> Option<usize> {
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_ALIAS_MIN_MB")
+            .ok()
+            .and_then(|s| crate::alias_plan::parse_mib(&s))
+    })
+}
+
+/// Cumulative aliased-memory cap (in bytes) when `VICTORY_ALIAS_BUDGET_MB` is
+/// set (unset or 0 = unbounded).
+fn alias_budget_bytes() -> Option<usize> {
+    static BUDGET: OnceLock<Option<usize>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_ALIAS_BUDGET_MB")
+            .ok()
+            .and_then(|s| crate::alias_plan::parse_mib(&s))
+    })
+}
+
 /// [`alias_region`], under [`LOCK`].
 fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
     let Some(zeroed) = supported() else {
         return false;
     };
     if base == 0 || len < PAGE || !base.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
+        return false;
+    }
+    let (_, aliased_bytes) = crate::shadow::aliased_totals();
+    if !crate::alias_plan::region_within_limits(
+        len,
+        aliased_bytes as usize,
+        alias_min_bytes(),
+        alias_budget_bytes(),
+    ) {
         return false;
     }
     let Some(end) = base.checked_add(len) else {
