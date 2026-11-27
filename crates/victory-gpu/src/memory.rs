@@ -392,6 +392,7 @@ struct Stats {
     withheld_bytes: u64,
     missed_pages: u64,
     missed_regions: u64,
+    ignored_null_pages: u64,
     first_missed: Vec<u64>,
 }
 
@@ -492,13 +493,34 @@ fn retake_dropped() {
     }
 }
 
+pub(crate) fn profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MEMORY_PROFILE"))
+}
+
+fn ignore_unmapped_null_page() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::switch::on("VICTORY_IGNORE_UNMAPPED_NULL_PAGE")
+            && crate::device::user_space().0 >= 1 << 16
+    })
+}
+
 /// Logs what title memory did since the last call, if anything: a line per
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let retake_started = profile_on().then(std::time::Instant::now);
     retake_dropped();
+    if let Some(started) = retake_started {
+        tracing::info!(us = started.elapsed().as_micros() as u64, "end-of-frame title memory retake");
+        crate::shadow::log_copy_sources();
+    }
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
+    if s.uses.is_empty()
+        && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions
+            + s.ignored_null_pages == 0
+    {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
@@ -508,7 +530,7 @@ pub(crate) fn log_frame() {
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         and {} 256 MiB regions with no copy (first: {}), {} page-zero misses ignored",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -517,7 +539,8 @@ pub(crate) fn log_frame() {
         s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
         s.missed_regions,
-        missed.join(" ")
+        missed.join(" "),
+        s.ignored_null_pages
     );
 }
 
@@ -905,18 +928,27 @@ pub(crate) fn kept() -> Vec<(usize, usize)> {
     DROPPED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The address of an entry in an allocated block, including unowned pages.
+fn page_address(blocks: &[usize], entry: usize) -> Option<u64> {
+    let block = entry / BLOCK;
+    if block == 0 {
+        return None;
+    }
+    let &region = blocks.get(block)?;
+    Some((region as u64) << 28 | ((entry % BLOCK) as u64) << 16)
+}
+
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
-fn has_missed(marks: &[u32], l: &Layout) -> bool {
+fn has_missed(marks: &[u32], l: &Layout, ignore_null_page: bool) -> bool {
     for (w, &mark) in marks.iter().enumerate() {
         let mut bits = mark;
         while bits != 0 {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let block = entry / BLOCK;
-            if block == 0
-                || l.blocks.get(block).is_none()
-                || l.owner.get(entry).is_none_or(|o| o.is_none())
-            {
+            let Some(at) = page_address(&l.blocks, entry) else {
+                return true;
+            };
+            if l.owner.get(entry).is_none_or(|o| o.is_none()) && !(ignore_null_page && at == 0) {
                 return true;
             }
         }
@@ -951,12 +983,15 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let missed_bitmap = Arc::clone(&pooled);
+    // A miss on the first 64 KiB is distinguishable only in an allocated
+    // block. Region-zero and out-of-range marks can refer to other pages.
+    let ignore_null_page = ignore_unmapped_null_page();
     list.defer_missed(move || {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
-        has_missed(marks, &l)
+        has_missed(marks, &l, ignore_null_page)
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
@@ -964,7 +999,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
-        let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        let (mut pages, mut regions, mut ignored_null_pages) = (0, 0, 0);
+        let mut missed = Vec::new();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
@@ -975,17 +1011,16 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let (block, page) = (entry / BLOCK, entry % BLOCK);
                 // Block 0's bits are 256 MiB regions with no block.
-                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                let Some(at) = page_address(blocks, entry) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
                     continue;
                 };
-                let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
+                    _ if ignore_null_page && at == 0 => ignored_null_pages += 1,
                     _ => {
                         pages += 1;
                         missed.push(at);
@@ -1019,6 +1054,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             s.withheld += withheld;
             s.missed_pages += pages;
             s.missed_regions += regions;
+            s.ignored_null_pages += ignored_null_pages;
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
         });
@@ -1152,28 +1188,39 @@ mod tests {
             owner,
         };
         let mut marks = vec![0u32; BITMAP_WORDS];
-        assert!(!has_missed(&marks, &l));
+        assert!(!has_missed(&marks, &l, false));
 
         // Owned entry in block 1.
         let owned = BLOCK + 5;
         marks[owned / 32] = 1 << (owned % 32);
-        assert!(!has_missed(&marks, &l));
+        assert!(!has_missed(&marks, &l, false));
+
+        // The unowned first page of an allocated region-zero block.
+        marks[BLOCK / 32] |= 1;
+        assert!(has_missed(&marks, &l, false));
+        assert!(!has_missed(&marks, &l, true));
+        marks[BLOCK / 32] &= !1;
 
         // Unowned entry in the same word as an owned entry.
         let unowned = BLOCK + 6;
         marks[unowned / 32] |= 1 << (unowned % 32);
-        assert!(has_missed(&marks, &l));
+        assert!(has_missed(&marks, &l, true));
+
+        // Block 0 bit 0 (missing region zero or an out-of-range address).
+        marks.fill(0);
+        marks[0] = 1;
+        assert!(has_missed(&marks, &l, true));
 
         // Block 0 bit (missing 256 MiB region).
         marks.fill(0);
         marks[0] = 1 << 3;
-        assert!(has_missed(&marks, &l));
+        assert!(has_missed(&marks, &l, false));
 
         // Out-of-range block.
         marks.fill(0);
         let oob = 2 * BLOCK + 1;
         marks[oob / 32] = 1 << (oob % 32);
-        assert!(has_missed(&marks, &l));
+        assert!(has_missed(&marks, &l, false));
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

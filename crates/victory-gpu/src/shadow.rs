@@ -1349,6 +1349,9 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if crate::memory::profile_on() {
+            note_profiled_copy(from, to - from);
+        }
         if self.has_widened.load(Ordering::Acquire) {
             self.refresh_widened(from, to);
         }
@@ -1357,6 +1360,51 @@ impl Shadow {
             t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
         }
         to - from
+    }
+}
+
+/// The ten largest distinct source runs copied since the last real frame.
+static COPY_SOURCES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn note_profiled_copy(from: usize, len: usize) {
+    let mut sources = COPY_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+    let run = (len, from);
+    if len == 0 || sources.contains(&run) {
+        return;
+    }
+    if sources.len() < 10 {
+        sources.push(run);
+    } else if let Some(smallest) = sources.iter_mut().min() {
+        if run > *smallest {
+            *smallest = run;
+        }
+    }
+}
+
+/// Queries only the sampled starts, outside the copy and watch locks.
+pub(crate) fn log_copy_sources() {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+
+    let mut sources = std::mem::take(&mut *COPY_SOURCES.lock().unwrap_or_else(|e| e.into_inner()));
+    sources.sort_unstable_by(|a, b| b.cmp(a));
+    for (len, from) in sources {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a valid out pointer; VirtualQuery does not read the source.
+        let found = unsafe { VirtualQuery(from as *const _, &mut info, size_of_val(&info)) } != 0;
+        let pages = (from % PAGE + len).div_ceil(PAGE);
+        tracing::info!(
+            from = format_args!("{from:#x}"),
+            bytes = len,
+            pages_64k = pages,
+            queried = found,
+            allocation = format_args!("{:#x}", info.AllocationBase as usize),
+            allocation_protect = format_args!("{:#x}", info.AllocationProtect),
+            region_bytes = info.RegionSize,
+            protect = format_args!("{:#x}", info.Protect),
+            state = format_args!("{:#x}", info.State),
+            kind = format_args!("{:#x}", info.Type),
+            "copied title memory source"
+        );
     }
 }
 

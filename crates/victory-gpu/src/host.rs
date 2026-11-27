@@ -254,6 +254,10 @@ static DEFERRED_PROFILE: [std::sync::atomic::AtomicU64; 5] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Copy-back phase timings, in microseconds, for the submission profiler.
+static BACK_PROFILE: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 fn note_submission_profile(gpu: Duration, runs: &[&HostList]) {
     if !submission_profile_on() {
         return;
@@ -301,6 +305,11 @@ fn log_submission_profile(frames: f64) {
         "  deferred+prelude breakdown: mem_rewrite {mem_rewrite:.1} ms ({rw_cnt} rewrites + {rw_patches} patches, {rw_pairs} new pairs), \
          mem_scan {mem_scan:.1} ms, host_work {host_work:.1} ms, mid_flush {mid_flush:.1} ms, \
          bindless {bindless:.1} ms, prelude {prelude:.1} ms"
+    );
+    let [miss, ranges, marks, reads, writes, after] =
+        BACK_PROFILE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / denom);
+    tracing::info!(
+        "  copy-back breakdown: miss checks {miss:.2} ms, plan ranges {ranges:.2} ms, view marks {marks:.2} ms, read views {reads:.2} ms, keep/copy writes {writes:.2} ms, deferred work {after:.2} ms"
     );
     let mut entries = std::mem::take(&mut *SUB_PROFILE.lock().unwrap_or_else(|e| e.into_inner()));
     if entries.is_empty() {
@@ -1587,6 +1596,8 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Pipelines [`HostList::bind_pipeline`] already kept and noted since reset.
     bound_pipelines: std::collections::HashSet<usize>,
+    /// Title-memory pipelines in the list, collected only for the memory profiler.
+    memory_pipelines: std::collections::BTreeSet<String>,
     /// Unaligned root-CBV scratch copies (`(source, bytes)` → host GPU address)
     /// valid until the next title copy or list reset.
     filled_scratch: std::collections::HashMap<(usize, usize), u64>,
@@ -2421,6 +2432,15 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let profiling_back = submission_profile_on();
+        let mut phase = copying;
+        let mut profile_back = |i: usize| {
+            if profiling_back {
+                let now = std::time::Instant::now();
+                BACK_PROFILE[i].fetch_add(now.duration_since(phase).as_micros() as u64, Ordering::Relaxed);
+                phase = now;
+            }
+        };
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
@@ -2437,10 +2457,22 @@ impl Host {
         // builder in one list, run light13).
         let missed: Vec<bool> = runs
             .iter()
-            .map(|list| list.deferred().missed.iter().any(|check| check()))
+            .map(|list| {
+                let deferred = list.deferred();
+                let missed = deferred.missed.iter().any(|check| check());
+                if missed && crate::memory::profile_on() {
+                    tracing::info!(
+                        list = list.id,
+                        pipelines = ?deferred.memory_pipelines,
+                        "title memory miss in command list"
+                    );
+                }
+                missed
+            })
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
+        profile_back(0);
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
@@ -2478,7 +2510,9 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        profile_back(1);
         crate::shadow::copy_back_marks(&withheld, withholding);
+        profile_back(2);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -2498,6 +2532,7 @@ impl Host {
                 );
             }
         }
+        profile_back(3);
         let total_back_bytes: usize = back
             .iter()
             .filter(|b| b.3)
@@ -2558,6 +2593,7 @@ impl Host {
                 }
             }
         }
+        profile_back(4);
         // Textures shaders wrote that the title reads on the CPU
         // (`crate::texback`): the lists that copied them have run.
         if crate::texback::on() {
@@ -2569,6 +2605,7 @@ impl Host {
                 work();
             }
         }
+        profile_back(5);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -3482,6 +3519,15 @@ impl HostList {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    pub(crate) fn profile_memory_pipeline(&self, name: &str) {
+        if crate::memory::profile_on() {
+            let mut deferred = self.deferred();
+            if !deferred.memory_pipelines.contains(name) {
+                deferred.memory_pipelines.insert(name.to_owned());
+            }
         }
     }
 
@@ -5473,6 +5519,7 @@ struct Meter {
     frames: u64,
     interp_frames: u64,
     caption_interp: u64,
+    report_interp: u64,
     caption_window: FrameWindow,
     report_window: FrameWindow,
     /// The caption the window had, once read.
@@ -5490,6 +5537,7 @@ impl Meter {
             frames: 0,
             interp_frames: 0,
             caption_interp: 0,
+            report_interp: 0,
             caption_window: start,
             report_window: start,
             caption: None,
@@ -5517,6 +5565,9 @@ impl Meter {
         self.caption_interp = self.interp_frames;
         if let Some(report) = self.report_window.sample(next, Duration::from_secs(5)) {
             let FrameRates { frames: report_frames, fps, ms, draws } = report;
+            let interpolated = self.interp_frames.saturating_sub(self.report_interp) as f64;
+            self.report_interp = self.interp_frames;
+            let real_fps = fps * (report_frames - interpolated).max(0.0) / report_frames;
             let [cpu, gpu] = SUBMISSION_US.each_ref().map(|counter| {
                 counter.swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
             });
@@ -5560,7 +5611,7 @@ impl Meter {
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
                  batched){zero_copy}{metal_fg}{guards}; submissions lost {submissions_lost}, \
-                 queues replaced {queues_replaced}",
+                 queues replaced {queues_replaced}; frame rates {real_fps:.1} real / {fps:.1} displayed",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

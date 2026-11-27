@@ -1020,6 +1020,7 @@ impl State {
                     return false;
                 };
                 crate::memory::note_use(&p.name);
+                list.profile_memory_pipeline(&p.name);
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {

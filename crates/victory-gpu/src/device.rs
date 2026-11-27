@@ -212,7 +212,7 @@ pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> H
     S_OK
 }
 
-fn user_space() -> (u64, u64) {
+pub(crate) fn user_space() -> (u64, u64) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
