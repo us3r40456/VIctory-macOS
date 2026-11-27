@@ -878,19 +878,23 @@ pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(us
         // The usual case: one slice comparison, no byte walk.
         return;
     }
-    // A streamed page can change in an otherwise equal MiB read. Skip
-    // equal blocks at either end before looking for individual runs. Keep
-    // the middle contiguous so a run crossing a block boundary stays one run.
+    // Compare in blocks and walk only adjacent dirty blocks together, so
+    // a changed run crossing their boundary remains a single run.
     const BLOCK: usize = 4096;
-    let mut start = 0;
-    let mut end = fresh.len();
-    while end - start >= BLOCK && kept[start..start + BLOCK] == fresh[start..start + BLOCK] {
-        start += BLOCK;
+    let mut dirty = None;
+    for start in (0..fresh.len()).step_by(BLOCK) {
+        let end = (start + BLOCK).min(fresh.len());
+        if kept[start..end] == fresh[start..end] {
+            if let Some(first) = dirty.take() {
+                walk_changed(at + first, &mut kept[first..start], &fresh[first..start], runs);
+            }
+        } else {
+            dirty.get_or_insert(start);
+        }
     }
-    while end - start >= BLOCK && kept[end - BLOCK..end] == fresh[end - BLOCK..end] {
-        end -= BLOCK;
+    if let Some(first) = dirty {
+        walk_changed(at + first, &mut kept[first..], &fresh[first..], runs);
     }
-    walk_changed(at + start, &mut kept[start..end], &fresh[start..end], runs);
 }
 
 /// One subresource's detiling as a shader does it ([`Layout::detile_params`]).

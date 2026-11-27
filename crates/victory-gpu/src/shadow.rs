@@ -1846,26 +1846,147 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Counts copies made and title buffers released: [`all`] may differ when
-/// it changed.
-static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Counts non-aliased copies made and title buffers released.
+static NON_ALIASED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Counts aliased regions added, coalesced, split, or removed.
+static ALIASED_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The generation of [`all`]: read it before calling that.
-pub(crate) fn generation() -> u64 {
-    GENERATION.load(std::sync::atomic::Ordering::Acquire)
+/// Incremental delta operation on the aliased shadow registry, consumed by
+/// `memory.rs` to patch only changed 64 KiB page-table entries in place.
+#[derive(Clone)]
+pub(crate) enum AliasedOp {
+    Add(Arc<Shadow>),
+    Remove(u64, u64),
 }
 
-/// Epoch for [`find`]'s per-thread lookup cache; bumped on every change to
-/// `BUFFERS`, `ALIASED`, or `LOOSE` (while holding that table's write lock).
-static LOOKUP_EPOCH: AtomicU64 = AtomicU64::new(1);
-
-fn lookup_changed() {
-    LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+struct AliasedLog {
+    /// Generation of `ops[0]`; any consumer older than `base` runs a full rewrite.
+    base: u64,
+    /// Current aliased generation (`base + ops.len()`).
+    head: u64,
+    ops: Vec<AliasedOp>,
 }
 
-fn changed() {
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-    lookup_changed();
+const ALIASED_LOG_CAP: usize = 4096;
+
+static ALIASED_LOG: Mutex<AliasedLog> = Mutex::new(AliasedLog {
+    base: 0,
+    head: 0,
+    ops: Vec::new(),
+});
+
+/// `(non_aliased_gen, aliased_gen)`: read both before snapshots or delta patching.
+pub(crate) fn generations() -> (u64, u64) {
+    let na = NON_ALIASED_GEN.load(Ordering::Acquire);
+    let a = ALIASED_GEN.load(Ordering::Acquire);
+    (na, a)
+}
+
+/// Returns `(current_aliased_gen, ops)` since `since`, or `None` if `since`
+/// has fallen behind the bounded delta log (requiring a full page-table rewrite).
+pub(crate) fn aliased_delta(since: u64) -> Option<(u64, Vec<AliasedOp>)> {
+    let log = ALIASED_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if since < log.base || since > log.head {
+        return None;
+    }
+    let start = (since - log.base) as usize;
+    Some((log.head, log.ops[start..].to_vec()))
+}
+
+fn record_aliased_ops(ops: &[AliasedOp]) {
+    if ops.is_empty() {
+        return;
+    }
+    let mut log = ALIASED_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.ops.len() + ops.len() > ALIASED_LOG_CAP {
+        let drop_n = (log.ops.len() / 2).max(ops.len()).min(log.ops.len());
+        log.ops.drain(..drop_n);
+        log.base += drop_n as u64;
+    }
+    log.ops.extend_from_slice(ops);
+    log.head = log.base + log.ops.len() as u64;
+    ALIASED_GEN.store(log.head, Ordering::Release);
+}
+
+/// Number of address stripes for [`find`]'s per-thread lookup cache epochs
+/// (16 MiB per stripe = 1 GiB full period). Changes in one address region only
+/// invalidate cached lookups in that region rather than flushing every thread's
+/// entire 16,384-set cache.
+const LOOKUP_EPOCH_STRIPES: usize = 64;
+const LOOKUP_STRIPE_SHIFT: u32 = 24;
+
+static LOOKUP_EPOCHS: [AtomicU64; LOOKUP_EPOCH_STRIPES] =
+    [const { AtomicU64::new(1) }; LOOKUP_EPOCH_STRIPES];
+
+#[inline]
+fn lookup_stripe(addr: u64) -> usize {
+    ((addr >> LOOKUP_STRIPE_SHIFT) as usize) & (LOOKUP_EPOCH_STRIPES - 1)
+}
+
+fn lookup_changed_all() {
+    for e in &LOOKUP_EPOCHS {
+        e.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn lookup_changed_range(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    let span = 1u64 << LOOKUP_STRIPE_SHIFT;
+    if end.saturating_sub(start) >= (LOOKUP_EPOCH_STRIPES as u64) * span {
+        lookup_changed_all();
+        return;
+    }
+    let mut mask = 0u64;
+    let mut a = start & !(span - 1);
+    while a < end {
+        mask |= 1u64 << lookup_stripe(a);
+        match a.checked_add(span) {
+            Some(next) => a = next,
+            None => break,
+        }
+    }
+    while mask != 0 {
+        let s = mask.trailing_zeros() as usize;
+        LOOKUP_EPOCHS[s].fetch_add(1, Ordering::Release);
+        mask &= mask - 1;
+    }
+}
+
+fn non_aliased_changed_range(start: u64, end: u64) {
+    NON_ALIASED_GEN.fetch_add(1, Ordering::Release);
+    lookup_changed_range(start, end);
+}
+
+fn non_aliased_changed_all() {
+    NON_ALIASED_GEN.fetch_add(1, Ordering::Release);
+    lookup_changed_all();
+}
+
+/// Whether any live non-aliased copy (`BUFFERS` with shadow, or `LOOSE`)
+/// overlaps `[start, end)`.
+pub(crate) fn has_non_aliased_overlap(start: u64, end: u64) -> bool {
+    if start >= end {
+        return false;
+    }
+    {
+        let map = buffers_read();
+        let span = MAX_SPAN.load(Ordering::Relaxed);
+        let lowest = start.saturating_sub(span);
+        if map
+            .range((lowest, 0)..(end, 0))
+            .any(|(&(_, _), e)| e.shadow.is_some() && e.end > start)
+        {
+            return true;
+        }
+    }
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let span = LOOSE_SPAN.load(Ordering::Relaxed);
+    let lowest = start.saturating_sub(span);
+    loose
+        .range((lowest, 0)..(end, 0))
+        .any(|(&(s, l), _)| s.saturating_add(l) > start)
 }
 
 /// The longest title buffer registered so far (it stays after the buffer is
@@ -1876,15 +1997,16 @@ static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
+    let end = start.saturating_add(len);
     MAX_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert(
         (start, resource),
         Entry {
-            end: start.saturating_add(len),
+            end,
             shadow: None,
         },
     );
-    lookup_changed();
+    lookup_changed_range(start, end);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -1892,9 +2014,9 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
     if let Some(entry) = map.remove(&(start, resource)) {
         if entry.shadow.is_some() {
-            changed();
+            non_aliased_changed_range(start, entry.end);
         } else {
-            lookup_changed();
+            lookup_changed_range(start, entry.end);
         }
     }
 }
@@ -1992,20 +2114,32 @@ pub(crate) fn register_aliased(mut shadow: Arc<Shadow>) {
             shadow.len + next.len,
         );
     }
+    let range_start = shadow.start;
+    let range_end = shadow.start.saturating_add(shadow.len);
     ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
-    map.insert(shadow.start, shadow);
+    let added = shadow.clone();
+    let replaced = map.insert(shadow.start, shadow);
     ALIASED_COUNT.store(map.len(), Ordering::Release);
-    changed();
+    if let Some(old) = replaced
+        && old.len > added.len
+    {
+        record_aliased_ops(&[AliasedOp::Remove(old.start, old.len), AliasedOp::Add(added)]);
+        lookup_changed_range(range_start, old.start.saturating_add(old.len));
+    } else {
+        record_aliased_ops(&[AliasedOp::Add(added)]);
+        lookup_changed_range(range_start, range_end);
+    }
 }
 
 pub(crate) fn unregister_aliased(start: u64) -> bool {
     let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
-    let removed = map.remove(&start).is_some();
-    if removed {
+    if let Some(sh) = map.remove(&start) {
         ALIASED_COUNT.store(map.len(), Ordering::Release);
-        changed();
+        record_aliased_ops(&[AliasedOp::Remove(sh.start, sh.len)]);
+        lookup_changed_range(sh.start, sh.start.saturating_add(sh.len));
+        return true;
     }
-    removed
+    false
 }
 
 /// Removes `[start, start + len)` from the aliased registry, splitting any
@@ -2026,11 +2160,16 @@ pub(crate) fn unregister_aliased_range(start: u64, len: u64) -> bool {
     if keys.is_empty() {
         return false;
     }
+    let mut ops = Vec::with_capacity(keys.len() + 2);
+    let (mut inv_start, mut inv_end) = (start, end);
+    ops.push(AliasedOp::Remove(start, len));
     for key in keys {
         let Some(sh) = map.remove(&key) else {
             continue;
         };
         let sh_end = sh.start + sh.len;
+        inv_start = inv_start.min(sh.start);
+        inv_end = inv_end.max(sh_end);
         if sh.start < start {
             let prefix = Shadow::new_aliased_at(
                 sh.buffer.clone(),
@@ -2040,6 +2179,7 @@ pub(crate) fn unregister_aliased_range(start: u64, len: u64) -> bool {
                 sh.start,
                 start - sh.start,
             );
+            ops.push(AliasedOp::Add(prefix.clone()));
             map.insert(prefix.start, prefix);
         }
         if sh_end > end {
@@ -2054,11 +2194,13 @@ pub(crate) fn unregister_aliased_range(start: u64, len: u64) -> bool {
                 end,
                 sh_end - end,
             );
+            ops.push(AliasedOp::Add(suffix.clone()));
             map.insert(suffix.start, suffix);
         }
     }
     ALIASED_COUNT.store(map.len(), Ordering::Release);
-    changed();
+    record_aliased_ops(&ops);
+    lookup_changed_range(inv_start, inv_end);
     true
 }
 
@@ -2105,50 +2247,29 @@ const LOOKUP_SETS: usize = 16384;
 
 #[derive(Default)]
 struct LookupSlot {
+    epoch: u64,
     address: u64,
     end: u64,
     shadow: std::sync::Weak<Shadow>,
 }
 
 struct LookupCache {
-    epoch: u64,
-    dirty: bool,
     slots: Box<[[LookupSlot; 2]]>,
 }
 
 impl LookupCache {
-    fn new(epoch: u64) -> Self {
+    fn new() -> Self {
         let slots = std::iter::repeat_with(|| [LookupSlot::default(), LookupSlot::default()])
             .take(LOOKUP_SETS)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self {
-            epoch,
-            dirty: false,
-            slots,
-        }
-    }
-
-    fn clear_if_stale(&mut self, epoch: u64) {
-        if self.epoch != epoch {
-            if self.dirty {
-                for pair in &mut self.slots {
-                    *pair = [LookupSlot::default(), LookupSlot::default()];
-                }
-                self.dirty = false;
-            }
-            self.epoch = epoch;
-        }
+        Self { slots }
     }
 
     fn get(&mut self, epoch: u64, address: u64, end: u64) -> Option<Arc<Shadow>> {
-        if self.epoch != epoch {
-            self.clear_if_stale(epoch);
-            return None;
-        }
         let pair = &mut self.slots[lookup_set(address, end)];
         for way in 0..2 {
-            if pair[way].address == address && pair[way].end == end {
+            if pair[way].epoch == epoch && pair[way].address == address && pair[way].end == end {
                 if let Some(shadow) = pair[way].shadow.upgrade() {
                     if way == 1 {
                         pair.swap(0, 1);
@@ -2162,9 +2283,9 @@ impl LookupCache {
     }
 
     fn insert(&mut self, epoch: u64, address: u64, end: u64, shadow: &Arc<Shadow>) {
-        self.clear_if_stale(epoch);
         let pair = &mut self.slots[lookup_set(address, end)];
         let entry = LookupSlot {
+            epoch,
             address,
             end,
             shadow: Arc::downgrade(shadow),
@@ -2174,7 +2295,6 @@ impl LookupCache {
         } else {
             pair[1] = std::mem::replace(&mut pair[0], entry);
         }
-        self.dirty = true;
     }
 }
 
@@ -2274,7 +2394,17 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.touch();
         return Some(shadow);
     }
-    let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
+    let stripe = lookup_stripe(address);
+    let single_stripe = stripe == lookup_stripe(end.saturating_sub(1))
+        && end.saturating_sub(address) <= (1u64 << LOOKUP_STRIPE_SHIFT);
+    if !single_stripe {
+        #[cfg(feature = "diagnostics")]
+        LOOKUP_STATS[1].fetch_add(1, Ordering::Relaxed);
+        let shadow = find_uncached(address, end)?;
+        shadow.touch();
+        return Some(shadow);
+    }
+    let epoch = LOOKUP_EPOCHS[stripe].load(Ordering::Acquire);
     let hit = LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
         guard.as_mut().and_then(|cache| cache.get(epoch, address, end))
@@ -2291,7 +2421,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.touch();
     LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
-        let cache = guard.get_or_insert_with(|| LookupCache::new(epoch));
+        let cache = guard.get_or_insert_with(LookupCache::new);
         cache.insert(epoch, address, end, &shadow);
     });
     Some(shadow)
@@ -2341,7 +2471,7 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
         released().remade(key.0);
-        changed();
+        non_aliased_changed_range(key.0, entry.end);
     }
     entry.shadow.clone()
 }
@@ -2415,7 +2545,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     released().remade(start);
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
-    changed();
+    non_aliased_changed_range(start, start.saturating_add(len));
     Some(shadow)
 }
 
@@ -2729,7 +2859,7 @@ pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
             }
         }
         if !gone.is_empty() {
-            changed();
+            non_aliased_changed_all();
         }
     }
     let (count, bytes) = (gone.len(), gone.iter().map(|c| c.len).sum::<u64>());
@@ -2752,16 +2882,24 @@ pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
     (count, bytes)
 }
 
+#[cfg(feature = "diagnostics")]
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = ALIASED
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .cloned()
-        .collect();
+    all_with_generations().0
+}
+
+/// Every live shadow alongside `(non_aliased_gen, aliased_gen)` captured so
+/// any concurrent aliased mutation after this snapshot is guaranteed to appear
+/// in [`aliased_delta`] at a generation strictly greater than `aliased_gen`.
+pub(crate) fn all_with_generations() -> (Vec<Arc<Shadow>>, u64, u64) {
+    let na_gen = NON_ALIASED_GEN.load(Ordering::Acquire);
+    let (mut all, a_gen) = {
+        let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+        let a_gen = ALIASED_GEN.load(Ordering::Acquire);
+        (map.values().cloned().collect::<Vec<_>>(), a_gen)
+    };
     all.extend(buffers_read().values().filter_map(|e| e.shadow.clone()));
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
-    all
+    (all, na_gen, a_gen)
 }
 
 /// For device-removed reports: the copy of title memory whose host range
@@ -3952,7 +4090,7 @@ pub(crate) mod tests {
         {
             let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
             loose.retain(|&(s, _), _| s != b as u64);
-            lookup_changed();
+            lookup_changed_all();
         }
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };

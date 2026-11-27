@@ -289,7 +289,7 @@ fn log_submission_profile(frames: f64) {
         PREP_PROFILE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / denom);
     let [mem_total, host_work, mid_flush, bindless, prelude] =
         DEFERRED_PROFILE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / 1e3 / denom);
-    let (rw_us, rw_cnt, rw_pairs) = crate::memory::take_rewrite_profile();
+    let (rw_us, rw_cnt, rw_patches, rw_pairs) = crate::memory::take_rewrite_profile();
     let mem_rewrite = rw_us as f64 / 1e3 / denom;
     let mem_scan = (mem_total - mem_rewrite).max(0.0);
     tracing::info!(
@@ -298,7 +298,7 @@ fn log_submission_profile(frames: f64) {
         evict + sync_heaps + uploads + deferred + flush
     );
     tracing::info!(
-        "  deferred+prelude breakdown: mem_rewrite {mem_rewrite:.1} ms ({rw_cnt} rewrites, {rw_pairs} new pairs), \
+        "  deferred+prelude breakdown: mem_rewrite {mem_rewrite:.1} ms ({rw_cnt} rewrites + {rw_patches} patches, {rw_pairs} new pairs), \
          mem_scan {mem_scan:.1} ms, host_work {host_work:.1} ms, mid_flush {mid_flush:.1} ms, \
          bindless {bindless:.1} ms, prelude {prelude:.1} ms"
     );

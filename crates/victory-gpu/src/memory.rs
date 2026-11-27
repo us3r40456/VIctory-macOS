@@ -66,21 +66,32 @@ fn pieces((start, len): (u64, u64)) -> impl Iterator<Item = (u64, u64, u64)> {
 }
 
 /// Rewrite telemetry for `VICTORY_SUBMISSION_PROFILE=1`:
-/// [0] = microseconds in `Shared::rewrite`, [1] = rewrite count, [2] = new descriptor pairs created.
-static REWRITE_PROFILE: [AtomicU64; 3] = [
+/// [0] = microseconds in `Shared::rewrite` / `Shared::patch_aliased`,
+/// [1] = full rewrite count,
+/// [2] = incremental aliased patch count,
+/// [3] = new descriptor pairs created.
+static REWRITE_PROFILE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
 
-/// Takes `(rewrite_us, rewrite_count, pairs_made)` since the last call.
-pub(crate) fn take_rewrite_profile() -> (u64, u64, u64) {
+/// Takes `(rewrite_us, full_rewrites, incremental_patches, pairs_made)` since the last call.
+pub(crate) fn take_rewrite_profile() -> (u64, u64, u64, u64) {
     (
         REWRITE_PROFILE[0].swap(0, Ordering::Relaxed),
         REWRITE_PROFILE[1].swap(0, Ordering::Relaxed),
         REWRITE_PROFILE[2].swap(0, Ordering::Relaxed),
+        REWRITE_PROFILE[3].swap(0, Ordering::Relaxed),
     )
 }
+
+/// Maximum incremental aliased ops applied before running a compacting full
+/// rewrite (bounds `Layout::copies` growth and frees pairs of unmapped chunks).
+const PATCH_COMPACT_OPS: usize = 4096;
+/// Cap on `Layout::copies.len()` during incremental patching.
+const PATCH_MAX_COPIES: usize = 32_768;
 
 /// Key for a raw SRV+UAV descriptor pair held by a page table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -265,8 +276,14 @@ struct Shared {
     /// Reusable sets/buffers for [`Shared::rewrite`] to avoid per-rewrite churn.
     live_keys: HashSet<PairKey>,
     live_bufs: HashSet<usize>,
-    /// The copies' generation it names ([`crate::shadow::generation`]).
-    generation: u64,
+    /// Non-aliased and aliased shadow generations last reflected in the table.
+    non_aliased_gen: u64,
+    aliased_gen: u64,
+    /// Incremental aliased ops applied since the last full rewrite.
+    patches_since_rewrite: usize,
+    /// Host mirror of the level-1 directory (`dwords[..LEVEL1]`) so incremental
+    /// patches can look up blocks without reading back upload memory.
+    l1_table: Box<[u32; LEVEL1]>,
     layout: Arc<Layout>,
     /// The table's working buffers, kept between rewrites (grown as
     /// needed, never shrunk): the copies' order, the level-1 index, each
@@ -488,19 +505,24 @@ impl Shared {
             buf_widths: HashMap::new(),
             live_keys: HashSet::new(),
             live_bufs: HashSet::new(),
-            generation: u64::MAX,
+            non_aliased_gen: u64::MAX,
+            aliased_gen: u64::MAX,
+            patches_since_rewrite: 0,
+            l1_table: vec![0u32; LEVEL1]
+                .into_boxed_slice()
+                .try_into()
+                .expect("LEVEL1"),
             layout: Arc::default(),
             scratch: pagetable::Scratch::default(),
         })
     }
 
-    /// Names every host copy there is now (`now`: their generation): view
-    /// pairs made for new copies, those of copies gone made null and given
-    /// back, the table rewritten. Only while no submission runs (the GPU
-    /// reads the table and the views).
-    fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+    /// Names every host copy there is now: view pairs made for new copies,
+    /// those of copies gone made null and given back, the table rewritten.
+    /// Only while no submission runs (the GPU reads the table and the views).
+    fn rewrite(&mut self, heap: &HostHeap) {
         let started = std::time::Instant::now();
-        let copies = crate::shadow::all();
+        let (copies, na_gen, a_gen) = crate::shadow::all_with_generations();
         self.live_keys.clear();
         self.live_bufs.clear();
         let mut planned: Vec<(usize, PairKey, u64, u64, u64, u64, u32)> =
@@ -588,6 +610,7 @@ impl Shared {
         // SAFETY: the mapping has room for `CAPACITY` blocks, which the
         // builder keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
+        self.l1_table.copy_from_slice(&built.dwords[..LEVEL1]);
         tracing::debug!(
             copies = ranges.len(),
             pairs = self.pairs.len(),
@@ -599,7 +622,9 @@ impl Shared {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
         }
-        self.generation = now;
+        self.non_aliased_gen = na_gen;
+        self.aliased_gen = a_gen;
+        self.patches_since_rewrite = 0;
         self.layout = Arc::new(Layout {
             copies: named,
             tracked,
@@ -610,7 +635,167 @@ impl Shared {
         stats(|s| s.tables += 1);
         REWRITE_PROFILE[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         REWRITE_PROFILE[1].fetch_add(1, Ordering::Relaxed);
-        REWRITE_PROFILE[2].fetch_add(pairs_made, Ordering::Relaxed);
+        REWRITE_PROFILE[3].fetch_add(pairs_made, Ordering::Relaxed);
+    }
+
+    /// Incrementally patches only the 64 KiB page-table entries affected by
+    /// aliased shadow additions/removals since `self.aliased_gen`. Returns
+    /// `true` on success, or `false` if a full [`Self::rewrite`] is needed.
+    fn patch_aliased(&mut self, heap: &HostHeap, na_now: u64) -> bool {
+        let started = std::time::Instant::now();
+        let Some((a_now, ops)) = crate::shadow::aliased_delta(self.aliased_gen) else {
+            return false;
+        };
+        if ops.is_empty() {
+            self.aliased_gen = a_now;
+            return true;
+        }
+        let op_count = ops.len();
+        if self.patches_since_rewrite.saturating_add(op_count) > PATCH_COMPACT_OPS {
+            return false;
+        }
+        let Some(layout) = Arc::get_mut(&mut self.layout) else {
+            return false;
+        };
+        if layout.copies.len().saturating_add(op_count) > PATCH_MAX_COPIES {
+            return false;
+        }
+        // SAFETY: `self.data` is the persistent mapping of `self.table` sized for
+        // `LEVEL1 + (CAPACITY + 1) * BLOCK * 2` u32s, and no submission runs while
+        // `SHARED` is locked.
+        let dwords = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.data as *mut u32,
+                LEVEL1 + (CAPACITY + 1) * BLOCK * 2,
+            )
+        };
+        let mut pairs_made = 0u64;
+        for op in ops {
+            match op {
+                crate::shadow::AliasedOp::Remove(start, len) => {
+                    let Some(end) = start.checked_add(len) else {
+                        return false;
+                    };
+                    if len == 0
+                        || (start & 0xFFFF) != 0
+                        || (len & 0xFFFF) != 0
+                        || end > 1 << 40
+                        || crate::shadow::has_non_aliased_overlap(start, end)
+                    {
+                        return false;
+                    }
+                    let (first, last) = (start >> 16, (end - 1) >> 16);
+                    let mut page = first;
+                    while page <= last {
+                        let l1 = (page >> 12) as usize;
+                        let upto = last.min(page | 0xFFF);
+                        let block = self.l1_table[l1] as usize;
+                        if block != 0 {
+                            let base = block * BLOCK;
+                            let from = (page & 0xFFF) as usize;
+                            let to = (upto & 0xFFF) as usize;
+                            layout.owner[base + from..=base + to].fill(None);
+                            let dw_from = LEVEL1 + (base + from) * 2;
+                            let dw_to = LEVEL1 + (base + to + 1) * 2;
+                            for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
+                                entry[0] = self.null;
+                                entry[1] = 0;
+                            }
+                        }
+                        page = upto + 1;
+                    }
+                }
+                crate::shadow::AliasedOp::Add(c) => {
+                    if !c.is_aliased() {
+                        return false;
+                    }
+                    let (start, len) = c.range();
+                    let Some(end) = start.checked_add(len) else {
+                        return false;
+                    };
+                    let base_off = c.base_offset();
+                    if len == 0
+                        || (start & 0xFFFF) != 0
+                        || (len & 0xFFFF) != 0
+                        || end > 1 << 40
+                        || !base_off.is_multiple_of(4)
+                        || crate::shadow::has_non_aliased_overlap(start, end)
+                    {
+                        return false;
+                    }
+                    let buf_raw = c.buffer.as_raw() as usize;
+                    let buf_width = *self.buf_widths.entry(buf_raw).or_insert_with(|| {
+                        // SAFETY: `c.buffer` is a live D3D12 buffer held by `c`.
+                        unsafe { c.buffer.GetDesc() }.Width
+                    });
+                    if buf_width > PIECE_VIEWED {
+                        return false;
+                    }
+                    let key = PairKey::WholeBuffer(buf_raw);
+                    let slot = match self.pairs.get(&key) {
+                        Some(&slot) => slot,
+                        None => {
+                            let Some(slot) = heap.pair() else {
+                                return false;
+                            };
+                            let viewed = buf_width.next_multiple_of(4);
+                            heap.raw_pair_at(slot, Some(&c.buffer), 0, viewed);
+                            self.pairs.insert(key, slot);
+                            pairs_made += 1;
+                            slot
+                        }
+                    };
+                    let low = start.wrapping_sub(base_off) as u32;
+                    let new_k = layout.copies.len();
+                    layout.copies.push(c.clone());
+                    layout.aliased.push(c);
+                    let (first, last) = (start >> 16, (end - 1) >> 16);
+                    let mut page = first;
+                    while page <= last {
+                        let l1 = (page >> 12) as usize;
+                        let upto = last.min(page | 0xFFF);
+                        if self.l1_table[l1] == 0 {
+                            if layout.blocks.len() > CAPACITY {
+                                return false;
+                            }
+                            let new_block = layout.blocks.len();
+                            layout.blocks.push(l1);
+                            layout.owner.resize(layout.owner.len() + BLOCK, None);
+                            let blk_dw = LEVEL1 + new_block * BLOCK * 2;
+                            for entry in dwords[blk_dw..blk_dw + BLOCK * 2].chunks_exact_mut(2) {
+                                entry[0] = self.null;
+                                entry[1] = 0;
+                            }
+                            self.l1_table[l1] = new_block as u32;
+                            dwords[l1] = new_block as u32;
+                        }
+                        let base = self.l1_table[l1] as usize * BLOCK;
+                        let from = (page & 0xFFF) as usize;
+                        let to = (upto & 0xFFF) as usize;
+                        layout.owner[base + from..=base + to].fill(Some(new_k));
+                        let dw_from = LEVEL1 + (base + from) * 2;
+                        let dw_to = LEVEL1 + (base + to + 1) * 2;
+                        for entry in dwords[dw_from..dw_to].chunks_exact_mut(2) {
+                            entry[0] = slot;
+                            entry[1] = low;
+                        }
+                        page = upto + 1;
+                    }
+                }
+            }
+        }
+        // If a non-aliased copy arrived concurrently, fall back to a full rewrite
+        // so overlap precedence matches `pagetable::Scratch::build_with_lows`.
+        if crate::shadow::generations().0 != na_now {
+            return false;
+        }
+        self.aliased_gen = a_now;
+        self.patches_since_rewrite += op_count;
+        stats(|s| s.tables += 1);
+        REWRITE_PROFILE[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        REWRITE_PROFILE[2].fetch_add(1, Ordering::Relaxed);
+        REWRITE_PROFILE[3].fetch_add(pairs_made, Ordering::Relaxed);
+        true
     }
 }
 
@@ -654,9 +839,11 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
-        let now = crate::shadow::generation();
-        if s.generation != now {
-            s.rewrite(heap, now);
+        let (na_now, a_now) = crate::shadow::generations();
+        if s.non_aliased_gen != na_now {
+            s.rewrite(heap);
+        } else if s.aliased_gen != a_now && !s.patch_aliased(heap, na_now) {
+            s.rewrite(heap);
         }
         Some(s.layout.clone())
     })
@@ -1463,6 +1650,110 @@ void main() {
         assert_eq!(look_up(&dwords, va2 + 0x80), (slot1, PAGE as u32 + 0x80));
         crate::shadow::unregister_aliased(va1);
         crate::shadow::unregister_aliased(va2);
+        list.close();
+        list.reset();
+    }
+
+    #[test]
+    fn incremental_aliased_patch_matches_full_rewrite_bit_for_bit() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        let (Some(host), Some(_views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer((4 * PAGE) as u64).unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let list = host.new_list().unwrap();
+        let _map = bind(&list, OURS).expect("a page table");
+        // Seed initial state so the table has completed at least one full rewrite.
+        prepare(OURS, |_, _, _| {});
+        let _ = take_rewrite_profile();
+
+        let snapshot = || -> (u32, Vec<u32>) {
+            let guard = shared();
+            let (_, s) = guard.iter().find(|(k, _)| *k == OURS).unwrap();
+            let len = LEVEL1 + s.layout.owner.len() * 2;
+            // SAFETY: `s.data` holds the written page table dwords under lock.
+            let dw = unsafe { std::slice::from_raw_parts(s.data as *const u32, len).to_vec() };
+            (s.null, dw)
+        };
+
+        // 1. Add 3 contiguous 64 KiB aliased slices in a fresh 256 MiB L1 region
+        // (tests new L1 block allocation + coalescing in `register_aliased`).
+        let base_va = 0x63_0000_0000u64;
+        for i in 0..3usize {
+            let off = (i * PAGE) as u64;
+            // SAFETY: `data` covers `4 * PAGE`.
+            let sh = Shadow::new_aliased_at(
+                buffer.clone(),
+                unsafe { data.add(off as usize) },
+                gpu + off,
+                off,
+                base_va + off,
+                PAGE as u64,
+            );
+            crate::shadow::register_aliased(sh);
+        }
+        prepare(OURS, |_, _, _| {});
+        let (_, full_rw, patches, _) = take_rewrite_profile();
+        assert_eq!(full_rw, 0, "aliased-only add must use incremental patch");
+        assert_eq!(patches, 1, "expected 1 incremental patch");
+        let (null, patched_add) = snapshot();
+        let slot = {
+            let probe = Shadow::new_aliased_at(buffer.clone(), data, gpu, 0, base_va, PAGE as u64);
+            pair_of(OURS, &probe).expect("whole-buffer pair created by patch")
+        };
+        assert_eq!(look_up(&patched_add, base_va + 0x10), (slot, 0x10));
+        assert_eq!(look_up(&patched_add, base_va + PAGE as u64 + 0x20), (slot, PAGE as u32 + 0x20));
+        assert_eq!(
+            look_up(&patched_add, base_va + 2 * PAGE as u64 + 0x30),
+            (slot, 2 * PAGE as u32 + 0x30)
+        );
+
+        // 2. Unmap the middle 64 KiB page (splits the coalesced run into prefix + suffix).
+        assert!(crate::shadow::unregister_aliased_range(base_va + PAGE as u64, PAGE as u64));
+        prepare(OURS, |_, _, _| {});
+        let (_, full_rw, patches, _) = take_rewrite_profile();
+        assert_eq!(full_rw, 0, "aliased split must use incremental patch");
+        assert_eq!(patches, 1, "expected 1 incremental patch for split");
+        let (_, patched_split) = snapshot();
+        assert_eq!(look_up(&patched_split, base_va + 0x10), (slot, 0x10));
+        assert_eq!(
+            look_up(&patched_split, base_va + PAGE as u64 + 0x20),
+            (null, (base_va + PAGE as u64 + 0x20) as u32)
+        );
+        assert_eq!(
+            look_up(&patched_split, base_va + 2 * PAGE as u64 + 0x30),
+            (slot, 2 * PAGE as u32 + 0x30)
+        );
+
+        // 3. Force a full rewrite and verify every probe address matches bit-for-bit.
+        with_heap(OURS, |h| {
+            let mut guard = shared();
+            let (_, s) = guard.iter_mut().find(|(k, _)| *k == OURS).unwrap();
+            s.rewrite(h);
+        });
+        let (_, full_after) = snapshot();
+        for addr in [
+            base_va + 0x10,
+            base_va + PAGE as u64 + 0x20,
+            base_va + 2 * PAGE as u64 + 0x30,
+            base_va + 3 * PAGE as u64 + 0x40,
+        ] {
+            assert_eq!(
+                look_up(&patched_split, addr),
+                look_up(&full_after, addr),
+                "mismatch at {addr:#x}"
+            );
+        }
+
+        // Clean up the test's aliased entries.
+        assert!(crate::shadow::unregister_aliased_range(base_va, 3 * PAGE as u64));
+        prepare(OURS, |_, _, _| {});
+        let (_, cleaned) = snapshot();
+        assert_eq!(look_up(&cleaned, base_va + 0x10).0, null);
+        assert_eq!(look_up(&cleaned, base_va + 2 * PAGE as u64 + 0x30).0, null);
         list.close();
         list.reset();
     }

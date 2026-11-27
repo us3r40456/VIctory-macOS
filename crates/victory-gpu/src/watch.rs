@@ -406,15 +406,29 @@ pub(crate) fn frame_line(frames: f64) -> String {
 }
 
 /// Number of independent address stripes for page-protection syscalls so
-/// concurrent buffer refreshes and write faults across distinct 1 MiB regions
-/// never serialize on the global `GUARDS` lock.
+/// concurrent buffer refreshes and write faults across distinct regions
+/// never serialize on a global lock.
 const STRIPES: usize = 64;
 
-/// 1 MiB (16 × 64 KiB pages) per stripe: keeps contiguous buffer runs in a
-/// single stripe while spreading independent buffers and faults across 64 locks.
+/// Shift in 64 KiB pages per stripe (`VICTORY_WATCH_STRIPE_SHIFT`, clamped to
+/// `4..=12`, default `8` = 256 pages = 16 MiB/stripe, 1 GiB full period).
+/// Keeps multi-megabyte buffers inside a few stripes so a 174 MiB buffer does
+/// not degenerate into acquiring all 64 stripes (`u64::MAX`).
+#[inline]
+fn stripe_shift() -> u32 {
+    static SHIFT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SHIFT.get_or_init(|| {
+        std::env::var("VICTORY_WATCH_STRIPE_SHIFT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|s| s.clamp(4, 12))
+            .unwrap_or(8)
+    })
+}
+
 #[inline]
 fn stripe_of(page: usize) -> usize {
-    (page >> 4) & (STRIPES - 1)
+    (page >> stripe_shift()) & (STRIPES - 1)
 }
 
 #[inline]
@@ -422,14 +436,16 @@ fn stripe_mask_range(first: usize, last: usize) -> u64 {
     if first >= last {
         return 0;
     }
-    if last - first >= STRIPES * 16 {
+    let shift = stripe_shift();
+    let span = 1usize << shift;
+    if last - first >= STRIPES * span {
         return u64::MAX;
     }
     let mut mask = 0u64;
-    let mut p = first & !15;
+    let mut p = first & !(span - 1);
     while p < last {
-        mask |= 1u64 << stripe_of(p);
-        p += 16;
+        mask |= 1u64 << ((p >> shift) & (STRIPES - 1));
+        p += span;
     }
     mask
 }

@@ -22,6 +22,27 @@ mod split_tests;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+/// Whether heap syncs leave a made slot untouched when the title wrote bytes
+/// there that are not one of our descriptor records (`VICTORY_STALE_LEFT=1`).
+/// A draw reading the slot through a table still nulls it via [`HostHeap::mirror`],
+/// and records whose resource was released are still nulled.
+fn stale_left() -> bool {
+    #[cfg(test)]
+    {
+        STALE_LEFT_TEST.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_STALE_LEFT"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STALE_LEFT_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -893,6 +914,7 @@ impl HostHeap {
             .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let buf_end = buf_start.saturating_add(buf.len() as u64);
+        let left = stale_left();
         let mut stale: Vec<u32> = Vec::new();
         let mut candidates: Vec<(u32, [u32; 3])> = Vec::new();
 
@@ -908,7 +930,7 @@ impl HostHeap {
             };
             let [tag, view, generation] = record;
             if tag != VIEW_TAG {
-                if self.made_is_nonzero(i) {
+                if !left && self.made_is_nonzero(i) {
                     stale.push(i);
                 }
                 continue;
@@ -966,6 +988,7 @@ impl HostHeap {
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
         let mut current = Vec::with_capacity(records.len());
         views_current_into(&records, &mut current);
+        let left = stale_left();
         let stale: Vec<u32> = {
             // mac: behind the one lock the look is under it, as before.
             // With locks of their own the slots' records are read without
@@ -977,8 +1000,9 @@ impl HostHeap {
             let _held = (!self.made.split()).then(|| self.made.lock(first));
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| {
-                    super::slots::stale(current, view, generation, self.made.peek(i))
+                .filter(|&(i, (&[tag, view, generation], current))| {
+                    !(left && tag != VIEW_TAG)
+                        && super::slots::stale(current, view, generation, self.made.peek(i))
                 })
                 .map(|(i, _)| i)
                 .collect()
