@@ -1779,6 +1779,7 @@ impl State {
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
         let frame = crate::queue::presented() + 1;
+        let compare_backing = crate::switch::on("VICTORY_TRACE_VIEW_BACKING");
         let hex = |b: &[u8]| -> String {
             let words: Vec<String> =
                 b.as_chunks::<4>().0.iter().map(|&c| format!("{:x}", u32::from_le_bytes(c))).collect();
@@ -1791,8 +1792,19 @@ impl State {
                 else {
                     continue;
                 };
-                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let view = crate::descriptor::view(handle);
                 let who = format!("{} {:?} s{}+{}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
+                if compare_backing {
+                    if let Some(view @ View::Placed(false, resource, _)) = view.as_deref()
+                        && resource[0] == 1
+                        && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+                        && len >= 4 << 20
+                    {
+                        self.probe_view_backing(list, handle, address, len, who, frame);
+                    }
+                    continue;
+                }
                 let (range, texture) = match view.as_deref() {
                     Some(View::Constant(address, size)) => (Some((*address, u64::from(*size))), None),
                     Some(v @ (View::Shader(r, _) | View::Unordered(r, ..))) => {
@@ -1822,6 +1834,47 @@ impl State {
                 });
             }
         }
+    }
+
+    /// Compare completed host and title samples for a large placed SRV.
+    /// The census identifies the slot's backing. Resolving a short sample
+    /// by title address alone could pick a different, overlapping alias.
+    #[cfg(feature = "diagnostics")]
+    fn probe_view_backing(&self, list: &HostList, handle: u64, address: u64, len: u64, who: String, frame: u64) {
+        let Some(heap) = self.heap_of(handle) else { return };
+        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else { return };
+        let viewed = host.viewed.clone();
+        let Some((shadow, first, bytes)) = crate::bindless::slot_buffer(&viewed, index) else {
+            tracing::info!(target: "victory_gpu::trace", frame, slot = index, %who, "placed SRV backing unavailable");
+            return;
+        };
+        if (first, bytes) != (address, len) {
+            tracing::info!(target: "victory_gpu::trace", frame, slot = index, %who, "placed SRV range differs from its slot");
+            return;
+        }
+        list.defer_after(move || {
+            let same_slot = crate::bindless::slot_buffer(&viewed, index)
+                .is_some_and(|(current, at, size)| std::sync::Arc::ptr_eq(&current, &shadow) && (at, size) == (address, len));
+            const SAMPLE: usize = 256;
+            let mut title = [0; SAMPLE];
+            let mut host = [0; SAMPLE];
+            let mut compared = 0;
+            let mut differences = 0;
+            if same_slot {
+                for offset in [0, len / 2, len - SAMPLE as u64] {
+                    let at = address + offset;
+                    if crate::host::read_into(at as *const u8, &mut title) && shadow.read_sample(at, &mut host) {
+                        compared += SAMPLE;
+                        differences += title.iter().zip(host).filter(|(a, b)| **a != *b).count();
+                    }
+                }
+            }
+            tracing::info!(
+                target: "victory_gpu::trace",
+                frame, slot = index, %who, bytes = len, aliased = shadow.is_aliased(),
+                same_slot, compared, differences, "placed SRV backing compared after submission"
+            );
+        });
     }
 
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it

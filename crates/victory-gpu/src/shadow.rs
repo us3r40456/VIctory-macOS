@@ -324,6 +324,18 @@ impl Shadow {
         words.join(" ")
     }
 
+    /// Read a sample from this backing after the GPU has completed its lists.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn read_sample(&self, address: u64, bytes: &mut [u8]) -> bool {
+        let Some(offset) = address.checked_sub(self.start) else { return false };
+        if bytes.len() as u64 > self.len.saturating_sub(offset) || bytes.is_empty() {
+            return false;
+        }
+        // SAFETY: the sample lies within the backing mapping held by this copy.
+        let source = unsafe { self.data.add(offset as usize) };
+        crate::host::read_into(source, bytes)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base

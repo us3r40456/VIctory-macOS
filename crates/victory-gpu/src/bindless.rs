@@ -620,6 +620,16 @@ pub(crate) fn slot_range(viewed: &Viewed, index: u32) -> Option<(usize, usize)> 
     }
 }
 
+/// The buffer backing actually entered for a host descriptor slot.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn slot_buffer(viewed: &Viewed, index: u32) -> Option<(Arc<Shadow>, u64, u64)> {
+    let inner = viewed.shard(index).lock().unwrap_or_else(|e| e.into_inner());
+    match inner.slots.get(&index) {
+        Some(Seen::Buffer(shadow, address, len, _)) => Some((shadow.clone(), *address, *len)),
+        _ => None,
+    }
+}
+
 /// Per submission: the buffer range of the view currently in `index`. A
 /// table draw may have been recorded with another view in that slot.
 pub(crate) fn refresh_slot(
